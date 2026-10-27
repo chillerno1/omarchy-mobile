@@ -668,6 +668,8 @@ earpiece() {
   flock -w 20 9 || ear_refuse "$want" "another earpiece change still runs"
   why=$(not_running)
   [[ -z $why ]] || ear_refuse "$want" "$why"
+  # every control helper reads amixer -c "$card": find it before any check
+  find_card || ear_refuse "$want" "no AoC sound card"
   check_limits >/dev/null 2>&1 || ear_refuse "$want" "the configured levels fail the limits check ($(check_limits 2>&1 | tail -n1))"
 
   if [[ $want == on ]]; then
