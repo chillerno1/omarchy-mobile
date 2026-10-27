@@ -539,6 +539,56 @@ if [[ -n ${OMAMOBILE_UPDATE_RENDER:-} ]]; then
 fi
 pass "update sheet"
 
+# The setup sheet (omamobile.onboarding, TOUCH-PLAN 1.11): the first run's
+# questions and System > PIN as sheets in place of the gum prompts. The
+# scripts stay the one definition of what each answer does (their
+# function-level entry points, test/onboarding.sh), the sheet calls them,
+# the secrets go to omamobile-set-pin's stdin and nowhere else, and the
+# scripts open the sheet when the shell has it. test/onboarding-render
+# draws every page in the OWL container.
+python3 -c 'import json; assert {"id": "omamobile.onboarding"} in json.load(open("profile/shell.json"))["plugins"]' \
+  || fail "the phone profile enables the setup sheet"
+grep -c 'add_plugin omamobile.onboarding' bin/omamobile-setup-user >/dev/null || fail "existing users get the setup sheet"
+bash test/onboarding.sh || fail "omamobile-onboarding and omamobile-set-pin entry points"
+if command -v node >/dev/null; then
+  node test/onboarding-model.js >/dev/null || { node test/onboarding-model.js; fail "setup sheet model"; }
+fi
+setup=plugins/omamobile.onboarding/Onboarding.qml
+grep -cF "omarchy-shell shell summon omamobile.onboarding \"\$1\"" bin/omamobile-onboarding >/dev/null || fail "omamobile-onboarding opens the sheet"
+grep -cF "omarchy-shell shell summon omamobile.onboarding \"\$1\"" bin/omamobile-set-pin >/dev/null || fail "omamobile-set-pin opens the sheet"
+grep -cF 'exec omarchy-launch-floating-terminal-with-presentation "omamobile-onboarding --inner"' bin/omamobile-onboarding >/dev/null || fail "the terminal prompts stay the fallback"
+grep -cF 'applyProc.write(root.currentSecret + "\n" + root.newSecret + "\n")' "$setup" >/dev/null || fail "the secrets go to omamobile-set-pin's stdin"
+if grep -nE 'command: .*(Secret|secretField)' "$setup"; then fail "a secret is never in argv"; fi
+if grep -nE 'console\.(log|info|warn|debug|error)\([^)]*(secret|Secret|pin|password)' "$setup"; then fail "a secret is never logged"; fi
+grep -cF 'if (name || email) Quickshell.execDetached(Model.identityArgv(name, email))' "$setup" >/dev/null || fail "the identity goes through omamobile-onboarding --identity"
+grep -cF 'Quickshell.execDetached(Model.INVITE_ARGV)' "$setup" >/dev/null || fail "the agent invitation goes through omamobile-onboarding --invite-agent"
+# (the comments may name passwd; the code may not run or imitate it)
+if [[ -n $(grep -nE 'git config|XCompose|passwd|chpasswd|toggles/' "$setup" plugins/omamobile.onboarding/OnboardingModel.js | grep -vE ':[0-9]+:\s*//') ]]; then
+  grep -nE 'git config|XCompose|passwd|chpasswd|toggles/' "$setup" plugins/omamobile.onboarding/OnboardingModel.js | grep -vE ':[0-9]+:\s*//'
+  fail "the sheet repeats none of the scripts' logic"
+fi
+grep -cF 'exclusionMode: ExclusionMode.Normal' "$setup" >/dev/null || fail "the setup sheet fits above the on-screen keyboard"
+python3 -B - <<'PY2' || fail "the setup sheet lints clean"
+import importlib.machinery, importlib.util, os, sys
+loader = importlib.machinery.SourceFileLoader("omamobile_widget", "bin/omamobile-widget")
+spec = importlib.util.spec_from_loader("omamobile_widget", loader)
+tool = importlib.util.module_from_spec(spec)
+loader.exec_module(tool)
+if not tool.qmllint_path() or not os.path.isdir(os.path.join(tool.OMARCHY_PATH, "shell")):
+    print("ok - setup sheet lint # SKIP no qmllint or Omarchy shell")
+    sys.exit(0)
+lint = tool.run_qmllint([os.path.abspath("plugins/omamobile.onboarding/Onboarding.qml")])
+noise = ("is not creatable", "QProcess::ExitStatus")
+bad = lint["errors"] + [w for w in lint["warnings"] if not any(n in w for n in noise)]
+for line in bad:
+    print("  " + line)
+sys.exit(1 if bad else 0)
+PY2
+if [[ -n ${OMAMOBILE_SETUP_RENDER:-} ]]; then
+  bash test/onboarding-render "$OMAMOBILE_SETUP_RENDER" >/dev/null || fail "setup sheet render"
+fi
+pass "setup sheet: the scripts' entry points, the sheet's wiring, no secret in argv or the log"
+
 # The permission sheet: the portal Access backend (its pure parts, then the
 # D-Bus service on a private bus against a fake omarchy-shell), the sheet's
 # model, and the wiring that makes the portal pick it under Hyprland.

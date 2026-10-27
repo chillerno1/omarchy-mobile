@@ -12,10 +12,12 @@ Omarchy Mobile's phone profile for Omarchy's own shell. It isn't a fork: these a
 | `plugins/omamobile.keyboard` | Hide button above the on-screen keyboard |
 | `plugins/omamobile.back` | The back gesture: swipe in from a side edge for Escape |
 | `plugins/omamobile.update` | The update sheet: Omarchy's update for a phone, through `omamobile-update` (package `omamobile-omarchy`) |
+| `plugins/omamobile.onboarding` | The setup sheet: the first run's questions (name and email, a PIN or password, Omarchy's agent invitation) and System > PIN, through `omamobile-onboarding` and `omamobile-set-pin`, which keep their terminal prompts as the fallback |
 | `plugins/omamobile.access` | The permission sheet: "Allow Camera to use the camera?" with the app's icon and two large buttons, in place of xdg-desktop-portal-gtk's desktop dialog |
 | `plugins/omamobile.fingerprint` | The under-display fingerprint sensor: target during verification, enrollment screen |
 | `profile/shell.json` | The phone layout the setup seeds once |
 | `bin/omamobile-setup-user` | Omarchy Mobile's per-user setup (Omarchy lifecycle `setup-user`) |
+| `bin/omamobile-onboarding`, `bin/omamobile-set-pin` | First-run setup and the PIN or password: the sheet above when the shell runs it, gum prompts in a terminal otherwise; `--status --json`, `--identity`, `--invite-agent` and `--apply TYPE` (secrets on stdin) are what the sheet calls |
 | `bin/omamobile-launch` | One app per screen: every launch from the shell (drawer, home screen, widgets, links, the agent) gets a new empty workspace through a per-launch Hyprland exec rule, or focuses the app's open window; and the switcher's "Show with…" and "Move to its own screen" |
 | `bin/omamobile-osk-watch` | Reports squeekboard's visibility (sm.puri.OSK0) to the fingerprint plugin |
 | `bin/omamobile-osk-guard` | Turns the on-screen keyboard (`screen-keyboard-enabled`) back on when it was left off with no screensaver running (a user unit for every graphical session) |
