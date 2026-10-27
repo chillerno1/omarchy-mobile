@@ -9,9 +9,9 @@ import "quicksettings" as QS
 // Offscreen review shots of quick settings (test/quicksettings-render):
 // the real QuickSettings.qml at the phone's 480x1040 logical px and on
 // its side at 1040x480, over an app stand-in, each shot in $QS_JOB
-// (collapsed, expanded, editing) saved as a PNG with the geometry of the
-// sheet, the tiles, the handle and the shade printed for the checks. Then
-// it quits.
+// (collapsed, expanded, editing, the reminder page) saved as a PNG with
+// the geometry of the sheet, the tiles, the handle, the shade and the
+// page's parts printed for the checks. Then it quits.
 ShellRoot {
   id: shell
 
@@ -40,6 +40,16 @@ ShellRoot {
       QS.QuickSettings {
         id: qs
         anchors.fill: parent
+        // The pages (Wi-Fi, Bluetooth, record, reminder) are windows of
+        // their own on the phone; their stand-ins fill the screen here.
+        Component.onCompleted: {
+          for (var i = 0; i < qs.children.length; i++) {
+            var page = qs.children[i]
+            if (page.opened === undefined || page.backRequested === undefined) continue
+            page.width = Qt.binding(function() { return qs.width })
+            page.height = Qt.binding(function() { return qs.height })
+          }
+        }
       }
     }
   }
@@ -63,7 +73,7 @@ ShellRoot {
     var s = shell.shot
     qs.close()
     Qt.callLater(function() {
-      qs.open(JSON.stringify({ expanded: s.expanded === true, page: s.edit ? "edit" : "" }))
+      qs.open(JSON.stringify({ expanded: s.expanded === true, page: s.edit ? "edit" : (s.page || "") }))
       settle.restart()
     })
   }
@@ -74,7 +84,7 @@ ShellRoot {
     var s = shell.shot
     var parts = shell.describe(qs, {})
     console.log("geometry " + s.name + " " + screen.width + "x" + screen.height
-                + " " + JSON.stringify({ parts: parts, columns: qs.tileColumns, expanded: qs.expanded, edit: qs.editing, notifications: qs.notifications.length }))
+                + " " + JSON.stringify({ parts: parts, columns: qs.tileColumns, expanded: qs.expanded, edit: qs.editing, page: s.page || "", notifications: qs.notifications.length }))
     screen.grabToImage(function(result) {
       result.saveToFile(s.png)
       console.log("shot " + s.png)

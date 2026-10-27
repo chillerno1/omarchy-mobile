@@ -148,6 +148,22 @@ grep -cF 'call omamobile.bar notificationsSeen' "$qs" >/dev/null || fail "the sh
 grep -cF 'function notificationsSeen(stamp: string): string' plugins/omamobile.bar/Bar.qml >/dev/null || fail "the bar serves notificationsSeen"
 grep -cF '"/.local/state/omamobile/notifications-seen"' plugins/omamobile.bar/Bar.qml >/dev/null || fail "the bar reads the shade's mark at start"
 grep -cF '"omarchy-shell", "shell", "summon", "omarchy.clipboard"' "$qs" >/dev/null || fail "the Clipboard tile opens Omarchy's clipboard history"
+# The Reminder tile (TOUCH-PLAN 1.12) is a page over Omarchy's own
+# omarchy-reminder: Set runs it with the minutes and message, Clear all
+# runs its clear after a second tap, the list is its JSON, and nothing
+# here starts a timer or a notification of its own. Night light was
+# already a tile (omarchy-toggle-nightlight, tile-action.sh).
+panel=plugins/omamobile.quicksettings/ReminderPanel.qml
+grep -cF 'var argv = TilesModel.reminderArgv(minutes, messageField.text)' "$panel" >/dev/null || fail "Set runs omarchy-reminder through reminderArgv"
+grep -cF 'Quickshell.execDetached(["omarchy-reminder", "clear"])' "$panel" >/dev/null || fail "Clear all runs omarchy-reminder clear"
+grep -cF 'onTapped: root.requestClear()' "$panel" >/dev/null || fail "Clear all asks first"
+grep -cF 'command: ["omarchy-reminder", "show", "--json"]' "$panel" >/dev/null || fail "the page lists omarchy-reminder's JSON"
+if grep -nE 'systemd-run|notification-send' "$panel"; then fail "the reminder page starts no timer or notification of its own"; fi
+grep -cF 'Quickshell.execDetached(["omarchy-reminder", "show"])' "$qs" >/dev/null || fail "a long-press on Reminder shows Omarchy's list"
+grep -cF '"reminder": reminder' "$qs" >/dev/null || fail "the Reminder tile has a backend"
+grep -cF 'else if (page === "reminder") reminderPanelItem.open()' "$qs" >/dev/null || fail "the Reminder tile opens its page"
+grep -cF 'exclusionMode: ExclusionMode.Normal' "$panel" >/dev/null || fail "the reminder page fits above the on-screen keyboard"
+grep -cF 'exec omarchy-toggle-nightlight' plugins/omamobile.quicksettings/tile-action.sh >/dev/null || fail "night light is Omarchy's toggle"
 # A swipe on a row forgets that one notification through the service's
 # forget call (omamobile-omarchy patch 0019), never by deleting its file
 # behind the service; the row's swipe is sideways only and off while the
