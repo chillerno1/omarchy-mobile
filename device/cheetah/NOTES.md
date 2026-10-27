@@ -2,6 +2,22 @@
 
 Findings from real hardware, newest first. `BRINGUP-M1.md` is the research map written before first boot.
 
+## 2026-10-27: earpiece mode, written offline (omamobile-audio 0.5.5)
+
+- **Not run on the phone yet; the runbook is AOC-PLAN C9k.**
+  `omamobile-speaker-protection earpiece on` puts the amplifiers on
+  stock's handset path at 20 dB under stock's gain: the top amplifier
+  alone, DSP bypassed, 657/6, the bottom at Digital PCM Volume 0, and the
+  watchdog in earpiece mode, which `on` waits for before it unmutes.
+  `off` restores and reads back every control. A "Voice Call" UCM verb
+  (never the default) has an Earpiece sink on the speaker's PCM that
+  switches the mode through `omamobile-earpiece@on|off.service` and a
+  polkit rule. The speaker filter's 6 dB drive is not in front of the
+  earpiece. Earpiece mode refuses while the boost converter is on,
+  because it follows the earpiece's analog gain of 6 (C9j). It never
+  touches the boost peak current: stock's in-call 3.5 A and gain 7 stay
+  out.
+
 ## 2026-10-27: the muted speakers were the open-loop coil estimate, not sleep; the static was the boost converter; the earpiece is the top speaker
 
 - **The speaker watchdog had muted media at every boot since 10-26 22:28**
