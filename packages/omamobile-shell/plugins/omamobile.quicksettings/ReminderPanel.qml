@@ -213,7 +213,7 @@ Item {
               width: parent.width
               textFormat: Text.PlainText
               text: root.reminders.length === 0 ? (root.listed ? "Nothing pending" : "") : (root.reminders.length === 1 ? "1 pending" : root.reminders.length + " pending")
-              color: Qt.darker(root.foreground, 1.4)
+              color: Readable.secondary(root.foreground, Commons.Color.popups.background)
               font.family: Style.font.family
               font.pixelSize: Style.font.body
             }
@@ -248,7 +248,7 @@ Item {
                     width: parent.width
                     textFormat: Text.PlainText
                     text: "At " + pendingRow.modelData.atTime + " (in " + pendingRow.modelData.remaining + ")"
-                    color: Qt.darker(root.foreground, 1.4)
+                    color: Readable.secondary(root.foreground, Commons.Color.popups.background)
                     font.family: Style.font.family
                     font.pixelSize: Readable.px(Style.font.caption)
                     elide: Text.ElideRight
@@ -341,6 +341,7 @@ Item {
               font.pixelSize: Style.font.title
               foreground: root.foreground
               placeholderText: "Minutes"
+              placeholderTextColor: Readable.secondary(root.foreground, Readable.flatten(Style.controlFill(activeFocus, hovered || hasCursor, foreground, accent), Commons.Color.popups.background))
               text: root.minutes
               inputMethodHints: Qt.ImhDigitsOnly | Qt.ImhNoPredictiveText
               onTextEdited: root.minutes = text
@@ -359,6 +360,7 @@ Item {
               font.pixelSize: Style.font.title
               foreground: root.foreground
               placeholderText: "What for (optional)"
+              placeholderTextColor: Readable.secondary(root.foreground, Readable.flatten(Style.controlFill(activeFocus, hovered || hasCursor, foreground, accent), Commons.Color.popups.background))
               inputMethodHints: Qt.ImhNoPredictiveText
               onAccepted: root.setReminder()
               Keys.onEscapePressed: root.close()

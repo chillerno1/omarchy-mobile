@@ -677,7 +677,7 @@ Item {
           horizontalAlignment: Text.AlignHCenter
           textFormat: Text.PlainText
           text: root.adapter ? "Turn on Bluetooth to see devices" : "No Bluetooth adapter"
-          color: Qt.darker(root.foreground, 1.4)
+          color: Readable.secondary(root.foreground, Commons.Color.popups.background)
           font.family: Style.font.family
           font.pixelSize: Style.font.body
           wrapMode: Text.Wrap
@@ -732,7 +732,7 @@ Item {
               anchors.centerIn: parent
               textFormat: Text.PlainText
               text: entryItem.row.text
-              color: Qt.darker(root.foreground, 1.4)
+              color: Readable.secondary(root.foreground, Commons.Color.popups.background)
               font.family: Style.font.family
               font.pixelSize: Style.font.body
             }
@@ -814,7 +814,7 @@ Item {
                   visible: text !== ""
                   textFormat: Text.PlainText
                   text: BluetoothModel.rowStatus(entryItem.row, entryItem.busy ? root.actionKind : "", entryItem.failure)
-                  color: entryItem.failure ? Commons.Color.urgent : Qt.darker(root.foreground, 1.4)
+                  color: entryItem.failure ? Commons.Color.urgent : Readable.secondary(root.foreground, Commons.Color.popups.background)
                   font.family: Style.font.family
                   font.pixelSize: Readable.px(Style.font.caption)
                   elide: Text.ElideRight
@@ -886,7 +886,7 @@ Item {
               visible: text !== ""
               textFormat: Text.PlainText
               text: root.agentSheet ? root.agentSheet.body : ""
-              color: Qt.darker(root.foreground, 1.2)
+              color: Readable.secondary(root.foreground, Commons.Color.popups.background)
               font.family: Style.font.family
               font.pixelSize: Style.font.body
               wrapMode: Text.Wrap
@@ -936,6 +936,7 @@ Item {
               font.pixelSize: Style.font.title
               foreground: root.foreground
               placeholderText: root.agentSheet && root.agentSheet.input === "passkey" ? "Passkey" : "PIN"
+              placeholderTextColor: Readable.secondary(root.foreground, Readable.flatten(Style.controlFill(activeFocus, hovered || hasCursor, foreground, accent), Commons.Color.popups.background))
               maximumLength: root.agentSheet && root.agentSheet.input === "passkey" ? 6 : 16
               inputMethodHints: root.agentSheet && root.agentSheet.input === "passkey"
                 ? Qt.ImhDigitsOnly | Qt.ImhNoPredictiveText
@@ -955,6 +956,7 @@ Item {
               font.pixelSize: Style.font.title
               foreground: root.foreground
               placeholderText: "Name"
+              placeholderTextColor: Readable.secondary(root.foreground, Readable.flatten(Style.controlFill(activeFocus, hovered || hasCursor, foreground, accent), Commons.Color.popups.background))
               maximumLength: 248
               onAccepted: root.submitRename()
               onTextEdited: root.sheetError = ""
@@ -1068,7 +1070,7 @@ Item {
         visible: text !== ""
         textFormat: Text.PlainText
         text: switchRow.detail
-        color: Qt.darker(root.foreground, 1.4)
+        color: Readable.secondary(root.foreground, Commons.Color.popups.background)
         font.family: Style.font.family
         font.pixelSize: Readable.px(Style.font.caption)
         elide: Text.ElideRight

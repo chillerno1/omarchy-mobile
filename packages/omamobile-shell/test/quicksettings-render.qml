@@ -60,11 +60,35 @@ ShellRoot {
   }
 
   // The named parts that are shown, as {name: {x, y, w, h}} in screen px.
-  function describe(item, out) {
+  // A name used more than once (a tile's label and status) is numbered
+  // from its second use; a text's colour (a field's placeholder colour)
+  // comes along for the contrast checks.
+  // A part cut off by a clipping ancestor (the sheet's scrolling content)
+  // is marked `clipped`, so the checks don't read what isn't drawn.
+  function describe(item, out, clipRect) {
     if (!item || !item.visible || item.opacity === 0) return out
-    if (item.objectName) out[item.objectName] = shell.rectOf(item)
-    for (var i = 0; i < item.children.length; i++) shell.describe(item.children[i], out)
+    var rect = shell.rectOf(item)
+    if (item.clip === true) clipRect = clipRect ? shell.intersect(clipRect, rect) : rect
+    if (item.objectName) {
+      var key = item.objectName
+      for (var n = 2; out[key] !== undefined; n++) key = item.objectName + "#" + n
+      var r = rect
+      if (item.placeholderTextColor !== undefined) r.color = String(item.placeholderTextColor)
+      else if (item.color !== undefined && item.text !== undefined) r.color = String(item.color)
+      if (clipRect && !shell.within(rect, clipRect)) r.clipped = true
+      out[key] = r
+    }
+    for (var i = 0; i < item.children.length; i++) shell.describe(item.children[i], out, clipRect)
     return out
+  }
+
+  function intersect(a, b) {
+    var x = Math.max(a.x, b.x), y = Math.max(a.y, b.y)
+    return { x: x, y: y, w: Math.max(0, Math.min(a.x + a.w, b.x + b.w) - x), h: Math.max(0, Math.min(a.y + a.h, b.y + b.h) - y) }
+  }
+
+  function within(a, b) {
+    return a.x >= b.x - 1 && a.y >= b.y - 1 && a.x + a.w <= b.x + b.w + 1 && a.y + a.h <= b.y + b.h + 1
   }
 
   function next() {

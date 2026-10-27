@@ -1519,7 +1519,7 @@ Item {
               Text {
                 textFormat: Text.PlainText
                 text: Qt.formatDateTime(clock.date, "dddd, d MMMM")
-                color: Qt.darker(root.foreground, 1.4)
+                color: Readable.secondary(root.foreground, Commons.Color.popups.background)
                 font.family: Style.font.family
                 font.pixelSize: Style.font.body
               }
@@ -1618,7 +1618,7 @@ Item {
                 anchors.centerIn: parent
                 textFormat: Text.PlainText
                 text: "No tiles. Tap 󰏫 to add some."
-                color: Qt.darker(root.foreground, 1.4)
+                color: Readable.secondary(root.foreground, Commons.Color.popups.background)
                 font.family: Style.font.family
                 font.pixelSize: Style.font.body
               }
@@ -1677,7 +1677,7 @@ Item {
                 width: parent.width
                 textFormat: Text.PlainText
                 text: "Tap a tile to remove it. Hold and drag to move it."
-                color: Qt.darker(root.foreground, 1.4)
+                color: Readable.secondary(root.foreground, Commons.Color.popups.background)
                 font.family: Style.font.family
                 font.pixelSize: Readable.px(Style.font.caption)
                 wrapMode: Text.WordWrap
@@ -1724,7 +1724,7 @@ Item {
                   anchors.centerIn: parent
                   textFormat: Text.PlainText
                   text: "No tiles on the sheet"
-                  color: Qt.darker(root.foreground, 1.4)
+                  color: Readable.secondary(root.foreground, Commons.Color.popups.background)
                   font.family: Style.font.family
                   font.pixelSize: Style.font.body
                 }
@@ -1784,7 +1784,7 @@ Item {
                 visible: root.spareTiles.length === 0
                 textFormat: Text.PlainText
                 text: "Every tile is on the sheet"
-                color: Qt.darker(root.foreground, 1.4)
+                color: Readable.secondary(root.foreground, Commons.Color.popups.background)
                 font.family: Style.font.family
                 font.pixelSize: Readable.px(Style.font.caption)
               }
@@ -1969,7 +1969,7 @@ Item {
           width: parent.width
           textFormat: Text.PlainText
           text: "No notifications"
-          color: Qt.darker(root.foreground, 1.4)
+          color: Readable.secondary(root.foreground, Commons.Color.popups.background)
           font.family: Style.font.family
           font.pixelSize: Style.font.body
         }

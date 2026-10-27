@@ -252,7 +252,7 @@ Item {
       visible: root.windows.length === 0
       textFormat: Text.PlainText
       text: "No recent apps"
-      color: Qt.darker(root.foreground, 1.4)
+      color: Readable.secondary(root.foreground, Commons.Color.menu.background)
       font.family: Style.font.family
       font.pixelSize: Style.font.subtitle
     }
@@ -487,7 +487,7 @@ Item {
             textFormat: Text.PlainText
             text: root.actionPage === "pick" ? "Show with…" : root.windowLabel(root.actionTarget)
             elide: Text.ElideRight
-            color: Qt.darker(root.foreground, 1.3)
+            color: Readable.secondary(root.foreground, Commons.Color.menu.background)
             font.family: Style.font.family
             font.pixelSize: Style.font.body
             bottomPadding: Style.space(6)
@@ -572,7 +572,7 @@ Item {
         textFormat: Text.PlainText
         text: sheetRow.hint
         elide: Text.ElideRight
-        color: Qt.darker(root.foreground, 1.4)
+        color: Readable.secondary(root.foreground, Commons.Color.menu.background)
         font.family: Style.font.family
         font.pixelSize: Readable.px(Style.font.caption)
       }
