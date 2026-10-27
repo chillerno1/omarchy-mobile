@@ -429,6 +429,25 @@ Item {
     connectDevice(address)
   }
 
+  // Forget unpairs the device, so it takes two taps (TOUCH-PLAN 3.7): the
+  // first turns it into "Forget <device>?" for a few seconds.
+  property bool confirmForget: false
+
+  Timer {
+    id: disarmForget
+    interval: 4000
+    onTriggered: root.confirmForget = false
+  }
+
+  function requestForget() {
+    if (!confirmForget) {
+      confirmForget = true
+      disarmForget.restart()
+      return
+    }
+    forgetSheet()
+  }
+
   function forgetSheet() {
     var address = sheetAddress
     cancelSheet()
@@ -495,6 +514,8 @@ Item {
     if (agentSheet) return answerAgent(false)
     sheet = ""
     sheetError = ""
+    confirmForget = false
+    disarmForget.stop()
     renameField.text = ""
     codeField.text = ""
     if (opened) panel.forceActiveFocus()
@@ -1007,9 +1028,9 @@ Item {
             SheetButton {
               visible: root.activeSheet === "actions" && root.sheetPaired
               width: parent.width
-              label: "Forget"
+              label: root.confirmForget ? "Forget " + root.sheetLabel + "?" : "Forget"
               danger: true
-              onTapped: root.forgetSheet()
+              onTapped: root.requestForget()
             }
 
             SheetButton {

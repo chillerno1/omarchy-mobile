@@ -92,6 +92,13 @@ grep -c 'onTapped: bottomButton.modelData.action === "home" ? root.goHome() : ro
 grep -c 'onTapped: root.requestReset()' plugins/omamobile.quicksettings/QuickSettings.qml >/dev/null || fail "quick-settings Reset asks first"
 grep -c 'if (!settingsFlick.confirmRemove) { settingsFlick.confirmRemove = true; return }' plugins/omamobile.home/HomeSheets.qml >/dev/null || fail "a widget's Remove asks first"
 grep -c 'onTapped: root.requestClearNotifications()' plugins/omamobile.quicksettings/QuickSettings.qml >/dev/null || fail "the shade's Clear all asks first"
+# TOUCH-PLAN 3.7: Forget (a saved Wi-Fi password, a Bluetooth pairing)
+# asks first too, naming what it forgets.
+for panel in WifiPanel BluetoothPanel; do
+  grep -c 'onTapped: root.requestForget()' "plugins/omamobile.quicksettings/$panel.qml" >/dev/null || fail "$panel: Forget asks first"
+  grep -cE 'label: root.confirmForget \? "Forget " \+ root.sheet(Ssid|Label) \+ "\?" : "Forget"' "plugins/omamobile.quicksettings/$panel.qml" >/dev/null || fail "$panel: the second tap names what it forgets"
+  grep -c 'confirmForget = false' "plugins/omamobile.quicksettings/$panel.qml" >/dev/null || fail "$panel: cancelling the sheet disarms Forget"
+done
 pass "touch: tiles and two-tap destructive actions"
 
 # Touch navigation (TOUCH-PLAN 1.2, 1.7, 1.8, 1.10, 2.5).
@@ -418,6 +425,14 @@ fi
 grep -c 'Quickshell.execDetached(LauncherModel.appArgv(entry.id))' plugins/omamobile.launcher/Launcher.qml >/dev/null || fail "the drawer launches through omamobile-launch"
 grep -c 'Quickshell.execDetached(HomeModel.appLaunchArgv(entry.id))' plugins/omamobile.home/Home.qml >/dev/null || fail "home-screen apps launch through omamobile-launch"
 grep -c 'tile.home.launch(tile.entry.app)' plugins/omamobile.home/AppTile.qml >/dev/null || fail "app tiles launch through the home screen"
+# TOUCH-PLAN 3.7's small parts: a missing app's tile says so rather than
+# showing its raw id, the drawer's long-press is answered on the home
+# page, and recents name apps by their desktop entry (test/switcher-touch).
+grep -c 'text: tile.missing ? "Not installed" :' plugins/omamobile.home/AppTile.qml >/dev/null || fail "a missing app's tile says Not installed"
+grep -c 'if (id !== "full") flash("Added to home")' plugins/omamobile.home/Home.qml >/dev/null || fail "the home says Added to home after the drawer's long-press"
+grep -c 'text: root.windowLabel(slot.modelData)' plugins/omamobile.switcher/Switcher.qml >/dev/null || fail "recents' cards are titled by windowLabel"
+grep -c 'var entry = DesktopEntries.byId(id) || DesktopEntries.byId(id + ".desktop")' plugins/omamobile.switcher/Switcher.qml >/dev/null || fail "recents look the app up by its desktop entry"
+grep -c '^## Gestures' README.md >/dev/null && grep -c 'Long-press an app | Put it on the home page' README.md >/dev/null || fail "the README has the gestures table"
 grep -c 'Quickshell.execDetached(HomeModel.commandLaunchArgv(argv))' plugins/omamobile.home/WidgetHost.qml >/dev/null || fail "widgets' host.launch goes through omamobile-launch"
 grep -c 'Quickshell.execDetached(HomeModel.urlLaunchArgv(text))' plugins/omamobile.home/WidgetHost.qml >/dev/null || fail "widgets' host.openUrl goes through omamobile-launch"
 grep -c 'HomeModel.commandLaunchArgv(\["sh", "-c", tap\])' plugins/omamobile.home/CommandWidget.qml >/dev/null || fail "the text widget's tap goes through omamobile-launch"
@@ -458,7 +473,7 @@ if [[ $rc == 77 ]]; then
 elif [[ $rc != 0 ]]; then
   printf '%s\n' "$out" | grep -vE '^(PASS|QDEBUG)' >&2; fail "recent apps under touch (test/switcher-touch)"
 else
-  pass "recent apps under touch: Clear all, Home, a near miss, a card, the cards on their side"
+  pass "recent apps under touch: Clear all, Home, a near miss, a card, the cards on their side, the apps' names"
 fi
 rc=0; out=$(bash test/shade-touch 2>&1) || rc=$?
 if [[ $rc == 77 ]]; then

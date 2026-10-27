@@ -357,6 +357,25 @@ Item {
     runAction("disconnect", ssid, false, function(network) { network.disconnect() })
   }
 
+  // Forget drops the saved password, so it takes two taps (TOUCH-PLAN 3.7):
+  // the first turns it into "Forget <network>?" for a few seconds.
+  property bool confirmForget: false
+
+  Timer {
+    id: disarmForget
+    interval: 4000
+    onTriggered: root.confirmForget = false
+  }
+
+  function requestForget() {
+    if (!confirmForget) {
+      confirmForget = true
+      disarmForget.restart()
+      return
+    }
+    forgetSheet()
+  }
+
   function forgetSheet() {
     var ssid = sheetSsid
     var uuid = sheetUuid
@@ -400,6 +419,8 @@ Item {
     sheet = ""
     sheetError = ""
     showPassword = false
+    confirmForget = false
+    disarmForget.stop()
     passwordField.text = ""
     if (opened) panel.forceActiveFocus()
   }
@@ -880,9 +901,9 @@ Item {
             SheetButton {
               visible: root.sheet === "actions" && (root.sheetKnown || root.sheetConnected)
               width: parent.width
-              label: "Forget"
+              label: root.confirmForget ? "Forget " + root.sheetSsid + "?" : "Forget"
               danger: true
-              onTapped: root.forgetSheet()
+              onTapped: root.requestForget()
             }
 
             SheetButton {
