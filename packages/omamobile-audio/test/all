@@ -678,6 +678,30 @@ assert g('mtx_t') == {'Gain 1': 1, 'Gain 2': 0} and g('mtx_b') == {'Gain 1': 0, 
 assert g('pre_t') == {'Gain 1': 1, 'Gain 2': 0, 'Gain 3': 0}, 'bassmono and harmonics off (top)'
 assert g('pre_b') == {'Gain 1': 1, 'Gain 2': 0, 'Gain 3': 0, 'Gain 4': 0}, 'bassmono and harmonics off (bottom)'
 PY
+# C9k: the filter's output never falls back to another sink (on the phone it
+# followed the default into the Earpiece sink once the speaker sink was gone).
+# WirePlumber 0.5's find-filter-target only stops at node.dont-fallback, and
+# destroys the filter unless node.linger is set; a defined target
+# (target.object) or node.dont-reconnect destroyed it at start.
+python3 - "$conf" <<'PY' || fail "filter: no fallback to another sink when the speaker sink is gone (C9k)"
+import re, sys
+s = re.sub(r'#[^\n]*', '', open(sys.argv[1]).read())
+pb = re.search(r'playback\.props = \{([^}]*)\}', s).group(1)
+assert 'node.name = "effect_output.omamobile_speaker_loudness"' in pb
+for k in ('node.passive', 'node.dont-fallback', 'node.linger'):
+    assert re.search(re.escape(k) + r' = true\b', pb), k
+for k in ('target.object', 'node.target', 'node.dont-reconnect'):
+    assert k not in pb, k
+cap = re.search(r'capture\.props = \{(.*?)\n            \}', s, re.S).group(1)
+assert 'filter.smart = true' in cap and 'filter.smart.target = {' in cap
+assert not re.search(r'filter\.smart\.(disabled|targetable) = true', s)
+# the same guard for a copy saved by an older omamobile-speaker-eq
+rules = re.search(r'^stream\.rules = \[(.*?)^\]', s, re.S | re.M).group(1)
+assert 'matches = [ { node.name = "effect_output.omamobile_speaker_loudness" } ]' in rules
+assert re.search(r'update-props = \{ node\.dont-fallback = true node\.linger = true \}', rules)
+assert s.index('stream.rules') < s.index('context.modules'), 'outside the conditional module'
+PY
+pass "filter: smart, in front of the speaker sink only, never falls back to the earpiece (C9k)"
 ln -sf "$here/test/fake-pw" "$fake/pw-dump"; ln -sf "$here/test/fake-pw" "$fake/pw-cli"
 ln -sf "$here/test/fake-pw" "$fake/wpctl"; ln -sf "$here/test/fake-pw" "$fake/pw-play"; ln -sf "$here/test/fake-pw" "$fake/pw-record"
 pwt=$tmp/pw; mkdir -p "$pwt"

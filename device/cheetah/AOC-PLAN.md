@@ -25,7 +25,10 @@ omamobile-audio 0.5.5, not run on the phone):** earpiece mode
 (`omamobile-speaker-protection earpiece on|off`, the top amplifier alone at
 657/6 with its DSP bypassed as stock's handset path, the bottom muted, the
 watchdog in earpiece mode) and a "Voice Call" UCM verb with an Earpiece
-sink; the gated runbook is C9k.
+sink; the gated runbook is C9k. A first look on the phone found the speaker
+filter following the default sink into the earpiece once Voice Call was
+active; its output now never falls back (`node.dont-fallback`,
+`node.linger`; C9k "The route").
 **Earlier plan (2026-10-13, before C9j):** the speakers sounded thin; the ranked plan and three
 runbooks follow C9d-6: C9g (omamobile-audio 0.4.0's speaker filter, by ear
 and measured, risk low), C9d-7/C9d-8 (the V/I feedback stream stock runs
@@ -2243,9 +2246,32 @@ merges cleanly into int; `make modules dtbs` passes in `out-aoc`):
      `omamobile-earpiece@on`, its disable sequence `omamobile-earpiece@off`;
      a failed request fails the device. Its sink ("Built-in Audio
      Earpiece", `alsa_output.…Voice_Call__Earpiece__sink`) is not the
-     speaker filter's smart-filter target, so the filter's 6 dB limiter
-     drive never reaches the earpiece, and while the profile is active the
-     HiFi sink (and the filter's target with it) is gone. Only the left
+     speaker filter's smart-filter target, and while the profile is active
+     the HiFi sink (and the filter's target with it) is gone. That alone
+     did not keep the filter off the earpiece: on the phone (PipeWire
+     1.6.9, WirePlumber 0.5) `pw-link -l` showed
+     `effect_output.omamobile_speaker_loudness:output_FL/FR` linked into
+     the Earpiece sink once Voice Call was active. WirePlumber's
+     `linking/find-filter-target.lua` gets no target for a smart filter
+     whose `filter.smart.target` matches nothing and, unless the stream has
+     `node.dont-fallback`, leaves it to `find-default-target` and
+     `find-best-target`, which pick the default sink, now the earpiece's.
+     The filter's playback stream therefore has `node.dont-fallback = true`
+     and `node.linger = true` (with `dont-fallback` alone that hook
+     destroys the stream when the target is missing, which happens at
+     every PipeWire start, before the speaker sink exists); a
+     `stream.rules` entry in the same file sets both on a copy saved by an
+     older `omamobile-speaker-eq`. A live try of `target.object` with
+     `node.dont-fallback` and `node.dont-reconnect` left the filter
+     unlinked even in HiFi: `find-defined-target.lua` destroys a stream
+     whose defined target is missing (the filter-chain module went with
+     it), so music played unfiltered. Proven offline (2026-10-27) with a
+     private PipeWire 1.6.9 and WirePlumber 0.5.18 on null sinks named as
+     the phone's: the filter in front of the speaker sink in HiFi, linked
+     to nothing in Voice Call while a stream to the default went straight
+     to the Earpiece sink, and back in front of the speaker sink after the
+     switch back; the unchanged file reproduced the phone's link into the
+     earpiece, the tried fix the destroyed filter. Only the left
      channel (TDM slot 0, the top amplifier) is heard: a mono stream plays
      whole. HiFi is unchanged. Speakerphone, headset, the call microphone
      and the proximity (acoustic-shock) mute are later T4 work.
@@ -2277,6 +2303,7 @@ merges cleanly into int; `make modules dtbs` passes in `out-aoc`):
    ctl() { tools/phone-ssh 'C=$(awk "/aoc-snd-card - /{print \$1; exit}" /proc/asound/cards); for p in Top Bottom; do for n in "PCM Source" "Analog PCM Volume" "Digital PCM Volume" "DRE Switch"; do printf "%s %s: " "$p" "$n"; amixer -c$C cget "name=$p $n" | sed -n "s/^ *: values=//p"; done; done; omamobile-speaker-protection earpiece status; omamobile-speaker-protection status | head -1'; }
    prof() { tools/phone-ssh "$U"'; C=$(as_user pactl list short cards | awk "/sound-aoc/{print \$2}"); as_user pactl set-card-profile $C "'"$1"'"; as_user pactl list cards | grep -E "Active Profile|Voice Call"'; }
    ear_play() { tools/phone-ssh "$U"'; S=$(as_user pactl list short sinks | awk "/Earpiece/{print \$2}"); as_user pactl set-sink-volume $S '"$2"'; as_user timeout 25 pw-play --target $S '"$1"'; journalctl -u omamobile-speaker-watch -n 3 --no-pager'; }
+   flinks() { tools/phone-ssh "$U"'; as_user pw-cli ls Node | grep -c "node.name = \"effect_.*omamobile_speaker_loudness\""; as_user pw-link -l | awk "/^[^ ]/{p=\$1} /\\|->/{print p, \$2}" | grep "^effect_output.omamobile_speaker_loudness" || echo "no link from the filter"'; }
    ```
    One register at a time only (`amixer cget` of single controls); never
    the amplifiers' regmap `registers` file.
@@ -2284,13 +2311,13 @@ merges cleanly into int; `make modules dtbs` passes in `out-aoc`):
    | Step | What | Risk | Expect / Pass | Stop / Rollback |
    | --- | --- | --- | --- | --- |
    | E0 | **Read-only, no sound:** `tools/phone-ssh 'uname -r; pacman -Q omamobile-audio; cat /sys/module/snd_soc_cs35l41/parameters/boost_en; systemctl is-active omamobile-speaker-protection omamobile-speaker-watch'; ctl` | none | 0.5.4 still; boost `N`; both `active`; "ok: stage media … Top 737/10, Bottom 737/10, boost converter off"; PCM Source 1 (DSP), 10, 737, on on both | the status not ok, the stage not media, boost `Y`: restore the default config and restart first |
-   | E1 | **Install 0.5.5, restart the user's PipeWire** (the human's go; announce: "sound stops for a few seconds"): `tools/phone-install-package packages/omamobile-audio`, then `tools/phone-ssh "$U"'; as_user systemctl --user restart pipewire pipewire-pulse wireplumber; sleep 3; as_user pactl list cards \| grep -E "Active Profile\|Voice Call"'`; `ctl` | low | `omamobile-audio 0.5.5`; profiles list "Voice Call", active profile still HiFi; `ctl` as in E0 and "mode: speaker; the watchdog enforces: speaker" | no Voice Call profile (the UCM did not parse: `as_user journalctl --user -u wireplumber -b \| tail`); rollback: reinstall 0.5.4 |
+   | E1 | **Install 0.5.5, restart the user's PipeWire** (the human's go; announce: "sound stops for a few seconds"): `tools/phone-install-package packages/omamobile-audio`; then, announced ("the speakers cut out for about 5 s"), `tools/phone-ssh 'systemctl restart omamobile-speaker-protection'`, since the running watchdog is still the old one and doesn't answer the mode handshake (on the phone, `earpiece off` then muted both amplifiers until a restart); then `tools/phone-ssh "$U"'; as_user systemctl --user restart pipewire pipewire-pulse wireplumber; sleep 3; as_user pactl list cards \| grep -E "Active Profile\|Voice Call"'`; `ctl`; `flinks` | low | `omamobile-audio 0.5.5`; profiles list "Voice Call", active profile still HiFi; `ctl` as in E0 and "mode: speaker; the watchdog enforces: speaker"; `flinks`: `2`, then `output_FL` and `output_FR` of `effect_output.omamobile_speaker_loudness` each into `alsa_output.platform-sound-aoc.HiFi__Speaker__sink` | no Voice Call profile (the UCM did not parse: `as_user journalctl --user -u wireplumber -b \| tail`); `flinks` with fewer than 2 filter nodes or no link into the speaker sink (the filter is gone or bypassed: music would skip the limiters); rollback: reinstall 0.5.4 |
    | E2 | **Earpiece on by hand, no stream** (announce the mode change): `tools/phone-ssh 'omamobile-speaker-protection earpiece on'; ctl; tools/phone-ssh 'journalctl -u omamobile-speaker-watch -n 3 --no-pager'` | low | "earpiece mode on"; Top: PCM Source 0 (ASP), analog 6, digital 657, DRE on; Bottom: PCM Source 1, analog 10, digital 0; "mode: earpiece; the watchdog enforces: earpiece"; the watchdog logs "earpiece mode: Top through ASP or DSP at digital <= 737, analog <= 6" | a refusal (record its reason; nothing changed); any other value; a mute. Rollback: restart |
    | E3 | **Earpiece off by hand, no stream:** `tools/phone-ssh 'omamobile-speaker-protection earpiece off'; ctl` | low | "earpiece mode off"; every value as in E0; "mode: speaker; the watchdog enforces: speaker" | any value that differs from E0. Rollback: restart |
-   | E4 | **The Voice Call profile switches the mode itself (polkit), no stream:** `prof "Voice Call"; ctl; tools/phone-ssh 'journalctl -u "omamobile-earpiece@*" -n 5 --no-pager'` | low | active profile Voice Call; the earpiece state as in E2; the journal shows `omamobile-earpiece@on` ran as a unit; `as_user pactl list short sinks` shows only the Earpiece sink | the profile does not switch, or the journal shows "Interactive authentication required" (polkit did not see the user's PipeWire as local and active: record it; the rule needs another subject test, a later version) and the amplifiers stay in speaker mode. Rollback: `prof HiFi` |
+   | E4 | **The Voice Call profile switches the mode itself (polkit), no stream:** `prof "Voice Call"; ctl; tools/phone-ssh 'journalctl -u "omamobile-earpiece@*" -n 5 --no-pager'`; `flinks` | low | active profile Voice Call; the earpiece state as in E2; the journal shows `omamobile-earpiece@on` ran as a unit; `as_user pactl list short sinks` shows only the Earpiece sink; `flinks`: `2` and "no link from the filter" (nothing from `effect_output.omamobile_speaker_loudness` into the Earpiece sink) | the profile does not switch, or the journal shows "Interactive authentication required" (polkit did not see the user's PipeWire as local and active: record it; the rule needs another subject test, a later version) and the amplifiers stay in speaker mode; **any** `flinks` line into `…Voice_Call__Earpiece__sink` (the filter's 6 dB drive at the ear: play nothing, `prof HiFi`). Rollback: `prof HiFi` |
    | E5 | **The tone at the lowest level** (657/6), `tools/phone-ssh 'omamobile-speaker-protection signal tone /tmp/ear30.wav --level -30 --seconds 1.5 --channels left'`, then with the phone at arm's length `ear_play /tmp/ear30.wav 100%`, then with the phone at the ear the same | low | at arm's length a faint beep from the top edge, or nothing; at the ear a clear, quiet beep; the bottom speaker silent; no watchdog line but the mode's | sound from the bottom speaker, a beep too loud at arm's length, a buzz, a mute. Rollback: `prof HiFi`, restart |
    | E6 | **Speech at the ear:** a mono speech recording under 30 s with no music bed, copied to `/tmp/speech.flac`; `ear_play /tmp/speech.flac 60%`, then `100%` | low | intelligible and comfortable, or quiet; record which at each volume. If too quiet at 100 %, record it: a higher earpiece level (up to the 737 ceiling) is its own step in a later session | distortion, buzz, a mute. Rollback: `prof HiFi`, restart |
-   | E7 | **Back to the speakers:** `prof HiFi; ctl`; then, announced, `tools/phone-ssh 'S=omamobile-speaker-protection; $S signal multitone /tmp/mtL.wav --level -20 --seconds 2 --channels left; $S signal multitone /tmp/mtR.wav --level -20 --seconds 2 --channels right'` and `tools/phone-ssh "$U"'; as_user wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.6; as_user pw-play /tmp/mtL.wav; as_user pw-play /tmp/mtR.wav'`, then 15 s of music the listener knows at their volume | low | the journal shows `omamobile-earpiece@off` ran; every value as in E0; the left multitone from the top speaker, the right from the bottom; music on both through the filter as before | a value that differs, one speaker silent, a mute. Rollback: restart |
+   | E7 | **Back to the speakers:** `prof HiFi; ctl; flinks`; then, announced, `tools/phone-ssh 'S=omamobile-speaker-protection; $S signal multitone /tmp/mtL.wav --level -20 --seconds 2 --channels left; $S signal multitone /tmp/mtR.wav --level -20 --seconds 2 --channels right'` and `tools/phone-ssh "$U"'; as_user wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.6; as_user pw-play /tmp/mtL.wav; as_user pw-play /tmp/mtR.wav'`, then 15 s of music the listener knows at their volume | low | the journal shows `omamobile-earpiece@off` ran; every value as in E0; `flinks` as in E1 (the filter back in front of the speaker sink); the left multitone from the top speaker, the right from the bottom; music on both through the filter as before | a value that differs, `flinks` not as in E1 (play nothing: the music would skip the filter), one speaker silent, a mute. Rollback: restart |
    | E8 | **A restart in earpiece mode** (announce: speakers cut out for about 5 s): `tools/phone-ssh 'omamobile-speaker-protection earpiece on; systemctl restart omamobile-speaker-protection; sleep 2'; ctl` | low | every value as in E0, "mode: speaker" | earpiece values after the restart. Rollback: restart again |
 
    Record the results here with the date and `uname -r`.

@@ -12,11 +12,27 @@ Findings from real hardware, newest first. `BRINGUP-M1.md` is the research map w
   `off` restores and reads back every control. A "Voice Call" UCM verb
   (never the default) has an Earpiece sink on the speaker's PCM that
   switches the mode through `omamobile-earpiece@on|off.service` and a
-  polkit rule. The speaker filter's 6 dB drive is not in front of the
-  earpiece. Earpiece mode refuses while the boost converter is on,
+  polkit rule. Earpiece mode refuses while the boost converter is on,
   because it follows the earpiece's analog gain of 6 (C9j). It never
   touches the boost peak current: stock's in-call 3.5 A and gain 7 stay
   out.
+- **A smart filter follows the default sink when its target is gone.** On
+  the phone, with the Voice Call profile active (the speaker sink gone, the
+  Earpiece sink the default), `pw-link -l` showed the speaker filter's
+  output (`effect_output.omamobile_speaker_loudness`) linked into the
+  Earpiece sink: its 6 dB of limiter drive at the ear. WirePlumber 0.5
+  hands a smart filter whose `filter.smart.target` matches nothing to the
+  default-target hooks unless the stream has `node.dont-fallback`; with
+  that alone it destroys the stream while the target is missing, which is
+  every PipeWire start, so `node.linger` too. A `target.object` with
+  `node.dont-reconnect` destroyed the filter even in HiFi (music
+  unfiltered). Fixed in the branch's 0.5.5; proven offline on null sinks;
+  C9k's E1, E4 and E7 check the links.
+- **Restart the protection service after installing 0.5.5.** The running
+  watchdog was 0.5.4's and didn't answer the new mode handshake, so
+  `earpiece off` muted both amplifiers until
+  `systemctl restart omamobile-speaker-protection` (harmless: muted is the
+  safe side). C9k E1 now restarts it.
 
 ## 2026-10-27: the muted speakers were the open-loop coil estimate, not sleep; the static was the boost converter; the earpiece is the top speaker
 
