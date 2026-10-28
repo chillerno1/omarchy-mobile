@@ -2,6 +2,43 @@
 
 Findings from real hardware, newest first. `BRINGUP-M1.md` is the research map written before first boot.
 
+## 2026-10-28: upower suspended the phone at 2 % and it ran flat awake
+
+Read-only R0 the next morning; times are the phone's.
+
+- **With auto-sleep off, the phone stayed awake overnight unplugged.** At
+  03:43 upower's critical action ran at 2 %. The phone's
+  `/etc/UPower/UPower.conf` is upower 1.91.5's default
+  (`UsePercentageForPolicy=true`, `PercentageLow=20.0`,
+  `PercentageCritical=5.0`, `PercentageAction=2.0`,
+  `AllowRiskyCriticalPowerAction=false`, `CriticalPowerAction=Auto`), and
+  `/etc/UPower/UPower.conf.d` exists. `GetCriticalAction`
+  returns "Sleep": Auto is logind's `Sleep()`, and with hibernation off
+  (our `sleep.conf` drop-in) that is a suspend.
+- **The gauge (max170xx on the MAX77759) woke it 3 minutes later** on its
+  1 % alert, as expected (SUSPEND-PLAN 6.3). upower acts only when the
+  warning level changes (`up_daemon_set_warning_level()` returns early on
+  the same level), and the phone was still at Action level, so nothing
+  acted again. **It browned out awake at 03:53** with the root file system
+  mounted; this boot showed no file system errors.
+- **The "2 %" was about 10 minutes of charge,** half the 20 minutes 6.6
+  had estimated from the s2idle draw.
+- **Auto-sleep had no low-battery floor either.** With the toggle on,
+  `omamobile-sleepd` would have put the phone back to sleep 5 s after each
+  gauge wake, and it would have browned out asleep.
+- **Fix, offline (branch `low-battery-poweroff`):** an upower drop-in,
+  `CriticalPowerAction=PowerOff` at 5 % with critical at 8 %
+  (omamobile-device-cheetah 0.1.35), and a floor in `omamobile-sleepd`: no
+  auto-sleep at 8 % and below unless on a charger (omamobile-shell 0.2.36).
+  The power-off needs the first `systemctl poweroff` from Linux (P7) to
+  pass first; SUSPEND-PLAN 6.6 and runbook B1-B5.
+- **upower 1.91.5's drop-ins, from its source:** read only from
+  `/etc/UPower/UPower.conf.d`, files named `NN-name.conf`; a key counts
+  only if the main `UPower.conf` has it; percentages are read as whole
+  numbers; unless Low > Critical > Action, all three fall back to 20/5/2.
+- upower's history files in `/var/lib/upower` carry the battery's
+  identifier in their names: quote values, never the file names.
+
 ## 2026-10-27: the muted speakers were the open-loop coil estimate, not sleep; the static was the boost converter; the earpiece is the top speaker
 
 - **The speaker watchdog had muted media at every boot since 10-26 22:28**
