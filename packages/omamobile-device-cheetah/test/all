@@ -75,3 +75,36 @@ grep -qx '\[Login\]' "$power" || fail "the power-key drop-in needs a [Login] hea
 grep -qx 'HandlePowerKey=ignore' "$power" || fail "a short press must not power the phone off"
 grep -qx 'HandlePowerKeyLongPress=ignore' "$power" || fail "the long press stays the PMIC reset"
 pass "install stages the package"
+
+# upower's critical action (SUSPEND-PLAN 6.6, stage B): power off at 5 %.
+# The rules are upower 1.91's own (src/up-config.c, src/up-daemon.c): a
+# drop-in is read only if its name is NN-name.conf, only its [UPower] keys
+# count, and only keys the main UPower.conf already has; the percentages
+# are read as whole numbers and must fall strictly, each under 100, or all
+# three fall back to 20/5/2.
+upower_conf="$tmp/root/etc/UPower/UPower.conf.d/10-omamobile.conf"
+[[ -f $upower_conf ]] || fail "install stages the upower drop-in in /etc/UPower/UPower.conf.d"
+grep -qE "^backup=\(.*etc/UPower/UPower\.conf\.d/10-omamobile\.conf" PKGBUILD || fail "the upower drop-in is a backup file"
+python3 - "$upower_conf" <<'PY' || fail "the upower drop-in powers off at 5 %, with strictly falling whole percentages"
+import configparser, os, re, sys
+path = sys.argv[1]
+assert re.fullmatch(r"[0-9][0-9]-[A-Za-z0-9_-]*\.conf", os.path.basename(path)), "upower ignores this file name"
+c = configparser.ConfigParser(interpolation=None, strict=True, comment_prefixes=("#",))
+c.optionxform = str
+c.read(path)
+assert c.sections() == ["UPower"], c.sections()
+u = c["UPower"]
+# Keys of upower 1.91.5's UPower.conf; a drop-in key missing from it is ignored.
+known = {"EnableWattsUpPro", "NoPollBatteries", "IgnoreLid", "UsePercentageForPolicy",
+         "PercentageLow", "PercentageCritical", "PercentageAction", "TimeLow", "TimeCritical",
+         "TimeAction", "AllowRiskyCriticalPowerAction", "ExpectBatteryRecalibration",
+         "CriticalPowerAction"}
+assert set(u) <= known, set(u) - known
+assert u["CriticalPowerAction"] == "PowerOff", u["CriticalPowerAction"]
+assert u["UsePercentageForPolicy"] == "true"
+low, crit, act = (float(u[k]) for k in ("PercentageLow", "PercentageCritical", "PercentageAction"))
+assert all(v == int(v) for v in (low, crit, act)), "upower truncates percentages to whole numbers"
+assert 100 > low > crit > act > 0, (low, crit, act)
+assert (crit, act) == (8, 5), (crit, act)
+PY
+pass "upower powers the phone off at 5 % (critical 8 %), as upower reads drop-ins"

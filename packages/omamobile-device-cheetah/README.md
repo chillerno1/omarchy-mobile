@@ -14,6 +14,7 @@ Omarchy Mobile's system support for the Google Pixel 7 Pro (codename cheetah, Te
 | `vendor/systemd/network/20-usb-gadget.network` | `/usr/lib/systemd/network` | USB networking to a host (172.16.42.1) |
 | `vendor/NetworkManager/conf.d/10-omamobile-usb.conf` | `/usr/lib/NetworkManager/conf.d` | Keeps NetworkManager off the USB link |
 | `vendor/systemd/logind.conf.d/10-omamobile-power-key.conf` | `/usr/lib/systemd/logind.conf.d` | A short power press opens the system menu instead of powering off |
+| `etc/UPower/10-omamobile.conf` | `/etc/UPower/UPower.conf.d/10-omamobile.conf` (a backup file; upower reads drop-ins only from `/etc`) | upower's critical action: power off at 5 %, critical at 8 %, instead of upower's default sleep at 2 %, which ran the phone flat while it slept (`device/cheetah/SUSPEND-PLAN.md` 6.6). Local changes go in a later file, such as `99-local.conf` |
 
 `./build [DIR]` compiles the C tools, `./install DESTDIR [DIR]` stages everything and enables nothing, and `test/all` runs the package tests.
 
