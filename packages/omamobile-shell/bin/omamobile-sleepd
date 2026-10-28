@@ -25,7 +25,12 @@
 #   - an SSH session is open (the USB link drops while the phone sleeps);
 #   - something holds a logind sleep inhibitor in block mode (a call, GNSS,
 #     systemd-inhibit --what=sleep);
-#   - a PipeWire sink is RUNNING (media playing).
+#   - a PipeWire sink is RUNNING (media playing);
+#   - the battery is at or below OMAMOBILE_SLEEP_MIN_BATTERY percent (8) and
+#     not charging: the phone stays awake so that upower's critical action
+#     (on the Pixel 7 Pro a power-off at 5 %, omamobile-device-cheetah) runs
+#     before the battery is empty, rather than the phone running flat
+#     asleep (SUSPEND-PLAN 6.6). Never on the charger.
 set -u
 
 int() { [[ $1 =~ ^[0-9]+$ ]] && echo "$1" || echo "$2"; }
@@ -34,6 +39,7 @@ after_off=$(int "${OMAMOBILE_SLEEP_AFTER_OFF:-30}" 30)
 ((after_off >= 5)) || after_off=5
 grace=$(int "${OMAMOBILE_SLEEP_GRACE:-5}" 5)
 now_delay=$(int "${OMAMOBILE_SLEEP_NOW_DELAY:-2}" 2)
+min_battery=$(int "${OMAMOBILE_SLEEP_MIN_BATTERY:-8}" 8)
 # Polls: every 2 s with the screen off and locked, every 5 s otherwise.
 poll=2
 idle_poll=5
@@ -92,6 +98,35 @@ playing() {
   pactl list short sinks 2>/dev/null | awk -F'\t' '$NF == "RUNNING" { print $2; exit }'
 }
 
+# The battery is low and nothing charges it: prints "N %, status". The
+# system battery is the first power supply of type Battery that isn't a
+# device's own (a headset's has scope Device). A Charging, Full or "Not
+# charging" battery, or any external supply online (USB, mains, wireless),
+# counts as charging. Unknown counts as discharging: a wrong refusal keeps a
+# phone on a cable awake, which costs nothing, while a wrong sleep is the
+# brown-out this check exists for (the gauge reported Unknown on a charger
+# once, NOTES 2026-10-18). With no readable capacity there is no floor.
+battery_low() {
+  local d bat= cap status
+  for d in "$sys"/class/power_supply/*; do
+    [[ -r $d/type ]] || continue
+    case $(<"$d/type") in
+      Battery)
+        [[ -z $bat && $(cat "$d/scope" 2>/dev/null) != Device ]] && bat=$d ;;
+      Mains|USB|USB_*|Wireless)
+        [[ $(cat "$d/online" 2>/dev/null) == 1 ]] && return 1 ;;
+    esac
+  done
+  [[ -n $bat ]] || return 1
+  cap=$(cat "$bat/capacity" 2>/dev/null) || return 1
+  [[ $cap =~ ^[0-9]+$ ]] && ((cap <= min_battery)) || return 1
+  status=$(cat "$bat/status" 2>/dev/null) || status=
+  case $status in
+    Charging|Full|"Not charging") return 1 ;;
+  esac
+  echo "$cap %, ${status:-no status}"
+}
+
 # Why sleep isn't allowed now; prints nothing and fails when it is.
 refusal() {
   local who
@@ -99,6 +134,7 @@ refusal() {
   screen_off || { echo "the screen is on"; return 0; }
   secure || { echo "the lock isn't secure"; return 0; }
   [[ -e $stay_awake ]] && { echo "Stay awake is on"; return 0; }
+  who=$(battery_low) && { echo "the battery is low ($who; awake at ${min_battery} % and below, so upower can power off)"; return 0; }
   ssh_open && { echo "an SSH session is open"; return 0; }
   who=$(blockers | head -n 1)
   [[ -n $who ]] && { echo "a sleep inhibitor is held ($who)"; return 0; }
@@ -137,7 +173,7 @@ watch() {
   last_ok=$(count success)
   last_fail=$(count fail)
   trap 'want_now=1' USR1
-  log "watching: sleep ${after_off} s after the screen goes off behind a secure lock, ${grace} s after a dark resume (toggle omamobile-sleep)"
+  log "watching: sleep ${after_off} s after the screen goes off behind a secure lock, ${grace} s after a dark resume, not at ${min_battery} % and below on battery (toggle omamobile-sleep)"
   while :; do
     t=$(clock)
     [[ -n ${OMAMOBILE_SLEEPD_STOP_AT:-} ]] && ((t >= OMAMOBILE_SLEEPD_STOP_AT)) && return 0

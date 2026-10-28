@@ -45,6 +45,7 @@ reset() {
   echo 0 >"$t/sys/power/suspend_stats/success"; echo 0 >"$t/sys/power/suspend_stats/fail"
   printf ' 145:          3          0  s2mpg12-pmic   0 Edge      rtc-alarm0\n' >"$t/proc/interrupts"
   printf ' 111:         76          1  gpa10   0 Edge      KEY_POWER\n' >>"$t/proc/interrupts"
+  rm -rf "$t/sys/class/power_supply"
   rm -f "$t/wake_irq" "$t/sys/power/pm_wakeup_irq" "$t/on_resume" "$t/now_at" "$t/off_at" "$t/active" "$t/home/.local/state/omarchy/indicators/stay-awake"
 }
 # Watch until the fake clock reaches 1000 + $1.
@@ -71,8 +72,8 @@ at=$(first_at); ((at >= 1005 && at <= 1009)) || fail "the wait is never under 5 
 echo "ok - sleepd: sleeps once the screen has been off behind a secure lock for OMAMOBILE_SLEEP_AFTER_OFF"
 
 # Each refusal on its own: no "systemctl suspend" in 200 s, and one log line.
-refused() { # NAME SETUP...
-  reset; eval "$2"; watch 200
+refused() { # NAME SETUP [VAR=VALUE...]
+  reset; eval "$2"; watch 200 "${@:3}"
   [[ $(suspends) == 0 ]] || fail "$1: no sleep"
 }
 refused "the toggle is off" 'rm -f "$t/toggle"'
@@ -89,6 +90,44 @@ refused "a RUNNING sink" 'printf "50\talsa_output.aoc\tPipeWire\ts16le 2ch 48000
 grep -c 'not sleeping: audio is playing (alsa_output.aoc)' "$t/out" >/dev/null || fail "the playing sink is named"
 refused "Stay awake" 'mkdir -p "$t/home/.local/state/omarchy/indicators"; touch "$t/home/.local/state/omarchy/indicators/stay-awake"'
 echo "ok - sleepd: never with the toggle off, the screen on, an insecure lock, SSH, an inhibitor, media or Stay awake"
+
+# The low-battery floor (OMAMOBILE_SLEEP_MIN_BATTERY, 8): awake at or below
+# it on battery, so upower's power-off at 5 % runs while the phone is awake.
+# battery NAME CAPACITY STATUS [SCOPE]; charger NAME TYPE ONLINE.
+battery() {
+  local d=$t/sys/class/power_supply/$1; mkdir -p "$d"
+  echo Battery >"$d/type"; echo "$2" >"$d/capacity"
+  if [[ $3 == - ]]; then rm -f "$d/status"; else echo "$3" >"$d/status"; fi
+  [[ -n ${4:-} ]] && echo "$4" >"$d/scope"
+  return 0
+}
+charger() { local d=$t/sys/class/power_supply/$1; mkdir -p "$d"; echo "$2" >"$d/type"; echo "$3" >"$d/online"; }
+allowed() { # NAME SETUP [VAR=VALUE...]
+  reset; eval "$2"; watch 100 "${@:3}"
+  [[ $(suspends) -ge 1 ]] || fail "$1: sleeps"
+}
+refused "discharging at 7 %" 'battery max170xx_battery 7 Discharging; charger max77759-charger USB 0'
+grep -c 'not sleeping: the battery is low (7 %, Discharging; awake at 8 % and below, so upower can power off)' "$t/out" >/dev/null \
+  || fail "the low battery is logged with its level and why"
+refused "discharging at 8 % (the floor itself)" 'battery max170xx_battery 8 Discharging'
+allowed "discharging at 9 %" 'battery max170xx_battery 9 Discharging; charger max77759-charger USB 0'
+allowed "charging at 3 %" 'battery max170xx_battery 3 Charging'
+allowed "not charging at 3 % (on a charger that holds the charge)" 'battery max170xx_battery 3 "Not charging"'
+allowed "discharging at 3 % with a charger online (a load above its input limit)" 'battery max170xx_battery 3 Discharging; charger max77759-charger USB 1'
+refused "an Unknown status at 5 % with no charger online" 'battery max170xx_battery 5 Unknown; charger max77759-charger USB 0'
+allowed "an Unknown status at 5 % with a charger online" 'battery max170xx_battery 5 Unknown; charger max77759-charger USB 1'
+refused "no status at 5 %" 'battery max170xx_battery 5 -'
+allowed "no readable capacity" 'battery max170xx_battery x Discharging'
+allowed "a headset's battery (scope Device) at 3 %" 'battery hid-headset 3 Discharging Device; battery max170xx_battery 60 Discharging'
+refused "OMAMOBILE_SLEEP_MIN_BATTERY raises the floor" 'battery max170xx_battery 9 Discharging' OMAMOBILE_SLEEP_MIN_BATTERY=10
+grep -c 'the battery is low (9 %, Discharging; awake at 10 % and below' "$t/out" >/dev/null || fail "the raised floor is the reason"
+allowed "OMAMOBILE_SLEEP_MIN_BATTERY lowers the floor" 'battery max170xx_battery 7 Discharging' OMAMOBILE_SLEEP_MIN_BATTERY=5
+# A dark resume (the gauge's 1 % alert) that finds the battery at the floor stays awake.
+reset; battery max170xx_battery 9 Discharging; echo 'echo 8 >"'"$t"'/sys/class/power_supply/max170xx_battery/capacity"' >"$t/on_resume"; watch 700
+[[ $(suspends) == 1 ]] || fail "a dark resume at the floor stays awake ($(suspends) suspends)"
+reset; battery max170xx_battery 7 Discharging; out=$(sleepd check) && fail "check: exit 1 on a low battery"
+[[ $out == "not sleeping: the battery is low (7 %, Discharging; awake at 8 % and below, so upower can power off)" ]] || fail "check names the low battery ($out)"
+echo "ok - sleepd: awake at or below 8 % on battery (Unknown counts as battery), never on a charger"
 
 # Delay-mode inhibitors (NetworkManager, the lock) and idle sinks don't count.
 reset
