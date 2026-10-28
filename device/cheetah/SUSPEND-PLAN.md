@@ -27,8 +27,8 @@ awake and unplugged, the phone reached 2 %; upower's default critical
 action suspended it, the gauge woke it 3 min later, upower never acted
 again, and it browned out awake 10 min after the suspend (NOTES
 2026-10-28). Branch `low-battery-poweroff`: an upower drop-in that powers
-off at 5 % (omamobile-device-cheetah 0.1.35) and a low-battery floor in
-`omamobile-sleepd` (omamobile-shell 0.2.36), section 6.6; runbook B1-B5
+off at 5 % (omamobile-device-cheetah 0.1.36) and a low-battery floor in
+`omamobile-sleepd` (omamobile-shell 0.2.37), section 6.6; runbook B1-B5
 after P8.
 
 Earlier status (2026-10-19): **S0-S6 passed and S7 is measured.**
@@ -320,7 +320,7 @@ the lock screen) only delay sleep and don't count.
 | --- | --- | --- |
 | The toggle | sleep only with `omarchy-toggle omamobile-sleep on` (off by default; the first release ships it off) | `omamobile-sleepd` |
 | Screen on, or the lock not `secure` | never sleeps; only a positive "off" (bl_power != 0 or every monitor DPMS off) counts | `omamobile-sleepd` |
-| A low battery | at or below `OMAMOBILE_SLEEP_MIN_BATTERY` % (8) with no charger, so that upower's power-off at 5 % runs awake (6.6); never on a charger, and an Unknown status counts as discharging (omamobile-shell 0.2.36) | `omamobile-sleepd` |
+| A low battery | at or below `OMAMOBILE_SLEEP_MIN_BATTERY` % (8) with no charger, so that upower's power-off at 5 % runs awake (6.6); never on a charger, and an Unknown status counts as discharging (omamobile-shell 0.2.37) | `omamobile-sleepd` |
 | Stay awake | Omarchy's idle indicator (`omarchy-toggle-idle stay-awake`, the quick-settings tile) also keeps the phone out of sleep, screen off or not: the user's "Keep awake" for a download or a long task | `omamobile-sleepd` |
 | An SSH session | any established connection to port 22 (`ss`); if `ss` can't answer, it refuses. We work over USB SSH, and the link drops in sleep | `omamobile-sleepd` |
 | Media playing | a PipeWire sink in state `RUNNING` (`pactl list short sinks`; idle sinks read IDLE or SUSPENDED). Checked by the watcher itself rather than an inhibitor in `omamobile-audio` | `omamobile-sleepd` |
@@ -361,7 +361,7 @@ the inhibitor above covers calls only once the AP is awake), and recording
     - It doesn't touch the panel: the screen-off flows below have already
       blanked it, and lighting it is the key handler's job.
   - They act whenever something calls `systemctl suspend`: upower's
-    critical action until device-cheetah 0.1.35 (NOTES 2026-10-18,
+    critical action until device-cheetah 0.1.36 (NOTES 2026-10-18,
     2026-10-28; 6.6) or a root shell; Omarchy's menu hides
     Suspend while `suspend-off` is set.
 - **The watcher, `omamobile-sleepd` (omamobile-shell 0.2.29, written
@@ -499,7 +499,7 @@ re-slept 5 s after every gauge wake, ending in a brown-out asleep.
 
 **Decision (2026-10-28): power off at 5 %, once B1 passes.**
 
-- **`omamobile-device-cheetah` 0.1.35** ships
+- **`omamobile-device-cheetah` 0.1.36** ships
   `/etc/UPower/UPower.conf.d/10-omamobile.conf` (a backup file):
   `UsePercentageForPolicy=true`, `PercentageLow=20.0`,
   `PercentageCritical=8.0`, `PercentageAction=5.0`,
@@ -526,7 +526,7 @@ re-slept 5 s after every gauge wake, ending in a brown-out asleep.
     "yes": B2 checks it;
   - a symlinked drop-in whose target is gone is skipped, which B4 uses
     to make its test file vanish at power-off.
-- **`omamobile-shell` 0.2.36: the floor.** `omamobile-sleepd` refuses
+- **`omamobile-shell` 0.2.37: the floor.** `omamobile-sleepd` refuses
   sleep while the system battery is at or below
   `OMAMOBILE_SLEEP_MIN_BATTERY` (8, upower's critical level) and nothing
   charges it ("not sleeping: the battery is low (7 %, Discharging; …)").
@@ -1599,7 +1599,7 @@ tools/phone-ssh 'sync; systemctl poweroff'
   fallback to slot A. Then upower keeps its default and 6.6 records why.
 - **Rollback:** Power held to boot.
 - **Then:** stage B (B2-B5, after P8): the upower drop-in of 6.6
-  (device-cheetah 0.1.35) and the sleepd floor (omamobile-shell 0.2.36).
+  (device-cheetah 0.1.36) and the sleepd floor (omamobile-shell 0.2.37).
   P7 is B1.
 
 #### P8: standby numbers (risk: low; the human unplugs)
@@ -1623,8 +1623,8 @@ after M4.2 and a backup check), and SYS_SLEEP (section 5).
 ### Low-battery runbook: B1-B5 (written 2026-10-28, not yet run)
 
 Section 6.6 has the why. Two packages from branch `low-battery-poweroff`:
-`omamobile-device-cheetah` 0.1.35 (upower: power off at 5 %, critical at
-8 %) and `omamobile-shell` 0.2.36 (`omamobile-sleepd` stays awake at 8 % and
+`omamobile-device-cheetah` 0.1.36 (upower: power off at 5 %, critical at
+8 %) and `omamobile-shell` 0.2.37 (`omamobile-sleepd` stays awake at 8 % and
 below on battery). Record `uname -r` with each result.
 
 Ground rules:
@@ -1651,7 +1651,7 @@ passes.
 - **Pass, Stop, Rollback:** as P7. Note too what ABL shows when the cable
   goes back in after the power-off (P7's question), since that is what a
   user sees after a low-battery power-off.
-- **If P7 fails:** don't install device-cheetah 0.1.35 (or remove its
+- **If P7 fails:** don't install device-cheetah 0.1.36 (or remove its
   drop-in and restart upower); upower keeps its default and 6.6 records
   why. The sleepd floor (B3) still helps on its own: the phone then dies
   awake at upower's suspend, not asleep.
@@ -1659,7 +1659,7 @@ passes.
 #### B2: install the drop-in; upower reads it (risk: low; announce: the battery icon may blink while upower restarts)
 
 ```sh
-tools/phone-install-package packages/omamobile-device-cheetah     # 0.1.35
+tools/phone-install-package packages/omamobile-device-cheetah     # 0.1.36
 tools/phone-ssh 'cat /usr/share/omamobile/device-cheetah/version; ls -l /etc/UPower/UPower.conf.d/
 grep -cE "^(PercentageLow|PercentageCritical|PercentageAction|CriticalPowerAction|UsePercentageForPolicy)=" /etc/UPower/UPower.conf
 systemctl restart upower; sleep 3; systemctl is-active upower
@@ -1669,7 +1669,7 @@ busctl get-property org.freedesktop.UPower /org/freedesktop/UPower/devices/Displ
 journalctl -b -u upower -o cat | tail -5'
 ```
 
-- **Expect:** version 0.1.35; `10-omamobile.conf` in the directory; 5
+- **Expect:** version 0.1.36; `10-omamobile.conf` in the directory; 5
   (the main file has every key the drop-in sets, or upower ignores them);
   `active`; `s "PowerOff"`; `s "yes"`; `u 1` (None, on the cable); no
   "risky" warning in upower's journal.
@@ -1699,7 +1699,7 @@ the 5 % threshold.
    add the type to `battery_low()`.
 2. Install and restart the watcher:
    ```sh
-   tools/phone-install-package packages/omamobile-shell     # 0.2.36
+   tools/phone-install-package packages/omamobile-shell     # 0.2.37
    tools/phone-ssh 'U=$(id -nu 1000); M="systemctl --user -M $U@"; $M daemon-reload; $M restart omamobile-sleepd.service
      journalctl _SYSTEMD_USER_UNIT=omamobile-sleepd.service -o cat | tail -1'
    ```
@@ -1832,8 +1832,8 @@ cat /var/lib/upower/history-charge-*.dat | tail -5'
 | PM debug config | negligible | on in test kernels | n/a |
 | Clearing `suspend-off` | users suspend a kernel that can't | only in S8, on the shipping image | set the toggle again |
 | `omamobile-sleepd` and the power key's request | a phone that sleeps under the user (missed Power wake, a sleep during media or over SSH) | the `omamobile-sleep` toggle off | `omarchy-toggle omamobile-sleep off`; previous omamobile-shell |
-| upower drop-in: power off at 5 % (device-cheetah 0.1.35) | a power-off that hangs or reboots (B1); a test drop-in left behind powers off every boot on battery (B4) | on with the package; acts only on battery at 5 % | remove the drop-in and restart upower; previous package |
-| sleepd's low-battery floor (omamobile-shell 0.2.36) | a floor that reads a charger wrongly keeps the phone awake on battery or asleep on a flat one | on with the package, at 8 % | `OMAMOBILE_SLEEP_MIN_BATTERY=0` in `~/.config/environment.d`; previous omamobile-shell |
+| upower drop-in: power off at 5 % (device-cheetah 0.1.36) | a power-off that hangs or reboots (B1); a test drop-in left behind powers off every boot on battery (B4) | on with the package; acts only on battery at 5 % | remove the drop-in and restart upower; previous package |
+| sleepd's low-battery floor (omamobile-shell 0.2.37) | a floor that reads a charger wrongly keeps the phone awake on battery or asleep on a flat one | on with the package, at 8 % | `OMAMOBILE_SLEEP_MIN_BATTERY=0` in `~/.config/environment.d`; previous omamobile-shell |
 | Sleep inhibitors (calls, GNSS) | the phone never sleeps (a leaked inhibitor) | on with their packages | `systemd-inhibit --list` names the holder; stop its unit |
 
 ## 10. Open questions

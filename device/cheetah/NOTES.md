@@ -28,8 +28,8 @@ Read-only R0 the next morning; times are the phone's.
   gauge wake, and it would have browned out asleep.
 - **Fix, offline (branch `low-battery-poweroff`):** an upower drop-in,
   `CriticalPowerAction=PowerOff` at 5 % with critical at 8 %
-  (omamobile-device-cheetah 0.1.35), and a floor in `omamobile-sleepd`: no
-  auto-sleep at 8 % and below unless on a charger (omamobile-shell 0.2.36).
+  (omamobile-device-cheetah 0.1.36), and a floor in `omamobile-sleepd`: no
+  auto-sleep at 8 % and below unless on a charger (omamobile-shell 0.2.37).
   The power-off needs the first `systemctl poweroff` from Linux (P7) to
   pass first; SUSPEND-PLAN 6.6 and runbook B1-B5.
 - **upower 1.91.5's drop-ins, from its source:** read only from
