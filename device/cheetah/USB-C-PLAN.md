@@ -457,7 +457,20 @@ knob.
   (gpa9-7) that can't reach the gauge's IRQ, unless the EINT mapping of
   gpa9 is off (AGENTS: gs201 EINT numbering); T1 tests that.
 
-### T1: does the stuck TCPC alert drive the gauge's IRQ? (risk: low; needs the maintainer's go: a write to the TCPC)
+### T1: does the stuck TCPC alert drive the gauge's IRQ? (not needed: answered read-only)
+
+**Answered without the write (2026-10-28, 22:10):** with no storm (0 gauge
+IRQs in 10 s), the TCPC still held `ALERT` 0xa803 and `VENDOR_ALERT`
+0x0001, so the pending alert alone doesn't drive the gauge's IRQ. The
+lead now is the gauge's own SOC alert: the driver re-arms SALRT at
+RepSOC ±1 % after each alert, and while the chip's estimates disagree
+(low charge, a model just loaded or failed) the window may be crossed
+again at once. Quiet at 11.9 %: RepSOC 11.86, AvSOC 11.67, MixSOC 11.58,
+VFSOC 11.73 %, SALRT 10-12 %, MiscCFG 0x3870. A read-only watcher
+(`x-fg-storm-watch`, log `/var/log/fg-storm.log`) records STATUS, SALRT,
+MiscCFG and the four SOC registers whenever the rate passes 20/s. The
+steps below stay for the record.
+
 
 Only while the storm runs. Bus 5, TCPC at 0x25 (`TCPC_ALERT` 0x10,
 `TCPC_ALERT_MASK` 0x12, `TCPC_VENDOR_ALERT` 0x80; write-1-to-clear).
