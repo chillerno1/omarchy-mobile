@@ -2,6 +2,44 @@
 
 Findings from real hardware, newest first. `BRINGUP-M1.md` is the research map written before first boot.
 
+## 2026-10-29: the fuel gauge's interrupt bursts are fixed on a test kernel; the charger stopped at 92 %
+
+Test kernel `7.3.0-rc6-omamobile-push1-00566-g66497d0197dc` (branch
+`omamobile-battery-irq`: `omamobile-int` 017e90d2f671 plus three
+max17042_battery commits, not published), device-cheetah 0.1.34, on the
+laptop's USB port.
+
+- **The bursts:** on 00591 every whole-percent RepSOC crossing gave 300-460
+  gauge interrupts in about a second, each with a `power_supply_changed`
+  (37,399 in one 12-hour boot, 43,960 in the boot that ran flat overnight),
+  with STATUS reading 0 after the first. Cause: the MAX77759 keeps ALRT low
+  for up to about 351 ms after STATUS is cleared (one TaskPeriod, 0x2d00),
+  and the oneshot IRQ was unmasked at once; Google's `max1720x_battery.c`
+  waits 500 ms for the same reason. Our driver also armed both the SALRT
+  +/-1 % window and dSOCi (Config2 0x0090 from the model) on the same
+  boundary, and kept both armed in s2idle.
+- **The fix (three commits):** dSOCi only for the 1 % steps on the MAX77759
+  (SALRT at the critical 3 % only, dSOCen cleared in suspend); a 1.5 x
+  TaskPeriod hold-off (528 ms) before the handler returns on the MAX77759;
+  STATUS == 0 returns IRQ_NONE with no uevent (all gauges).
+- **Result:** SALRT read 0xff03, Config2 0x0090. Charging 93 % to 100 %
+  (10:24-10:43), the eight percent steps took 1, 0, 0, 2, 1, 1, 1 and 1
+  interrupts (8 in the boot), and 7 battery uevents in all. No max170xx or
+  max77759 errors, no "nobody cared". One s2idle cycle (`rtcwake -m freeze
+  -s 30`) slept 31 s and woke; Config2 read 0x0090 again after resume, no
+  gauge interrupt during it, no UFS error handler.
+- **Not yet:** gs101 (raven) uses the same driver and now gets the dSOCi
+  scheme too: it needs a raven test before the commits are published.
+- **The charger stopped at 92 % (00591):** after about 12 hours at the
+  500 mA input limit the charger read `online 0`, `Not charging` with the
+  cable in and USB working, and the battery current near 0. A reboot
+  brought it back (`Charging`, about 800 mA). Our max77759_charger never
+  programs the fast-charge timer (CHG_CNFG_01), so a timer fault is the
+  likeliest cause, unproven: the reboot cleared it before `health` was
+  read. A watcher now logs the charger's online, status, health and charge
+  type at every change (`/var/log/chg-watch.log`, transient unit
+  `x-chg-watch`).
+
 ## 2026-10-28: at 0 %, upower's critical suspend slept behind a lit lock screen and kept a charging phone flat
 
 Kernel `7.3.0-rc6-omamobile-push1-00591-gebc0cd6858ee`, omamobile-shell
