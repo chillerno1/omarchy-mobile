@@ -1,0 +1,115 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Runs inside tools/build-ingot-probe's disposable aarch64 Alpine container.
+set -eu
+apk add --no-cache gcc musl-dev cpio dtc python3 gzip
+
+[ "$(fdtget /input/ingot.dtb / model)" = 'Solana Mobile Saga' ] || {
+    echo 'Not a Solana Mobile Saga device tree' >&2; exit 1;
+}
+case " $(fdtget /input/ingot.dtb / compatible) " in
+    *' qcom,sm8475 '*) ;;
+    *) echo 'Not an SM8475 device tree' >&2; exit 1 ;;
+esac
+gzip -t /input/kernel || { echo 'Expected a gzip-compressed ARM64 Image' >&2; exit 1; }
+gzip -dc /input/kernel > /tmp/Image
+python3 - <<'PY'
+from pathlib import Path
+import sys
+with Path('/tmp/Image').open('rb') as stream:
+    stream.seek(56)
+    if stream.read(4) != b'ARM\x64':
+        sys.exit('Kernel has no ARM64 Image header')
+PY
+rm /tmp/Image
+
+stage=/tmp/rootfs
+mkdir -p "$stage"
+apk --root "$stage" --initdb --no-cache \
+    --repositories-file /etc/apk/repositories --keys-dir /etc/apk/keys add \
+    alpine-baselayout busybox dropbear iproute2 util-linux busybox-extras
+install -m755 /src/device/ingot/initramfs/init "$stage/init"
+mkdir -p "$stage/root/.ssh" "$stage/proc" "$stage/sys" "$stage/dev" "$stage/run"
+cp /input/key.pub "$stage/root/.ssh/authorized_keys"
+chmod 700 "$stage/root/.ssh"
+chmod 600 "$stage/root/.ssh/authorized_keys"
+gcc -Os -static -o "$stage/sbin/reboot-to" \
+    /src/packages/omamobile-device-cheetah/src/reboot-to.c
+
+# No vendor firmware or modules enter the probe. The remote processors are
+# disabled in the device tree; UFS is on, behind the init's read-only guard.
+cp /input/ingot.dtb /out/ingot.dtb
+# The dtbo overlay below targets &reserved_memory, which needs the base tree's
+# symbols: build the DTB with DTC_FLAGS=-@.
+fdtget /out/ingot.dtb /__symbols__ reserved_memory >/dev/null 2>&1 || {
+    echo 'The device tree has no __symbols__ (build it with DTC_FLAGS=-@)' >&2; exit 1;
+}
+for node in remoteproc@30000000 remoteproc@32300000 remoteproc@4080000 \
+            remoteproc@2400000; do
+    path=/soc@0/$node
+    if fdtget /out/ingot.dtb "$path" compatible >/dev/null 2>&1; then
+        [ "$(fdtget /out/ingot.dtb "$path" status 2>/dev/null || echo okay)" = disabled ] || {
+            echo "$path is not disabled in the device tree" >&2; exit 1;
+        }
+    fi
+done
+# ABL picks the base device tree by SoC ID. Upstream device trees for SM8450
+# and later can't carry these IDs, so only this image's copy gets them, as
+# on stock's base tree: SM8475 (530) v1.0 with board ID 0.
+fdtput -t x /out/ingot.dtb / qcom,msm-id 0x212 0x10000
+fdtput -t x /out/ingot.dtb / qcom,board-id 0x0 0x0
+# ABL also stays in fastboot unless the base tree has an arch_timer label.
+# Upstream's timer node has none, so only this image's copy gets the symbol.
+fdtget /out/ingot.dtb /timer compatible >/dev/null 2>&1 || {
+    echo 'The device tree has no /timer node' >&2; exit 1;
+}
+fdtput -t s /out/ingot.dtb /__symbols__ arch_timer /timer
+(cd "$stage" && find . -print0 | cpio --null --quiet -o -H newc --owner=0:0) \
+    | gzip -n -9 > /out/initramfs.cpio.gz
+
+# ABL always takes the device tree from vendor_boot (a DTB in a header v2
+# image or appended to the kernel is ignored), and then applies the board's
+# overlay from dtbo. So the probe is three images: boot (kernel, initramfs
+# and command line, sent with `fastboot boot`), and vendor_boot and dtbo for
+# the experiment slot. The dtbo holds one overlay that only adds a marker,
+# carrying the IDs of stock's "Cape QRD with PM8010" entry so ABL picks it.
+# ABL matches the entry by these IDs alone, so the overlay keeps our model.
+# ABL refuses to boot unless the overlay applies through a label fixup: a
+# target-path fragment, or an overlay with no fragments, leaves it in fastboot.
+python3 /mkbootimg/mkbootimg.py --header_version 4 \
+    --kernel /input/kernel --ramdisk /out/initramfs.cpio.gz \
+    --os_version 14.0.0 --os_patch_level 2024-11 \
+    --cmdline 'console=tty0 rdinit=/init clk_ignore_unused pd_ignore_unused regulator_ignore_unused fw_devlink=permissive panic=10 printk.devkmsg=on' \
+    -o /out/boot.img
+(cd /tmp && mkdir -p empty && cd empty && find . -print0 | cpio --null --quiet -o -H newc --owner=0:0) \
+    | gzip -n -9 > /tmp/empty.cpio.gz
+python3 /mkbootimg/mkbootimg.py --header_version 4 --pagesize 4096 \
+    --base 0x0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
+    --tags_offset 0x100 --dtb_offset 0x1f00000 \
+    --vendor_ramdisk /tmp/empty.cpio.gz --dtb /out/ingot.dtb --vendor_cmdline '' \
+    --vendor_boot /out/vendor_boot.img
+cat > /tmp/marker.dtso <<'DTS'
+/dts-v1/;
+/plugin/;
+
+/ {
+	model = "Solana Mobile Saga";
+	compatible = "osom,ingot", "qcom,sm8475";
+	qcom,msm-id = <0x213 0x10000>, <0x21c 0x10000>, <0x212 0x10000>;
+	qcom,board-id = <0x1000b 0x0>;
+	qcom,pmic-id = <0x2f 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x41 0x41>;
+	qcom,pmic-id-size = <0xa>;
+};
+
+&reserved_memory {
+	omamobile,dtbo = "ingot-marker";
+};
+DTS
+dtc -q -@ -I dts -O dtb -o /tmp/marker.dtbo /tmp/marker.dtso
+python3 /mkdtboimg/mkdtboimg.py create /out/dtbo.img --page_size=4096 /tmp/marker.dtbo
+for img in boot vendor_boot; do
+    size=$(stat -c %s /out/$img.img)
+    [ "$size" -le 100663296 ] || { rm /out/$img.img; echo "$img exceeds its 96 MiB partition" >&2; exit 1; }
+done
+[ "$(stat -c %s /out/dtbo.img)" -le 25165824 ] || { echo 'dtbo exceeds its 24 MiB partition' >&2; exit 1; }
+(cd /out && sha256sum boot.img vendor_boot.img dtbo.img ingot.dtb initramfs.cpio.gz > SHA256SUMS)
