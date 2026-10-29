@@ -37,6 +37,26 @@ charger's input limit read 500 mA).
 - **Fix for the lit sleep:** omamobile-omarchy 0.1.13, patch 0021: once the
   session is secure, the sleep lock turns the display off (SUSPEND-PLAN
   6.8). upower's action is unchanged until P7 (6.6).
+- **Charging rate:** device-cheetah's `default_ilim_ua=500000` (since 10-19;
+  the bootloader leaves 3 A, `found: ... input limit 3000000 uA`) leaves
+  about +100 mA for the battery awake with the screen off. Reloading
+  `max77759_charger` with `default_ilim_ua=900000` under a dead-man gave
+  +680 to +720 mA from the laptop dock's port, with no disconnect
+  (USB-C-PLAN 9, 2026-10-28). The guard paused charging for its first 30 s
+  after the reload (`no reading from max170xx_battery`, at probe only; no
+  inhibit around any suspend in four boots).
+- **The gauge interrupt storms, on and off:** IRQ `gpa9 3 Level
+  max170xx_battery` reached 43960 in the boot that ran flat at 03:53 on
+  10-28 (upower's critical suspend at 03:43, woken by that IRQ at 03:46),
+  and 462 in 10 s tonight, then 0. During the storm the gauge's STATUS
+  read 0x0000 in 300 samples, and the pin keeps its pull-up, so its own
+  alerts don't explain it. The TCPC (0x25, its driver blacklisted until
+  B4) had `ALERT` 0xa803 pending with 0x8003 unmasked. Cause open; the
+  test is USB-C-PLAN T1.
+- **The gauge's model load timed out at two boots** (`max17042 5-0036:
+  model load did not complete: -110`), and the percentage was off without
+  it: 0 % at 3.40 V, 3 % at 3.76 V. A reload of the charger triggered a
+  model load that succeeded.
 
 ## 2026-10-27: the muted speakers were the open-loop coil estimate, not sleep; the static was the boost converter; the earpiece is the top speaker
 

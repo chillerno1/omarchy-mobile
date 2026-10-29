@@ -437,6 +437,59 @@ knob.
 
 ## 9. Runbook 2026-10-19 (B3g to Type-C by default)
 
+### Findings 2026-10-28 (kernel 7.3.0-rc6-omamobile-push1-00591-gebc0cd6858ee, at 0 %)
+
+- **900 mA on a dock port.** `modprobe -r max77759_charger && modprobe
+  max77759_charger default_ilim_ua=900000`, run as a transient unit with a
+  dead-man reloading the package's 500 mA after 120 s: `probed: ... input
+  limit 900000 uA`, the battery at +680 to +720 mA (against about +100 mA
+  at 500 mA, screen off), the link held, checked over a fresh login. The
+  guard inhibited for its first 30 s (no gauge reading at probe), then
+  `band 20-42 C`. A reboot returns to 500 mA. Whether 900 mA becomes the
+  default is open: a plain USB 2.0 port may cut VBUS (section 7).
+- **The bootloader leaves CHGIN_ILIM at 3 A** (`found: mode 0x5 ... input
+  limit 3000000 uA` at the first boots, before our driver lowers it).
+- **The fuel gauge's alert IRQ storms intermittently** (NOTES 2026-10-28):
+  43960 in a boot that ran flat, 46/s for a while tonight, then 0. STATUS
+  stays 0x0000 meanwhile. The TCPC, which nothing services while
+  `tcpci_maxim` is blacklisted, holds `ALERT` 0xa803 (`ALERT_MASK` 0x80ff,
+  so 0x8003 unmasked: vendor, power status, CC status). On its own line
+  (gpa9-7) that can't reach the gauge's IRQ, unless the EINT mapping of
+  gpa9 is off (AGENTS: gs201 EINT numbering); T1 tests that.
+
+### T1: does the stuck TCPC alert drive the gauge's IRQ? (risk: low; needs the maintainer's go: a write to the TCPC)
+
+Only while the storm runs. Bus 5, TCPC at 0x25 (`TCPC_ALERT` 0x10,
+`TCPC_ALERT_MASK` 0x12, `TCPC_VENDOR_ALERT` 0x80; write-1-to-clear).
+
+T1.0, read-only:
+
+```sh
+tools/phone-ssh 'r() { grep max170xx /proc/interrupts | awk "{print \$2}"; }; a=$(r); sleep 10; echo "fg irqs/10 s: $(( $(r) - a ))"
+  for g in 0x10 0x12 0x80; do echo "$g $(i2cget -f -y 5 0x25 $g w)"; done'
+```
+
+- **Go on** only with at least 100 IRQs in 10 s and `ALERT & ALERT_MASK`
+  non-zero. Otherwise stop: no storm to test.
+
+T1.1, clear the TCPC's latched flags once (no role, VBUS or CC change;
+the flags latch again on the next event):
+
+```sh
+tools/phone-ssh 'v=$(i2cget -f -y 5 0x25 0x80 w); i2cset -f -y 5 0x25 0x80 $v w
+  a=$(i2cget -f -y 5 0x25 0x10 w); i2cset -f -y 5 0x25 0x10 $((a & 0x7fff)) w
+  for g in 0x10 0x80; do echo "$g $(i2cget -f -y 5 0x25 $g w)"; done
+  r() { grep max170xx /proc/interrupts | awk "{print \$2}"; }; b=$(r); sleep 10; echo "fg irqs/10 s after: $(( $(r) - b ))"'
+```
+
+- **Expect / pass:** `ALERT` reads 0 (or only masked bits) and the gauge
+  IRQ rate falls to about 0: the storm comes through the TCPC's line, and
+  the fix is to mask the TCPC's alerts while its driver is absent (or B4).
+- **Fail:** the rate stays: not the TCPC; next suspects the gauge's ALRT
+  pin itself (scope) and the EINT setup of gpa9.
+- **Stop:** USB drops (it shouldn't: no role or VBUS change; the rescue
+  closes the switch while VBUS is valid). **Rollback:** none needed.
+
 ### Results 2026-10-19 (kernel 7.3.0-rc6-omamobile-push1-00558-gcbd727f42785)
 
 - **P0/G0 passed** (read-only): charger mode 5, WDTEN 0, JEITA_EN 1
