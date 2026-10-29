@@ -25,10 +25,30 @@ rm /tmp/Image
 
 stage=/tmp/rootfs
 mkdir -p "$stage"
+# ARCH_BOOT=1 (build-ingot-probe --arch): the shared init, which boots Arch
+# from userdata and leaves that partition, and only that one, writable.
+# Otherwise the RAM-only probe init, with every partition read-only.
+extra=""
+[ "${ARCH_BOOT:-0}" = 1 ] && extra="e2fsprogs e2fsprogs-extra kexec-tools"
+# shellcheck disable=SC2086 # extra is a list of package names
 apk --root "$stage" --initdb --no-cache \
     --repositories-file /etc/apk/repositories --keys-dir /etc/apk/keys add \
-    alpine-baselayout busybox dropbear iproute2 util-linux busybox-extras
-install -m755 /src/device/ingot/initramfs/init "$stage/init"
+    alpine-baselayout busybox dropbear iproute2 util-linux busybox-extras $extra
+if [ "${ARCH_BOOT:-0}" = 1 ]; then
+    install -m755 /src/initramfs/init "$stage/init"
+    # What bin/omamobile initramfs packs for the shared init, from
+    # device/ingot/device.conf: the storage allowlist and the USB product
+    rw=$(sed -n 's/^UFS_RW="\(.*\)"$/\1/p' /src/device/ingot/device.conf)
+    [ "$rw" = userdata ] || { echo "ARCH_BOOT needs UFS_RW=\"userdata\", not \"$rw\"" >&2; exit 1; }
+    mkdir -p "$stage/etc"
+    echo "$rw" > "$stage/etc/omamobile-ufs-rw"
+    sed -n 's/^USB_PRODUCT="\(.*\)"$/\1/p' /src/device/ingot/device.conf > "$stage/etc/omamobile-usb-product"
+    for f in sbin/e2fsck usr/sbin/resize2fs usr/sbin/dumpe2fs; do
+        [ -x "$stage/$f" ] || { echo "the initramfs has no /$f" >&2; exit 1; }
+    done
+else
+    install -m755 /src/device/ingot/initramfs/init "$stage/init"
+fi
 mkdir -p "$stage/root/.ssh" "$stage/proc" "$stage/sys" "$stage/dev" "$stage/run"
 cp /input/key.pub "$stage/root/.ssh/authorized_keys"
 chmod 700 "$stage/root/.ssh"
