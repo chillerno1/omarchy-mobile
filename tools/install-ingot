@@ -1,0 +1,222 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# install-ingot: put Omarchy Mobile's root image on a Solana Mobile Saga's
+# userdata, from the laptop, with the phone in fastboot mode.
+#
+# What it writes, and nothing else:
+#   - "fastboot flash userdata" with the root image (this ERASES userdata:
+#     LineageOS on slot B needs its recovery to format data before it boots
+#     again).
+# It never flashes a boot image, never changes the active slot and never
+# reboots: the Saga's Linux boot images go to slot A by hand
+# (tools/build-ingot-probe --arch, device/ingot/device.conf), or are booted
+# from RAM with "fastboot boot". The bootloader, radio, persist, efs, modem,
+# devinfo and vbmeta are never touched.
+#
+# The owner's answers become /etc/omamobile/firstboot.conf and root's
+# authorized_keys in a LOCAL COPY of the root image, written with debugfs as
+# tools/install-phone does; omamobile-firstboot creates the user on the
+# phone's first boot and deletes the file.
+#
+#   install-ingot [--dry-run] [--rootfs FILE.img.zst]
+#     --dry-run   check the phone (read-only) and prepare the image copy,
+#                 then print the flash command instead of running it
+#     --rootfs    the root image (default: the newest out/ingot/*.img.zst,
+#                 from tools/build-rootfs --local ingot)
+set -euo pipefail
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+CODENAME=ingot
+FASTBOOT=${FASTBOOT:-fastboot}
+say() { printf '\033[1m==> %s\033[0m\n' "$*"; }
+note() { printf '    %s\n' "$*"; }
+die() { printf 'install-ingot: %s\n' "$*" >&2; exit 1; }
+
+dry=0 rootfs=""
+while (($#)); do
+  case $1 in
+    --dry-run) dry=1 ;;
+    --rootfs) rootfs=${2:?}; shift ;;
+    -h|--help) sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+  shift
+done
+for tool in "$FASTBOOT" debugfs dumpe2fs e2fsck zstd openssl sha256sum; do
+  command -v "$tool" >/dev/null || die "$tool not found (fastboot: android-tools; debugfs: e2fsprogs)"
+done
+
+# --- The descriptor ------------------------------------------------------------
+conf=$ROOT/device/$CODENAME/device.conf
+UFS_RW=$(sed -n 's/^UFS_RW="\(.*\)"$/\1/p' "$conf")
+[[ $UFS_RW == userdata ]] || die "$conf: UFS_RW must be exactly \"userdata\", not \"$UFS_RW\""
+
+# --- Integrity of what will be written -------------------------------------------
+if [[ -z $rootfs ]]; then
+  rootfs=$(ls -t "$ROOT"/out/$CODENAME/omamobile-rootfs-*-aarch64.img.zst 2>/dev/null | head -1 || true)
+  [[ -n $rootfs ]] || die "no root image in out/$CODENAME: tools/build-rootfs --local $CODENAME"
+fi
+[[ -f $rootfs ]] || die "no $rootfs"
+say "Checking the files"
+[[ -f $rootfs.sha256 ]] || die "no $rootfs.sha256"
+(cd "$(dirname "$rootfs")" && sha256sum -c --quiet "$(basename "$rootfs").sha256") || die "$rootfs doesn't match its .sha256"
+note "root image checksum matches"
+manifest=${rootfs%.img.zst}.MANIFEST
+[[ -f $manifest ]] || die "no $manifest"
+built_for=$(sed -n 's/^device: \([a-z0-9]*\).*/\1/p' "$manifest")
+[[ $built_for == "$CODENAME" ]] || die "the root image was built for ${built_for:-an unknown device}, not $CODENAME"
+modules_release=$(sed -n 's/^kernel modules: \([^ ]*\).*/\1/p' "$manifest")
+note "built for $CODENAME, kernel modules ${modules_release:-unknown}"
+
+# --- The phone ---------------------------------------------------------------------
+say "Checking the phone"
+mapfile -t serials < <("$FASTBOOT" devices 2>/dev/null | awk '$2 == "fastboot" {print $1}')
+((${#serials[@]} == 1)) || die "expected one phone in fastboot mode, found ${#serials[@]} ('fastboot devices')"
+serial=${serials[0]}
+fb() { "$FASTBOOT" -s "$serial" "$@"; }
+vars=$(fb getvar all 2>&1 | sed -E 's/^\(bootloader\) //')
+var() { awk -F: -v k="$1" '$1 == k { sub(/^[^:]*:[ ]*/, ""); print; exit }' <<<"$vars"; }
+product=$(var product)
+[[ $product == "$CODENAME" ]] || die "the phone is '${product:-unknown}', not $CODENAME (Solana Mobile Saga)"
+[[ $(var unlocked) == yes ]] || die "the bootloader is locked"
+psize=$(sed -nE 's/^partition-size:userdata:[ ]*(0x[0-9a-fA-F]{1,12})$/\1/p' <<<"$vars" | head -1)
+[[ -n $psize ]] || die "the phone reports no partition-size for userdata"
+note "$CODENAME, unlocked, current slot $(var current-slot), userdata $((psize / 1048576)) MiB"
+
+# --- The owner's answers -----------------------------------------------------------
+RESERVED='^(root|alarm|omamobile|omandroid|omarchy|bin|daemon|mail|ftp|http|nobody|dbus|systemd-.*|tss|uuidd|alpm|git|avahi|cups|cups-browsed|lp|_talkd|polkitd|rtkit|qemu|brltty|gluster|rpc|libvirt-qemu|pcscd|nvidia-persistenced|sddm|builder|admin)$'
+USERNAME_RE='^[a-z_][a-z0-9_-]{0,31}$'
+HOSTNAME_RE='^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
+SSHKEY_RE='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}( [ -~]*)?$'
+ask() { local prompt=$1 default=${2:-} answer; printf '%s%s: ' "$prompt" "${default:+ [$default]}" >&2; IFS= read -r answer || die "no answer"; printf '%s' "${answer:-$default}"; }
+ask_secret() { local answer; printf '%s: ' "$1" >&2; IFS= read -rs answer || die "no answer"; printf '\n' >&2; printf '%s' "$answer"; }
+
+say "About the phone's owner"
+while true; do
+  username=$(ask "User name")
+  if [[ ! $username =~ $USERNAME_RE ]]; then echo "  lower-case letters, digits, - and _, starting with a letter or _ (at most 32)" >&2
+  elif [[ $username =~ $RESERVED ]]; then echo "  '$username' is reserved; pick your own name" >&2
+  else break; fi
+done
+while true; do
+  password=$(ask_secret "Password or PIN (unlocks the phone, and for sudo)")
+  again=$(ask_secret "Again")
+  if [[ -z $password ]]; then echo "  it can't be empty" >&2
+  elif [[ $password != "$again" ]]; then echo "  they don't match" >&2
+  elif [[ $password == *$'\n'* ]]; then echo "  no line breaks" >&2
+  else break; fi
+done
+credential=password
+[[ $password =~ ^[0-9]+$ ]] && credential=pin
+password_hash=$(printf '%s\n' "$password" | openssl passwd -6 -stdin)
+unset password again
+[[ $password_hash == '$6$'* ]] || die "openssl passwd -6 failed"
+while true; do
+  hostname=$(ask "Host name" "$username-saga")
+  [[ $hostname =~ $HOSTNAME_RE ]] && break
+  echo "  1-63 letters, digits or dashes, not starting or ending with a dash" >&2
+done
+tz_default=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+[[ -n $tz_default ]] || tz_default=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
+while true; do
+  timezone=$(ask "Time zone" "${tz_default:-UTC}")
+  [[ $timezone =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ && -f /usr/share/zoneinfo/$timezone ]] && break
+  echo "  not a time zone (like Europe/Paris or America/New_York)" >&2
+done
+full_name=$(ask "Full name for git (optional)")
+[[ $full_name != *[:,]* ]] || die "the full name can't contain : or ,"
+email=$(ask "Email for git (optional)")
+[[ -z $email || $email =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] || die "'$email' is not an email address"
+# No Wi-Fi question: the Saga's Wi-Fi isn't brought up yet.
+while true; do
+  key_file=$(ask "SSH public key for root and $username" "$HOME/.ssh/id_ed25519.pub")
+  key_file=${key_file/#\~/$HOME}
+  if [[ -f $key_file ]] && [[ $(head -1 "$key_file") =~ $SSHKEY_RE ]] && [[ $(grep -c . "$key_file") == 1 ]]; then break; fi
+  echo "  not a single OpenSSH public key file (a .pub, never the private key)" >&2
+done
+ssh_key=$(head -1 "$key_file")
+
+# --- A local copy of the root image, with the owner's first-boot file -------------
+work=${work:-${XDG_CACHE_HOME:-$HOME/.cache}/omamobile-install-$CODENAME}
+mkdir -p "$work"
+chmod 700 "$work"
+copy=$work/root.img sparse=$work/root.simg conf_file=$work/firstboot.conf keys_file=$work/authorized_keys
+# The copy holds the password hash: never left behind
+cleanup() { rm -f "$conf_file" "$keys_file" "$copy" "$sparse"; }
+trap cleanup EXIT
+(
+  umask 077
+  {
+    echo "# Written by install-ingot on the laptop; omamobile-firstboot reads and deletes it."
+    echo "USERNAME=$username"
+    echo "PASSWORD_HASH=$password_hash"
+    echo "HOSTNAME=$hostname"
+    echo "TIMEZONE=$timezone"
+    echo "SSH_KEY=$ssh_key"
+    echo "CREDENTIAL=$credential"
+    [[ -n $full_name ]] && echo "FULL_NAME=$full_name"
+    [[ -n $email ]] && echo "EMAIL=$email"
+  } > "$conf_file"
+  printf '%s\n' "$ssh_key" > "$keys_file"
+)
+
+say "Preparing a local copy of the root image in $work"
+rm -f "$copy" "$sparse"
+zstd -q -d --sparse -f "$rootfs" -o "$copy"
+[[ $(dumpe2fs -h "$copy" 2>/dev/null | sed -n 's/^Filesystem volume name: *//p') == omamobile-root ]] ||
+  die "$rootfs is not an Omarchy Mobile root image (label omamobile-root)"
+(($(stat -c %s "$copy") <= psize)) || die "the root image is larger than userdata"
+debugfs -w -f - "$copy" >/dev/null 2>&1 <<EOF || true
+mkdir /etc/omamobile
+rm /etc/omamobile/firstboot.conf
+write $conf_file /etc/omamobile/firstboot.conf
+sif /etc/omamobile/firstboot.conf mode 0100600
+sif /etc/omamobile/firstboot.conf uid 0
+sif /etc/omamobile/firstboot.conf gid 0
+mkdir /root/.ssh
+sif /root/.ssh mode 040700
+sif /root/.ssh uid 0
+sif /root/.ssh gid 0
+rm /root/.ssh/authorized_keys
+write $keys_file /root/.ssh/authorized_keys
+sif /root/.ssh/authorized_keys mode 0100600
+sif /root/.ssh/authorized_keys uid 0
+sif /root/.ssh/authorized_keys gid 0
+EOF
+cmp -s <(debugfs -R "cat /etc/omamobile/firstboot.conf" "$copy" 2>/dev/null) "$conf_file" || die "writing firstboot.conf into the image copy failed"
+cmp -s <(debugfs -R "cat /root/.ssh/authorized_keys" "$copy" 2>/dev/null) "$keys_file" || die "writing authorized_keys into the image copy failed"
+e2fsck -fn "$copy" >/dev/null 2>&1 || die "the image copy doesn't check clean after the writes"
+note "firstboot.conf and root's authorized_keys written, file system checks clean"
+userdata_image=$copy
+if command -v img2simg >/dev/null; then
+  img2simg "$copy" "$sparse"
+  rm -f "$copy"
+  userdata_image=$sparse
+  note "converted to an Android sparse image ($(du -h "$sparse" | cut -f1))"
+fi
+
+# --- What will be written -------------------------------------------------------
+say "The plan"
+note "phone:      Solana Mobile Saga ($CODENAME), serial $serial"
+note "user:       $username ($credential), host $hostname, time zone $timezone"
+note "SSH key:    ${ssh_key:0:40}... (root and $username)"
+note "root image: $(basename "$rootfs")"
+echo
+echo "This command, and only this one, will run:"
+echo "    fastboot flash userdata $userdata_image"
+echo
+echo "userdata will be ERASED: LineageOS on slot B loses its data and needs its"
+echo "recovery to format data before it boots again. No boot image, slot or"
+echo "other partition is touched, and the phone is not rebooted."
+echo
+answer=$(ask "Type the phone's codename ($CODENAME) to go ahead")
+[[ $answer == "$CODENAME" ]] || die "not confirmed; nothing was written"
+
+if ((dry)); then
+  printf '    would run: %s -s %s flash userdata %s\n' "$FASTBOOT" "$serial" "$userdata_image"
+  say "Dry run done: nothing was written to the phone"
+else
+  say "Flashing"
+  printf '    %s flash userdata %s\n' "$FASTBOOT" "$userdata_image"
+  fb flash userdata "$userdata_image" || die "fastboot flash userdata failed; the phone is still in fastboot"
+  say "Done. userdata holds Omarchy Mobile; boot it with the --arch boot images."
+fi

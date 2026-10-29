@@ -4,7 +4,12 @@
 #
 # Usage: tools/build-ingot-probe --kernel Image.gz --dtb sm8475-osom-ingot.dtb \
 #          --ssh-key ~/.ssh/id_ed25519.pub --mkbootimg /path/to/mkbootimg.py \
-#          --mkdtboimg /path/to/mkdtboimg.py --out /path/to/output
+#          --mkdtboimg /path/to/mkdtboimg.py --out /path/to/output [--arch]
+#
+# --arch packs the shared initramfs/init instead of the RAM-only probe init:
+# it boots Arch from userdata and leaves userdata, and only userdata,
+# writable (device/ingot/device.conf UFS_RW). Never boot it on a phone whose
+# userdata isn't ours to erase.
 #
 # The kernel must have USB DWC3/QCOM, the eUSB2 PHY, RPMh regulators,
 # configfs NCM/ACM and devtmpfs built in (device/ingot/kernel.config).
@@ -17,7 +22,7 @@
 # Docker runs an aarch64 Alpine builder; x86 hosts need a binfmt handler.
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-kernel="" dtb="" key="" mkbootimg="" mkdtboimg="" out=""
+kernel="" dtb="" key="" mkbootimg="" mkdtboimg="" out="" arch_boot=0
 die() { echo "error: $*" >&2; exit 1; }
 while (($#)); do
   case $1 in
@@ -27,7 +32,8 @@ while (($#)); do
     --mkbootimg) mkbootimg=${2:?}; shift ;;
     --mkdtboimg) mkdtboimg=${2:?}; shift ;;
     --out) out=${2:?}; shift ;;
-    -h|--help) sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --arch) arch_boot=1 ;;
+    -h|--help) sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
   shift
@@ -72,5 +78,10 @@ docker run --rm --platform linux/arm64 \
   --mount "type=bind,source=$(dirname "$mkbootimg"),target=/mkbootimg,readonly" \
   --mount "type=bind,source=$(dirname "$mkdtboimg"),target=/mkdtboimg,readonly" \
   --mount "type=bind,source=$out,target=/out" \
+  -e ARCH_BOOT="$arch_boot" \
   alpine:3.22 sh /src/device/ingot/initramfs/build
-echo "Built boot.img, vendor_boot.img and dtbo.img in $out (no phone was accessed)"
+if ((arch_boot)); then
+  echo "Built Arch boot images in $out (no phone was accessed). Booted, they leave userdata writable"
+else
+  echo "Built boot.img, vendor_boot.img and dtbo.img in $out (no phone was accessed)"
+fi
