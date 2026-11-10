@@ -110,10 +110,16 @@
 # (tools/ingot-fp-stage links here); its unit omamobile-fp-ingot.service runs
 # the bridge stage on /usr/lib/omamobile-fp-ingot/{root,bin}, opt-in.
 #
+# Modules: a start (not check) loads qcom_qseecom_user when /dev/qseecom is
+# missing, and betterlife-fp for hal and bridge when /dev/blfp is, BEFORE
+# its precondition check: nothing loads them at boot.
+#
 # Tests: tools/ingot-fp-stage-test. OMAMOBILE_FP_TEST_ROOT (host /dev, /sys
 # and /run under a fake tree; "device nodes" there are regular files
-# reading "c MAJ:MIN", copied instead of mknod) and OMAMOBILE_FP_TEST_INJECT
-# (a fault for the audit to catch) are honoured only with OMAMOBILE_FP_TEST=1.
+# reading "c MAJ:MIN", copied instead of mknod), OMAMOBILE_FP_TEST_INJECT
+# (a fault for the audit to catch) and OMAMOBILE_FP_TEST_MODPROBE (the
+# modprobe to run against the fake tree; none without it) are honoured only
+# with OMAMOBILE_FP_TEST=1.
 set -euo pipefail
 
 say() {
@@ -802,17 +808,33 @@ sock_free() {
   return 0
 }
 
+# The modules the nodes come from; nothing loads them at boot. Before check,
+# which refuses a missing /dev/qseecom.
+load_modules() {
+  local mp=modprobe
+  if [[ -n $TROOT ]]; then
+    mp=${OMAMOBILE_FP_TEST_MODPROBE:-}
+    [[ -n $mp ]] || return 0
+  fi
+  if ! [[ -c $HDEV/qseecom || ( -n $TROOT && -f $HDEV/qseecom ) ]]; then
+    say "no $HDEV/qseecom: modprobe qcom_qseecom_user"
+    "$mp" qcom_qseecom_user || say "modprobe qcom_qseecom_user failed"
+  fi
+  if [[ $MODE == hal || $MODE == bridge ]] && ! [[ -c $HDEV/blfp || ( -n $TROOT && -f $HDEV/blfp ) ]]; then
+    say "no $HDEV/blfp: modprobe betterlife-fp"
+    "$mp" betterlife-fp || say "modprobe betterlife-fp failed"
+  fi
+  [[ -z $TROOT ]] && command -v udevadm >/dev/null && { udevadm settle -t 5 || true; }
+  return 0
+}
+
 outer() {
+  load_modules
   check
   [[ $MODE != bridge && $MODE != audit ]] || sock_free
   install -d -m 0700 "$RUN"
   exec 9> "$RUN/lock"
   flock -n 9 || die "another listeners/hal/bridge stage is running (run attaches to it; ingot-fp-stage stop stops it)"
-  if [[ -z $TROOT ]]; then
-    [[ -c /dev/qseecom ]] || modprobe qcom_qseecom_user || true
-    [[ ( $MODE != hal && $MODE != bridge ) || -c /dev/blfp ]] || modprobe betterlife-fp || true
-    command -v udevadm >/dev/null && udevadm settle -t 5 || true
-  fi
   local fwd=()
   unshare --help 2>/dev/null | grep -q -- '--forward-signals' && fwd=(--forward-signals)
   local args=(--image "$IMAGE" --bin "$BIN" --state "$STATE")

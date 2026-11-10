@@ -323,7 +323,23 @@ EOF
   cp "$t/fake" "$IMG/vendor/bin/qseecomd"
   cp "$t/fake" "$BIN/omamobile-fp-halhost"
   chmod 0755 "$IMG/vendor/bin/qseecomd" "$BIN/omamobile-fp-halhost"
-  TIMEOUT=60 st hal --seconds 1 > "$out" 2>&1 || fail "hal with the fakes"
+  # after a reboot nothing has loaded the modules: the start loads them
+  # before its precondition check (a fake modprobe makes the nodes)
+  cat > "$t/modprobe" <<MP
+#!/bin/sh
+echo "\$1" >> "$t/modprobe.log"
+case \$1 in
+  qcom_qseecom_user) echo 'c 236:0' > "$H/dev/qseecom"; mkdir -p "$H/sys/module/qcom_qseecom_user" ;;
+  betterlife-fp) echo 'c 10:120' > "$H/dev/blfp"; mkdir -p "$H/sys/module/betterlife_fp" ;;
+  *) exit 1 ;;
+esac
+MP
+  chmod 0755 "$t/modprobe"
+  rm -f "$H/dev/qseecom" "$H/dev/blfp" "$t/modprobe.log"
+  TIMEOUT=60 OMAMOBILE_FP_TEST_MODPROBE=$t/modprobe st hal --seconds 1 > "$out" 2>&1 || fail "hal with the fakes"
+  [[ $(cat "$t/modprobe.log" 2>/dev/null | tr '\n' ' ') == 'qcom_qseecom_user betterlife-fp ' ]] ||
+    fail "hal: the modules not loaded before the check ($(cat "$t/modprobe.log" 2>/dev/null))"
+  grep -q "no $H/dev/qseecom: modprobe qcom_qseecom_user" "$out" || fail "hal: the module load not said"
   grep -q '^\[qseecomd\] [0-9]*/7 I QSEECOMD: listener services: Started (Listener ID = 8192)' "$out" ||
     fail "hal: the logdw reader's line for qseecomd"
   grep -q 'listeners registered: 2 started' "$out" || fail "hal: listeners not seen"
@@ -334,7 +350,7 @@ EOF
   grep -q '^\[qseecomd\] qseecomd fake: TERM' "$out" || fail "hal: qseecomd not stopped with TERM"
   [[ $(grep -n 'S3 PASS' "$out" | cut -d: -f1) -lt $(grep -n 'qseecomd fake: TERM' "$out" | cut -d: -f1) ]] ||
     fail "hal: qseecomd stopped before the report"
-  pass "hal: log reader, listeners, HAL host after them, PASS, ordered stop"
+  pass "hal: missing modules loaded before the check; log reader, listeners, HAL host after them, PASS, ordered stop"
 
   # --- bridge, with a fake bridge ---
   cp "$t/fake" "$BIN/omamobile-fp-bridge-ingot"
@@ -438,7 +454,11 @@ EOF
   }
   row() { grep -cE "^  $2 +$3 " "$1" > /dev/null || fail "s4 $4: the summary's $2 is not $3"; }
   out=$t/s4.nofinger.out
-  agg "$out" nofinger || fail "s4 nofinger"
+  # the preflight loads what is missing, as after a reboot
+  rm -rf "$H/sys/module/qcom_qseecom_user" "$H/sys/module/betterlife_fp" "$t/modprobe.log"
+  OMAMOBILE_FP_TEST_MODPROBE=$t/modprobe agg "$out" nofinger || fail "s4 nofinger"
+  grep -q 'modprobe qcom_qseecom_user (not loaded)' "$out" && grep -q 'modprobe betterlife-fp (not loaded)' "$out" ||
+    fail "s4 nofinger: the preflight did not load the missing modules"
   grep -q '^S4 nofinger: PASS' "$out" || fail "s4 nofinger: no PASS"
   for r in preflight hal bridge storage restart stop; do row "$out" "$r" PASS nofinger; done
   row "$out" fprintd SKIP nofinger

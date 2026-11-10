@@ -732,11 +732,28 @@ summary() {
 
 # --- nofinger -------------------------------------------------------------------
 
+# load_module SYSFS-GLOB NAME: modprobe NAME unless /sys/module/SYSFS-GLOB is
+# there (a test runs OMAMOBILE_FP_TEST_MODPROBE instead, or nothing)
+load_module() {
+  local mp=modprobe
+  [[ -n $(find "$TROOT/sys/module" -maxdepth 1 -name "$1" -print -quit 2>/dev/null) ]] && return 0
+  if [[ -n $TROOT ]]; then mp=${OMAMOBILE_FP_TEST_MODPROBE:-}; [[ -n $mp ]] || return 0; fi
+  does "modprobe $2 (not loaded)"
+  if "$mp" "$2" 2>&1 | sed -u 's/^/    /'; then
+    [[ -z $TROOT ]] && command -v udevadm > /dev/null && { udevadm settle -t 5 || true; }
+  else
+    info "modprobe $2 failed"
+  fi
+}
+
 n_preflight() {
   local f v m p
   step "preflight: the sensor driver, the modules, the device nodes"
   no_touch
   criteria "$SYSFP/{chipid,irq_count} readable, qcom_qseecom_user and betterlife's module loaded, /dev/qseecom and /dev/blfp there"
+  # nothing loads them at boot: load what is missing first, as the runner does
+  load_module qcom_qseecom_user qcom_qseecom_user
+  load_module 'betterlife*' betterlife-fp
   for f in chipid irq_count; do
     if [[ -r $SYSFP/$f ]] && v=$(cat "$SYSFP/$f" 2>/dev/null); then ok "$SYSFP/$f: $v"
     else fail "$SYSFP/$f missing or unreadable (the betterlife-fp driver)"; fi
