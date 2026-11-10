@@ -232,7 +232,7 @@ expect "and the next change keeps only the set it replaces" base-1-1 app-2-1 app
 } > "$t/np.sh"
 grep -q '^never_published() {$' "$t/np.sh" && grep -q '^NEVER_PUBLISH=(.*linux-omamobile-ingot' "$t/np.sh" \
   || fail "never_published() and NEVER_PUBLISH are in tools/repo-publish"
-sed -n '/^verify() {$/,/^}$/p' tools/repo-publish | grep -qx '  never_published "$dir"' || fail "verify() runs never_published"
+sed -n '/^verify() {$/,/^}$/p' tools/repo-publish | grep -cx '  never_published "$dir"' >/dev/null || fail "verify() runs never_published"
 named_index() { # DIR NAME...: an index whose entries carry %NAME%
   local d=$1 n
   shift
