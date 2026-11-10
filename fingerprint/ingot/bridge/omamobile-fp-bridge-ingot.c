@@ -51,11 +51,14 @@
  * -----------------------------------------------------------
  * The Saga's HAL 2.1 enroll (fingerprint.betterlife.so, bd_enroll) checks,
  * in the library, before touching the trusted app:
- *   - the hw_auth_token is non-null;
- *   - hat->version == 0 ("invalid hat->version" otherwise);
+ *   - hat->timestamp != 0. Its message for a zero one is "hat is null"
+ *     (bd_enroll line 231 tests the 8 bytes at offset 0x1d, the packed
+ *     token's timestamp, not the pointer). It then notifies ERROR 2 and
+ *     returns 0, so the client saw FINGER NEEDED, then ERROR 2;
  *   - hat->challenge == the value pre_enroll() just returned ("challenge not
- *     match" otherwise). pre_enroll() returns CLOCK_MONOTONIC tv_sec; there
- *     is no crypto on it;
+ *     match" otherwise; also ERROR 2 after a return of 0);
+ *   - hat->version == 0 ("invalid hat->version" otherwise, returns -93);
+ *     pre_enroll() returns CLOCK_MONOTONIC tv_sec; there is no crypto on it;
  *   - hat->user_id (the Android secure id) is passed to the trusted app's
  *     secure-id check ("Android Sercure id not match" otherwise).
  * The token HMAC is NEVER verified: the library's auth-token check
@@ -63,14 +66,20 @@
  * app's key (loaded at init via keymaster64, cid 222) is used only to SIGN
  * the token the app returns on a successful authenticate. So enrolment does
  * not need a gatekeeper-signed token: the bridge forges the token itself,
- * with version 0, the live pre_enroll challenge, and a fixed secure id
- * (--sid, default 0). The vendor gatekeeper is not used, and could not
+ * with version 0, the live pre_enroll challenge, a fixed secure id (--sid,
+ * default 0) and a timestamp (ms since boot, network order, as gatekeeper
+ * makes it; only its being non-zero is checked). The trusted app never
+ * sees the token at enrolment: after these checks bd_enroll hands it only
+ * a new template id. The vendor gatekeeper is not used, and could not
  * persist under option (a) anyway (its keymaster blobs would need the RPMB
  * and SSD listeners, which are stubs here).
  *
  * If the trusted app rejects the secure id (its stored secure id is not 0),
  * the ENROLL fails with a clear log line ("Android Sercure id not match")
- * and the tester retries with a different --sid. Nothing hangs.
+ * and the tester retries with a different --sid. Nothing hangs. Careful: on
+ * a secure-id mismatch bd_enroll first REMOVES ALL TEMPLATES and checks
+ * again ("... and remove all fingerprints failed" if that fails), so a new
+ * --sid after an enrolment erases it, as a new secure id does on Android.
  *
  * Templates live in <data-path> (set_active_group(0, <data-path>); the HAL
  * writes <data-path>/<user>.mbn). <data-path> defaults to <state>/fpdata,
@@ -399,6 +408,14 @@ static void start_enroll(void)
 	hat.version = 0;
 	hat.challenge = challenge;
 	hat.user_id = forged_sid;
+	{
+		struct timespec boot;
+		uint64_t ms = 1;
+
+		if (!clock_gettime(CLOCK_BOOTTIME, &boot))
+			ms = (uint64_t)boot.tv_sec * 1000 + boot.tv_nsec / 1000000;
+		hat.timestamp = __builtin_bswap64(ms ? ms : 1);	/* network order */
+	}
 
 	say("enroll(gid %u, secure_id 0x%llx, timeout %u s)", active_gid,
 	    (unsigned long long)forged_sid, enroll_timeout);

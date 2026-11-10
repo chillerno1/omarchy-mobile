@@ -29,7 +29,10 @@
  *                          progress step, and ends
  *
  * enroll() writes "fakehal: enroll timeout_sec N" to stderr, so a test sees
- * the timeout the bridge passed.
+ * the timeout the bridge passed. It checks the token the way the Saga's
+ * bd_enroll does, in its order: a zero timestamp ("hat is null") or a
+ * challenge that is not the last pre_enroll's notifies ERROR 2 and returns
+ * 0; a version other than 0 notifies ERROR 2 and returns -93.
  */
 
 #define _GNU_SOURCE
@@ -51,6 +54,7 @@ struct fake_device {
 	volatile int busy;
 	int job;		/* 1 enroll, 2 auth, 3 enumerate, 4 remove */
 	uint32_t remove_fid;
+	uint64_t challenge;	/* the last pre_enroll's */
 };
 
 static int env_int(const char *name, int dflt)
@@ -211,8 +215,23 @@ static int fake_set_notify(struct fingerprint_device_t *dev, fingerprint_notify_
 
 static uint64_t fake_pre_enroll(struct fingerprint_device_t *dev)
 {
-	(void)dev;
-	return (uint64_t)time(NULL);
+	struct fake_device *fd = (struct fake_device *)dev;
+
+	fd->challenge = (uint64_t)time(NULL);
+	return fd->challenge;
+}
+
+/* the vendor's refusal: a log line, ERROR 2 through notify, then RET */
+static int refuse(struct fake_device *fd, const char *why, int ret)
+{
+	fingerprint_msg_t m;
+
+	(void)!write(2, why, strlen(why));
+	memset(&m, 0, sizeof(m));
+	m.type = FINGERPRINT_ERROR;
+	m.data.error.error = FP_ERROR_UNABLE_TO_PROCESS;
+	emit(fd, &m);
+	return ret;
 }
 
 static int fake_enroll(struct fingerprint_device_t *dev, const hw_auth_token_t *hat,
@@ -225,8 +244,12 @@ static int fake_enroll(struct fingerprint_device_t *dev, const hw_auth_token_t *
 	n = snprintf(line, sizeof(line), "fakehal: enroll timeout_sec %u\n", to);
 	if (n > 0)
 		(void)!write(2, line, n);
-	if (!hat || hat->version != 0)
-		return FP_ERROR_UNABLE_TO_PROCESS;
+	if (!hat || !hat->timestamp)
+		return refuse((struct fake_device *)dev, "fakehal: error: hat is null\n", 0);
+	if (hat->challenge != ((struct fake_device *)dev)->challenge)
+		return refuse((struct fake_device *)dev, "fakehal: error: challenge not match\n", 0);
+	if (hat->version != 0)
+		return refuse((struct fake_device *)dev, "fakehal: error: invalid hat->version\n", -93);
 	return start_job((struct fake_device *)dev, 1);
 }
 

@@ -156,6 +156,8 @@ def t0(t):
     c.close()
     b.close()
     log = b.text()
+    ok("fakehal: error:" not in log,
+       "the enrol token passes the Saga HAL's checks (a non-zero timestamp, the challenge, version 0)")
     ok("fakehal: enroll timeout_sec 60" in log, "the default enroll timeout (60 s) reaches the HAL")
     ok("enroll timeout 60 s, LIST/DELETE deadline 5 s" in log, "the bridge logs its timeouts at start")
 
