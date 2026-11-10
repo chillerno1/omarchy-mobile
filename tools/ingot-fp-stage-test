@@ -238,7 +238,7 @@ static void answer(FILE *fp, const char *line)
 }
 static int bridge(int argc, char **argv)
 {
-	const char *path = "", *state = "";
+	const char *path = "", *state = "", *enroll_timeout = "60";
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
 	struct sigaction sa = { .sa_handler = term };	/* no SA_RESTART */
 	char line[128], f[256];
@@ -251,6 +251,8 @@ static int bridge(int argc, char **argv)
 			path = argv[++i];
 		else if (!strcmp(argv[i], "--state"))
 			state = argv[++i];
+		else if (!strcmp(argv[i], "--enroll-timeout"))
+			enroll_timeout = argv[++i];
 	}
 	printf("bridge fake: --socket %s --state %s uid %d\n", path, state, (int)getuid());
 	snprintf(f, sizeof(f), "%s/secret", state);
@@ -264,7 +266,9 @@ static int bridge(int argc, char **argv)
 		perror("bridge fake: listen");
 		return 1;
 	}
-	printf("bridge fake: ready on %s\n", path);
+	/* the real bridge's start line, which ingot-fp-s4-test reads */
+	printf("bridge fake: ready on %s (enroll timeout %s s, LIST/DELETE deadline 5 s)\n",
+	       path, enroll_timeout);
 	fflush(stdout);
 	while (!done) {
 		c = accept(s, NULL, NULL);
@@ -337,7 +341,11 @@ EOF
   chmod 0755 "$BIN/omamobile-fp-bridge-ingot"
   SD=$H/run/omamobile-fp/sock
   out=$t/bridge.out
-  TIMEOUT=60 st bridge > "$out" 2>&1 &
+  st hal --enroll-timeout 90 > "$t/eto" 2>&1 && fail "hal --enroll-timeout accepted"
+  grep -q 'enroll-timeout is for the bridge stage' "$t/eto" || { cat "$t/eto" >&2; fail "hal --enroll-timeout: the reason"; }
+  st bridge --enroll-timeout 0 > "$t/eto" 2>&1 && fail "bridge --enroll-timeout 0 accepted"
+  grep -q 'enroll-timeout takes a number of seconds' "$t/eto" || { cat "$t/eto" >&2; fail "bridge --enroll-timeout 0: the reason"; }
+  TIMEOUT=60 st bridge --enroll-timeout 90 > "$out" 2>&1 &
   bpid=$!
   for ((i = 0; i < 300; i++)); do
     grep -q 'stage bridge running' "$out" 2>/dev/null && break
@@ -348,6 +356,7 @@ EOF
   grep -q '^\[bridge\] bridge fake: --socket /dev/socket/omamobile-fp/bridge.sock --state /data/vendor/omamobile-fp uid 0' "$out" ||
     fail "bridge: its arguments"
   grep -q '^\[bridge\] bridge fake: /data/vendor/omamobile-fp/secret written' "$out" || fail "bridge: state not writable"
+  grep -q '^\[bridge\] bridge fake: ready on .* (enroll timeout 90 s,' "$out" || fail "bridge: --enroll-timeout did not reach the bridge"
   [[ $(grep -n 'listeners registered' "$out" | cut -d: -f1) -lt $(grep -n 'starting bridge' "$out" | cut -d: -f1) ]] ||
     fail "bridge: started before the listeners"
   [[ -S $SD/bridge.sock ]] || fail "bridge: no socket on the host at $SD/bridge.sock"
@@ -361,7 +370,7 @@ EOF
   { grep -qx '<- READY 0 0 0' "$t/ctl" && grep -qx '<- OK' "$t/ctl"; } || { cat "$t/ctl" >&2; fail "bridge: STATUS answers"; }
   { "$CTL" --socket "$SD/bridge.sock" --timeout 5 LIST > "$t/ctl" 2>&1 && grep -qx '<- LIST' "$t/ctl"; } ||
     { cat "$t/ctl" >&2; fail "bridge: ctl LIST"; }
-  pass "bridge: after the listeners, socket on the host (0600, directory 0700), a client outside gets READY 0 0 0"
+  pass "bridge: after the listeners, socket on the host (0600, directory 0700), a client outside gets READY 0 0 0; --enroll-timeout reaches it (bridge stage only)"
 
   env OMAMOBILE_FP_TEST=1 OMAMOBILE_FP_TEST_ROOT="$H" "$STAGE" stop > "$t/stop" 2>&1 || { cat "$t/stop" >&2; fail "stop"; }
   wait "$bpid" || true
@@ -464,6 +473,8 @@ EOF
   grep -q 'ingot-fp-s4-test lock --image' "$out" || fail "s4 morning: the lock step's command"
   grep -c '/dev/tty' "$out" > /dev/null && fail "s4 morning: tried the terminal"
   [[ -S $H/run/omamobile-fp/sock/bridge.sock ]] || fail "s4 morning: the stack is not left running"
+  grep -q 'the bridge: enroll timeout 240 s, LIST/DELETE deadline 5 s' "$out" || fail "s4 morning: the bridge's enrolment timeout (240 s)"
+  grep -q 'omamobile-fp-ctl --timeout 300 ENROLL' "$out" || fail "s4 morning: ctl's ENROLL timeout after the HAL's"
   pass "ingot-fp-s4-test morning without a terminal: the finger prompts, every part PASS, the stack left running, the pipe closed"
 
   out=$t/s4.nofinger2.out

@@ -55,8 +55,10 @@
 #   INGOT_FP_SECONDS (irq, default 30; nofinger's hal run, default 8),
 #   INGOT_FP_GAP (seconds to switch fingers where no Enter can be read:
 #   morning, or no terminal; default 8), INGOT_FP_ENROL_TRIES (morning:
-#   enrolment attempts, default 2), INGOT_FP_FINGER (fprintd, default
-#   right-index-finger)
+#   enrolment attempts, default 2), INGOT_FP_ENROLL_TIMEOUT (the HAL's
+#   budget for one whole enrolment, passed to the bridge when this script
+#   starts the stack; default 240 s, the bridge's own default is 60),
+#   INGOT_FP_FINGER (fprintd, default right-index-finger)
 #
 # The runner is ingot-fp-stage next to this script (a staged bundle tests its
 # own copy), else /usr/lib/omamobile-fp-ingot/ingot-fp-stage
@@ -90,6 +92,7 @@ YES=${INGOT_FP_YES:-0}
 SECS=${INGOT_FP_SECONDS:-30}
 [[ $STEP == nofinger ]] && SECS=${INGOT_FP_SECONDS:-8}
 GAP=${INGOT_FP_GAP:-8}
+ENROLL_TO=${INGOT_FP_ENROLL_TIMEOUT:-240}
 FINGER=${INGOT_FP_FINGER:-right-index-finger}
 ID_ARG='' LEAVE=0
 # an aggregate (nofinger, morning): never waits for Enter
@@ -124,8 +127,11 @@ SYSFP=$TROOT/sys/devices/platform/fingerprint
 UNIT=omamobile-fp-ingot.service
 
 usage() { sed -n '/^#   ingot-fp-s4-test irq/,/^#   .*right-index-finger)$/p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
-[[ $SECS =~ ^[0-9]+$ && $GAP =~ ^[0-9]+$ && ${INGOT_FP_ENROL_TRIES:-2} =~ ^[1-9][0-9]*$ ]] ||
-  { echo "INGOT_FP_SECONDS, INGOT_FP_GAP and INGOT_FP_ENROL_TRIES take a number" >&2; exit 2; }
+[[ $SECS =~ ^[0-9]+$ && $GAP =~ ^[0-9]+$ && ${INGOT_FP_ENROL_TRIES:-2} =~ ^[1-9][0-9]*$ &&
+   $ENROLL_TO =~ ^[1-9][0-9]{0,4}$ ]] ||
+  { echo "INGOT_FP_SECONDS, INGOT_FP_GAP, INGOT_FP_ENROL_TRIES and INGOT_FP_ENROLL_TIMEOUT take a number" >&2; exit 2; }
+# omamobile-fp-ctl's own ENROLL timeout: after the HAL's, so its error is seen
+CTL_ENROLL=$((ENROLL_TO + 60))
 
 # --- Output ------------------------------------------------------------------
 
@@ -221,11 +227,12 @@ ctl_to() {
   does "omamobile-fp-ctl $*"
   ctl "$@" 2>&1 | tee "$out" | sed -u 's/^/    /'
   rc=${PIPESTATUS[0]}
-  # LIST/DELETE end only when the HAL says so: a HAL that never ends an
-  # enumerate leaves the bridge busy (every later command: ERROR 1)
+  # The bridge ends a LIST or DELETE the HAL never finishes after 5 s (its
+  # --list-timeout); one that did not answer at all is an older bridge,
+  # which stays busy (every later command: ERROR 2)
   if grep -c '^timeout: sending CANCEL' "$out" > /dev/null && [[ ${3:-} == LIST || ${3:-} == DELETE ]]; then
-    info "NOTE: the bridge did not finish $3: it may now refuse every command (ERROR 1)"
-    info "      until the stack is restarted (ingot-fp-s4-test stop, then bridge)"
+    info "NOTE: the bridge did not answer $3 at all: an older bridge may now refuse every"
+    info "      command (ERROR 2) until the stack is restarted (ingot-fp-s4-test stop, then bridge)"
   fi
   return "$rc"
 }
@@ -240,11 +247,11 @@ start_stack() {
   else
     [[ -d $IMAGE ]] || { fail "no vendor tree $IMAGE (--image)"; return 1; }
     [[ -d $BIN ]] || { fail "no bin directory $BIN (--bin)"; return 1; }
-    does "starting: $STAGE bridge $(stage_args) (in the background; output in $LOGS/stack.out)"
+    does "starting: $STAGE bridge $(stage_args) --enroll-timeout $ENROLL_TO (in the background; output in $LOGS/stack.out)"
     # no stack runs: an old run's log and socket must not read as this one's
     rm -f "$STAGELOG" "$SOCK"
     # shellcheck disable=SC2046
-    setsid "${WRAP[@]}" "$STAGE" bridge $(stage_args) >> "$LOGS/stack.out" 2>&1 < /dev/null &
+    setsid "${WRAP[@]}" "$STAGE" bridge $(stage_args) --enroll-timeout "$ENROLL_TO" >> "$LOGS/stack.out" 2>&1 < /dev/null &
     p=$!
     echo "$p" > "$LOGS/stack.runner-pid"
     for ((i = 0; i < 1800; i++)); do
@@ -255,6 +262,21 @@ start_stack() {
     [[ -S $SOCK ]] || { fail "no socket $SOCK after 180 s"; return 1; }
   fi
   ok "socket $SOCK ($(stat -c '%U:%G %a' "$SOCK" 2>/dev/null))"
+  bridge_timeouts
+}
+
+# What the running bridge says it gives the HAL (its start line in stage.log)
+bridge_timeouts() {
+  local t
+  t=$(grep -o 'enroll timeout [0-9]* s, LIST/DELETE deadline [0-9]* s' "$STAGELOG" 2>/dev/null | tail -1)
+  if [[ -z $t ]]; then
+    info "the bridge did not log its timeouts (an older bridge: enrolment 60 s, no LIST/DELETE deadline)"
+  elif [[ $t != "enroll timeout $ENROLL_TO s,"* ]]; then
+    info "the running bridge: $t; this script wants $ENROLL_TO s for an enrolment"
+    info "  (stop the stack first, ingot-fp-s4-test stop, and this script starts it with that)"
+  else
+    info "the bridge: $t"
+  fi
 }
 
 stop_stack() {
@@ -360,7 +382,7 @@ s_bridge() {
   info "Starts the bridge stage in the background if it isn't running:"
   info "qseecomd, then omamobile-fp-bridge-ingot as uid 1000, which opens the HAL"
   info "and serves fprintd's socket. Leave it running for the next steps."
-  info "(In a second terminal instead: $STAGE bridge $(stage_args))"
+  info "(In a second terminal instead: $STAGE bridge $(stage_args) --enroll-timeout $ENROLL_TO)"
   criteria "the socket appears, STATUS answers READY ... and OK, LIST answers LIST"
   no_touch
   start_stack || return
@@ -377,9 +399,9 @@ s_enrol() {
   info "another; each accepted one is a PROGRESS line counting down."
   criteria "ENROLLED <id>, and LIST then shows that id"
   running || { fail "no stack running: run the bridge step first"; return; }
-  finger "touch the sensor with ONE finger, lift, touch again, moving it a little each time, until ENROLLED (the bridge gives the HAL a 60 s enrolment timeout)"
+  finger "touch the sensor with ONE finger, lift, touch again, moving it a little each time, until ENROLLED (the whole enrolment has $ENROLL_TO s if this script started the stack)"
   mark=$(log_mark)
-  if ctl_to "$f" --timeout 300 ENROLL; then ok "ENROLL"; else fail "ENROLL did not end in ENROLLED"; log_trouble "$mark"; fi
+  if ctl_to "$f" --timeout "$CTL_ENROLL" ENROLL; then ok "ENROLL"; else fail "ENROLL did not end in ENROLLED"; log_trouble "$mark"; fi
   id=$(sed -n 's/^<- ENROLLED \(-\{0,1\}[0-9]*\)$/\1/p' "$f" | tail -1)
   n=$(grep -c '^<- PROGRESS ' "$f")
   first=$(sed -n 's/^<- PROGRESS [^ ]* \([0-9]*\)$/\1/p' "$f" | head -1)
@@ -842,8 +864,8 @@ auth_match() { # file prompt
   fail "the enrolled finger gave '$AUTH_RES', want MATCH $ENROLLED_ID"
 }
 
-# A LIST the bridge never finished (the HAL ended no enumerate) leaves it
-# busy: every later command gets ERROR 1. Restart the stack then.
+# A LIST an older bridge never finished (the HAL ended no enumerate) leaves
+# it busy: every later command gets ERROR 2. Restart the stack then.
 unwedge() { # ctl output file
   grep -c '^timeout: sending CANCEL' "$1" > /dev/null || return 0
   info "the bridge did not finish that command: restarting the stack so the next one finds it idle"
@@ -888,7 +910,7 @@ m_enrol() {
     ((try > 1)) && { f=$LOGS/enrol.$try.ctl; info "attempt $try of $tries"; }
     mark=$(log_mark)
     finger "TOUCH NOW with ONE finger (the one to enrol). Keep touching and lifting, moving it a little each time, until ENROLLED"
-    ctl_to "$f" --timeout 300 ENROLL
+    ctl_to "$f" --timeout "$CTL_ENROLL" ENROLL
     id=$(sed -n 's/^<- ENROLLED \(-\{0,1\}[0-9]*\)$/\1/p' "$f" | tail -1)
     n=$(grep -c '^<- PROGRESS ' "$f")
     first=$(sed -n 's/^<- PROGRESS [^ ]* \([0-9]*\)$/\1/p' "$f" | head -1)

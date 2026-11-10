@@ -18,12 +18,15 @@
 #                                    --hal-root: as root); then the sensor
 #                                    driver's chipid/version and the kernel log.
 #                                    PASS for S3: chipid 5f83
-#   ingot-fp-stage bridge    --image DIR --bin DIR
+#   ingot-fp-stage bridge    --image DIR --bin DIR [--enroll-timeout SEC]
 #                                    qseecomd, then omamobile-fp-bridge-ingot
 #                                    as uid/gid 1000 (it hosts the HAL itself),
 #                                    serving fprintd's socket on the host at
 #                                    /run/omamobile-fp/sock/bridge.sock (root,
-#                                    0600), until stopped. S4 and later
+#                                    0600), until stopped. S4 and later.
+#                                    --enroll-timeout: the HAL's budget for a
+#                                    whole enrolment (the bridge's default,
+#                                    Android's, is 60 s)
 #   ingot-fp-stage stop              stop a running stage in order (TERM to
 #                                    its namespace's PID 1) and wait for it
 #   ingot-fp-stage run       --image DIR --bin DIR [--as-system] -- CMD...
@@ -181,7 +184,7 @@ if [[ $MODE == stop ]]; then
   for ((i = 0; i < 300; i++)); do kill -0 "$p" 2>/dev/null || { say "stopped"; exit 0; }; sleep 0.1; done
   die "the stage (PID $p) still runs after 30 s"
 fi
-IMAGE='' BIN='' STATE=/var/lib/omamobile-fp-ingot SECONDS_ARG='' HAL_ROOT=0 AS_SYSTEM=0
+IMAGE='' BIN='' STATE=/var/lib/omamobile-fp-ingot SECONDS_ARG='' HAL_ROOT=0 AS_SYSTEM=0 ENROLL_TIMEOUT=''
 CMD=()
 while (($#)); do
   case $1 in
@@ -189,6 +192,7 @@ while (($#)); do
     --bin) BIN=${2:?}; shift ;;
     --state) STATE=${2:?}; shift ;;
     --seconds) SECONDS_ARG=${2:?}; shift ;;
+    --enroll-timeout) ENROLL_TIMEOUT=${2:?}; shift ;;
     --hal-root) HAL_ROOT=1 ;;
     --as-system) AS_SYSTEM=1 ;;
     --) shift; CMD=("$@"); break ;;
@@ -203,6 +207,8 @@ BIN=$(realpath -e -- "$BIN") || die "no such directory: --bin"
 [[ $STATE == /* ]] || die "--state must be an absolute path"
 case $STATE in /dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/run/omamobile-fp-ingot*|/run/omamobile-fp|/run/omamobile-fp/*|/) die "--state $STATE: not there" ;; esac
 [[ -z $SECONDS_ARG || $SECONDS_ARG =~ ^[0-9]+$ ]] || die "--seconds takes a number"
+[[ -z $ENROLL_TIMEOUT || $ENROLL_TIMEOUT =~ ^[1-9][0-9]{0,4}$ ]] || die "--enroll-timeout takes a number of seconds (1-99999)"
+[[ -z $ENROLL_TIMEOUT || $MODE == bridge ]] || die "--enroll-timeout is for the bridge stage"
 
 SHIM=$BIN/omamobile-fp-shim.so
 HALHOST=$BIN/omamobile-fp-halhost
@@ -760,7 +766,8 @@ inner() {
     # the bridge binds its socket as uid 1000: the directory is its until then
     chown "$SYS_ID:$SYS_ID" "$SOCKDIR"
     spawn bridge system /omamobile/omamobile-fp-bridge-ingot --socket "$CSOCKDIR/bridge.sock" \
-      --state "$BRIDGE_STATE" --data-path /data/vendor_de/0/fpdata
+      --state "$BRIDGE_STATE" --data-path /data/vendor_de/0/fpdata \
+      ${ENROLL_TIMEOUT:+--enroll-timeout "$ENROLL_TIMEOUT"}
     bridge_socket
     say "stage bridge running: $SOCK (^C or ingot-fp-stage stop stops)"
     wait -n "${PIDS[bridge]}" "${PIDS[qseecomd]}" || true
@@ -810,6 +817,7 @@ outer() {
   unshare --help 2>/dev/null | grep -q -- '--forward-signals' && fwd=(--forward-signals)
   local args=(--image "$IMAGE" --bin "$BIN" --state "$STATE")
   [[ -n $SECONDS_ARG ]] && args+=(--seconds "$SECONDS_ARG")
+  [[ -n $ENROLL_TIMEOUT ]] && args+=(--enroll-timeout "$ENROLL_TIMEOUT")
   ((HAL_ROOT)) && args+=(--hal-root)
   ((AS_SYSTEM)) && args+=(--as-system)
   ((${#CMD[@]})) && args+=(-- "${CMD[@]}")
