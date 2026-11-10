@@ -13,6 +13,7 @@
 //       drops it, so an app the bootloader loaded and nobody had
 //       registered yet is unloaded when this program exits.
 //   qseecom-probe [--dev PATH] load DIR NAME [--heap PATH] [--hold SECONDS]
+//                 [--buffer BYTES]
 //       Reads DIR/NAME.mdt and DIR/NAME.b00 .. NAME.bNN (one per ELF program
 //       header, every one must exist), copies them back to back, .mdt first,
 //       into one dma-buf from a dma-buf heap (default
@@ -20,7 +21,9 @@
 //       with mdt_len = the .mdt's size, img_len = the total and app_arch =
 //       the .mdt's ELF class, prints the app id, holds the app for SECONDS
 //       (0: not at all), then QSEECOM_IOCTL_UNLOAD_APP_REQ. SIGINT or
-//       SIGTERM ends the hold early and still unloads.
+//       SIGTERM ends the hold early and still unloads. --buffer makes the
+//       dma-buf at least BYTES large (the image still starts at offset 0),
+//       to see whether TrustZone minds the size of the buffer around it.
 //   qseecom-probe [--dev PATH] listen ID[:SIZE][,ID[:SIZE]...]
 //           [--heap PATH] [--reply fail|zero] [--seconds N]
 //       Fake listener services. For each listener id (hex 0x.. or decimal):
@@ -184,7 +187,7 @@ static void usage(FILE *f)
 	fprintf(f,
 		"usage: qseecom-probe [--dev PATH] version\n"
 		"       qseecom-probe [--dev PATH] query NAME...\n"
-		"       qseecom-probe [--dev PATH] load DIR NAME [--heap PATH] [--hold SECONDS]\n"
+		"       qseecom-probe [--dev PATH] load DIR NAME [--heap PATH] [--hold SECONDS] [--buffer BYTES]\n"
 		"       qseecom-probe [--dev PATH] listen ID[:SIZE][,ID[:SIZE]...] [--heap PATH]\n"
 		"                     [--reply fail|zero] [--seconds N]\n");
 }
@@ -365,7 +368,8 @@ static int dmabuf_sync(int fd, __u64 flags, const char *what)
 	return ret;
 }
 
-static int cmd_load(const char *dir, const char *name, const char *heap, long hold)
+static int cmd_load(const char *dir, const char *name, const char *heap, long hold,
+		    uint64_t minbuf)
 {
 	if (strlen(name) >= QP_MAX_APP_NAME_SIZE) {
 		fprintf(stderr, "%s: name longer than %d bytes\n", name,
@@ -397,6 +401,8 @@ static int cmd_load(const char *dir, const char *name, const char *heap, long ho
 		return 1;
 	}
 	uint64_t buflen = (total + 4095) & ~(uint64_t)4095;
+	if (minbuf > buflen)
+		buflen = (minbuf + 4095) & ~(uint64_t)4095;
 	printf("image %s/%s: ELF class %u (%s), %u segments\n", dir, name, cls,
 	       cls == 2 ? "64-bit" : "32-bit", phnum);
 	uint64_t off = 0;
@@ -867,6 +873,7 @@ int main(int argc, char **argv)
 		const char *dir = argv[i], *name = argv[i + 1];
 		const char *heap = "/dev/dma_heap/default_cma_region";
 		long hold = 0;
+		uint64_t minbuf = 0;
 		for (i += 2; i < argc; i += 2) {
 			if (i + 1 >= argc)
 				break;
@@ -880,12 +887,20 @@ int main(int argc, char **argv)
 						argv[i + 1]);
 					return 2;
 				}
+			} else if (strcmp(argv[i], "--buffer") == 0) {
+				char *end;
+				minbuf = strtoull(argv[i + 1], &end, 0);
+				if (*end || !minbuf || minbuf > (1ull << 30)) {
+					fprintf(stderr, "--buffer: not a size in bytes (up to 1 GiB): %s\n",
+						argv[i + 1]);
+					return 2;
+				}
 			} else {
 				break;
 			}
 		}
 		if (i == argc)
-			return cmd_load(dir, name, heap, hold);
+			return cmd_load(dir, name, heap, hold, minbuf);
 	}
 	if (strcmp(cmd, "listen") == 0 && i < argc) {
 		const char *spec = argv[i];
