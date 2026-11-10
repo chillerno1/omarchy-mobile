@@ -51,6 +51,7 @@ pass "reboot-to compiles"
 ./install "$tmp/root" "$tmp/build"
 for f in usr/bin/reboot-to \
          usr/lib/udev/rules.d/10-omamobile-storage.rules \
+         usr/lib/udev/rules.d/70-omamobile-dma-heap.rules \
          usr/lib/systemd/network/20-usb-gadget.network \
          usr/lib/systemd/logind.conf.d/10-omamobile-power-key.conf \
          usr/lib/NetworkManager/conf.d/10-omamobile-usb.conf \
@@ -66,6 +67,8 @@ grep -q 'ID_PART_ENTRY_NAME}!="userdata"' "$tmp/root/usr/lib/udev/rules.d/10-oma
   || fail "userdata is the only partition desktop tools may see"
 grep -q 'KERNEL=="sd\[a-z\]\[0-9\]\*"' "$tmp/root/usr/lib/udev/rules.d/10-omamobile-storage.rules" \
   || fail "the rule covers all eight of the Saga's LUNs"
+grep -q 'SUBSYSTEM=="dma_heap".*GROUP="video", MODE="0660"' "$tmp/root/usr/lib/udev/rules.d/70-omamobile-dma-heap.rules" \
+  || fail "the video group and the seat's user get the DMA-BUF heaps (libcamera's software ISP)"
 grep -q 'Address=172.16.42.1/24' "$tmp/root/usr/lib/systemd/network/20-usb-gadget.network" \
   || fail "usb0 keeps the initramfs address"
 power="$tmp/root/usr/lib/systemd/logind.conf.d/10-omamobile-power-key.conf"
@@ -77,6 +80,12 @@ grep -q '^HandlePowerKeyLongPress=ignore$' "$power" \
   || fail "the long press stays the PMIC reset"
 grep -q '^PACKAGE=omamobile-device-ingot$' "$tmp/root/usr/share/omamobile/device.conf" \
   || fail "the installed descriptor is ingot"
+grep -qx 'TORCH_LED=white:flash' "$tmp/root/usr/share/omamobile/device.conf" \
+  || fail "the torch is the PM8350C flash LED"
+level=$(sed -n 's/^TORCH_LEVEL=//p' "$tmp/root/usr/share/omamobile/device.conf")
+[[ $level =~ ^[0-9]+$ ]] && (( level > 0 && level <= 153 )) \
+  || fail "the torch level is a raw value at most 60% of 255 (about 120 mA), not $level"
+pass "the descriptor names the torch LED and a comfortable level"
 for absent in usr/bin/omamobile-boot-success usr/bin/omamobile-bootctl \
               usr/lib/systemd/system/omamobile-boot-success.service \
               usr/bin/omamobile-wifi-start usr/bin/omamobile-charge-guard \

@@ -11,6 +11,8 @@ build=${2:-build}
 install -Dm755 "$build/reboot-to" "$destination/usr/bin/reboot-to"
 install -Dm644 vendor/udev/rules.d/10-omamobile-storage.rules \
   "$destination/usr/lib/udev/rules.d/10-omamobile-storage.rules"
+install -Dm644 vendor/udev/rules.d/70-omamobile-dma-heap.rules \
+  "$destination/usr/lib/udev/rules.d/70-omamobile-dma-heap.rules"
 install -Dm644 vendor/systemd/network/20-usb-gadget.network \
   "$destination/usr/lib/systemd/network/20-usb-gadget.network"
 install -Dm644 vendor/systemd/logind.conf.d/10-omamobile-power-key.conf \
