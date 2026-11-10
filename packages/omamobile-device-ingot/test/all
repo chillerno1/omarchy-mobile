@@ -60,6 +60,9 @@ for f in usr/bin/reboot-to \
          usr/lib/modprobe.d/omamobile-wifi.conf \
          usr/lib/environment.d/50-omamobile-libcamera.conf \
          usr/lib/udev/rules.d/80-omamobile-bt-addr.rules \
+         usr/lib/udev/rules.d/71-omamobile-soundwire.rules \
+         usr/share/alsa/ucm2/conf.d/sm8475/SM8475-Solana-Saga.conf \
+         usr/share/alsa/ucm2/Solana/ingot/HiFi.conf \
          usr/lib/systemd/system/omamobile-adsp.service \
          usr/lib/systemd/system/omamobile-bt-addr@.service \
          usr/bin/omamobile-ingot-firmware \
@@ -429,6 +432,78 @@ echo not-an-id > "$b/machine-id"
 grep -q public-addr "$b/log" && fail "nothing is set on a controller that never answered"
 bt hcix && fail "refuses a name that isn't a controller"
 pass "omamobile-bt-addr gives only an unconfigured controller a stable, local, unprinted address"
+
+# --- 0.1.5: sound (the use-case profile, the topology link, the buses) ---
+ucm=$r/usr/share/alsa/ucm2
+card=$ucm/conf.d/sm8475/SM8475-Solana-Saga.conf
+hifi=$ucm/Solana/ingot/HiFi.conf
+[[ -f $card && -f $hifi ]] || fail "install stages the sound card's profile where alsa-lib looks (conf.d/<driver>/<long name>.conf)"
+grep -q 'File "/Solana/ingot/HiFi.conf"' "$card" || fail "the card file names the verb file"
+for f in "$card" "$hifi"; do
+  [[ $(tr -cd '{' < "$f" | wc -c) == "$(tr -cd '}' < "$f" | wc -c)" && $(tr -cd '[' < "$f" | wc -c) == "$(tr -cd ']' < "$f" | wc -c)" ]] \
+    || fail "${f##*/}: unbalanced braces or brackets"
+done
+# Every control the profile sets exists on the card (the names the phone's
+# card reports on the kernel without the VA link, test/saga-mixer-controls),
+# so a typo can't fail a sequence. The Mic device's controls belong to the
+# VA macro, which joins the card only with the "VA Capture" link: those
+# names are the driver's (lpass-va-macro.c) and the topology's, not yet
+# read back from the phone, and they sit behind a ControlExists check.
+used=$(cat "$card" "$hifi" | sed -n "s/^[[:space:]]*cset \"name='\([^']*\)' .*\"$/\1/p" | LC_ALL=C sort -u)
+[[ $(wc -l <<< "$used") -ge 25 ]] || fail "the profile's cset lines parse"
+va='MultiMedia3 Mixer VA_CODEC_DMA_TX_0
+VA DEC0 MUX
+VA DEC1 MUX
+VA DMIC MUX0
+VA DMIC MUX1
+VA_AIF1_CAP Mixer DEC0
+VA_AIF1_CAP Mixer DEC1
+VA_DEC0 Volume
+VA_DEC1 Volume'
+missing=$(LC_ALL=C comm -23 <(printf '%s\n' "$used") <( { cat test/saga-mixer-controls; printf '%s\n' "$va"; } | LC_ALL=C sort -u))
+[[ -z $missing ]] || fail "the profile sets controls the card does not have: $missing"
+[[ $(cat "$card" "$hifi" | grep -c 'cset "') == "$(cat "$card" "$hifi" | grep -c "^[[:space:]]*cset \"name='[^']*' [^\"]*\"$")" ]] \
+  || fail "every cset line has the form the test understands"
+# the VA controls appear only inside the conditional block
+awk '/^If.dmic \{/ {inside = 1} !inside && /VA[ _]/ && /cset/ {bad = 1} END {exit bad}' "$hifi" \
+  || fail "the VA macro's controls are set only behind the ControlExists check"
+grep -A3 '^If.dmic {' "$hifi" | grep -q 'Type ControlExists' && grep -q "Control \"name='VA DMIC MUX0'\"" "$hifi" \
+  || fail "the Mic device exists only when the card has the VA macro"
+pass "the sound profile is staged, balanced, and sets only controls the card has"
+
+# No speaker protection in the kernel: the gains are fixed at their lowest
+# and nothing in the profile lets the desktop raise them.
+for amp in SpkrLeft SpkrRight; do
+  grep -q "cset \"name='$amp PA Volume' 12\"" "$card" || fail "$amp's analog gain starts at 12 (-3 dB, the minimum)"
+done
+[[ -z $(cat "$card" "$hifi" | sed -n "s/.*cset \"name='Spkr[A-Za-z]* PA Volume' \([0-9]*\)\".*/\1/p" | awk '$1 > 12') ]] \
+  || fail "no sequence raises an amplifier's analog gain above 12"
+[[ -z $(cat "$card" "$hifi" | sed -n "s/.*cset \"name='WSA_RX[01] Digital Volume' \([0-9]*\)\".*/\1/p" | awk '$1 > 70') ]] \
+  || fail "the WSA digital gain stays at or below 70 (-14 dB)"
+[[ $(grep -c "cset \"name='WSA_RX[01] Digital Volume' " "$card") == 2 ]] || fail "the boot sequence sets both WSA digital gains"
+grep -qE "cset \"name='WSA_COMP[12] Switch' 1\"|VISENSE Switch' 1\"" "$card" "$hifi" && fail "the macro's compander and the unused V/I sense stay off"
+grep -qE 'PlaybackMixerElem|PlaybackVolume|PlaybackMasterElem|PlaybackSwitch' "$card" "$hifi" \
+  && fail "the profile names no playback mixer element: the desktop's volume is software only"
+for dev in Speaker Earpiece Mic; do grep -q "^[[:space:]]*SectionDevice.\"$dev\"" "$hifi" || fail "the profile has the $dev device"; done
+grep -q "PlaybackPCM \"hw:\${CardId},1\"" "$hifi" && grep -q "CapturePCM \"hw:\${CardId},2\"" "$hifi" \
+  || fail "playback is MultiMedia2 (the WSA back end), capture MultiMedia3"
+# The microphones are the two digital ones the vendor records from; the
+# WCD938x's analog inputs (no microphone signal on them) are never enabled.
+grep -q "cset \"name='VA DMIC MUX0' DMIC1\"" "$hifi" && grep -q "cset \"name='VA DMIC MUX1' DMIC6\"" "$hifi" \
+  || fail "Mic records DMIC1 (left) and DMIC6 (right)"
+grep -qE "cset \"name='ADC[1-4](_MIXER)? Switch' 1\"" "$hifi" && fail "the profile enables no analog input"
+pass "the amplifiers start at their lowest gain and the desktop cannot raise them"
+
+tplg=$r/usr/lib/firmware/updates/qcom/sm8475/SM8475-Solana-Saga-tplg.bin
+[[ -L $tplg && $(readlink "$tplg") == /usr/lib/firmware/qcom/sm8450/SM8450-HDK-tplg.bin ]] \
+  || fail "the topology the kernel asks for by the card's name is a link to linux-firmware-qcom's SM8450 HDK topology"
+[[ -z $(git ls-files 2>/dev/null | grep -E '\.(bin|mbn|mdt|elf)$') ]] || fail "no firmware file or link is kept in the package directory"
+grep -q 'linux-firmware-qcom' PKGBUILD && grep -q 'alsa-ucm-conf' PKGBUILD || fail "pacman pulls in the topology and the profile library"
+sdw=$r/usr/lib/udev/rules.d/71-omamobile-soundwire.rules
+grep -qx 'ACTION=="add", SUBSYSTEM=="platform", KERNEL=="3210000.soundwire|3250000.soundwire|33b0000.soundwire", ATTR{power/control}="on"' "$sdw" \
+  || fail "the three audio SoundWire buses are kept awake from their add event (before the driver loads)"
+[[ $(grep -cv '^#' "$sdw") == 1 ]] || fail "the SoundWire rule file holds that one rule"
+pass "the topology link and the SoundWire rule are staged"
 
 if command -v systemd-analyze > /dev/null; then
   # Missing binaries in the stand-in root are expected; unit syntax errors are not.
