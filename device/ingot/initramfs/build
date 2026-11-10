@@ -96,10 +96,13 @@ fdtput -t s /out/ingot.dtb /__symbols__ arch_timer /timer
 # ABL matches the entry by these IDs alone, so the overlay keeps our model.
 # ABL refuses to boot unless the overlay applies through a label fixup: a
 # target-path fragment, or an overlay with no fragments, leaves it in fastboot.
+# systemd.firstboot=no: the root image ships no locale, keymap or time zone, so
+# systemd-firstboot would wait for a keyboard on the console on first boot;
+# omamobile-firstboot sets the owner's answers instead.
 python3 /mkbootimg/mkbootimg.py --header_version 4 \
     --kernel /input/kernel --ramdisk /out/initramfs.cpio.gz \
     --os_version 14.0.0 --os_patch_level 2024-11 \
-    --cmdline 'console=tty0 rdinit=/init clk_ignore_unused pd_ignore_unused regulator_ignore_unused fw_devlink=permissive panic=10 printk.devkmsg=on' \
+    --cmdline 'console=tty0 rdinit=/init clk_ignore_unused pd_ignore_unused regulator_ignore_unused fw_devlink=permissive panic=10 printk.devkmsg=on systemd.firstboot=no' \
     -o /out/boot.img
 (cd /tmp && mkdir -p empty && cd empty && find . -print0 | cpio --null --quiet -o -H newc --owner=0:0) \
     | gzip -n -9 > /tmp/empty.cpio.gz
