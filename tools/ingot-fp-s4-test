@@ -1,0 +1,562 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# ingot-fp-s4-test: the Solana Saga's (ingot) fingerprint stages S4 and S5,
+# step by step, ON THE PHONE, as root. Each step says what it does, what to
+# do with the finger, and its PASS criteria, and saves its output in the log
+# directory. Run them in this order, one at a time:
+#
+#   ingot-fp-s4-test irq       the hal stage for 30 s while you touch the
+#                              sensor: the interrupt path (/dev/blfp, netlink)
+#   ingot-fp-s4-test bridge    start the bridge stage in the background (if it
+#                              is not running), then STATUS and LIST
+#   ingot-fp-s4-test enrol     enrol one finger through omamobile-fp-ctl (no
+#                              fprintd), then LIST
+#   ingot-fp-s4-test verify    AUTH with that finger (MATCH), then with another
+#                              finger (NOMATCH)
+#   ingot-fp-s4-test storage   what the stack wrote under the state directory
+#                              (names, sizes, owners), the stubs' RPMB/SSD
+#                              requests, and that no block device was opened
+#   ingot-fp-s4-test persist   stop the stack, start it again, LIST and AUTH
+#   ingot-fp-s4-test fprintd   fprintd-list/-enroll/-verify for your user
+#   ingot-fp-s4-test lock      S5: the Omarchy lock screen with the finger
+#   ingot-fp-s4-test delete    remove the test fingers again
+#   ingot-fp-s4-test stop      stop the stack (any step's leftovers)
+#
+# Options (or the environment variables in brackets):
+#   --image DIR  [INGOT_FP_IMAGE]  default /usr/lib/omamobile-fp-ingot/root
+#   --bin DIR    [INGOT_FP_BIN]    default /usr/lib/omamobile-fp-ingot/bin
+#   --state DIR  [INGOT_FP_STATE]  default /var/lib/omamobile-fp-ingot
+#   --logs DIR   [INGOT_FP_LOGS]   default /var/log/omamobile-fp-ingot-s4
+#   --user NAME  [INGOT_FP_USER]   fprintd and lock: default uid 1000's name
+#   --yes        [INGOT_FP_YES=1]  never wait for Enter (and answer the lock
+#                                  step's questions "unanswered")
+#   INGOT_FP_SECONDS (irq, default 30), INGOT_FP_FINGER (fprintd, default
+#   right-index-finger)
+#
+# The runner is /usr/lib/omamobile-fp-ingot/ingot-fp-stage (omamobile-fingerprint)
+# or else ingot-fp-stage next to this script; omamobile-fp-ctl is
+# /usr/lib/omamobile-fp/omamobile-fp-ctl or else next to this script.
+#
+# Nothing here assumes the bridge works: every failure prints the tail of
+# the stack's log (the runner's stage.log, the background runner's output,
+# the unit's journal). Tests: tools/ingot-fp-stage-test runs most steps
+# against its fakes (OMAMOBILE_FP_TEST=1, OMAMOBILE_FP_TEST_ROOT and
+# INGOT_FP_STAGE_WRAP are honoured only then).
+# shellcheck disable=SC2329  # the steps run as "s_$STEP"
+set -uo pipefail
+
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+STEP=${1:-}
+[[ -n $STEP ]] && shift
+
+TROOT='' WRAP=()
+if [[ ${OMAMOBILE_FP_TEST:-} == 1 && -n ${OMAMOBILE_FP_TEST_ROOT:-} ]]; then
+  TROOT=$OMAMOBILE_FP_TEST_ROOT
+  read -ra WRAP <<<"${INGOT_FP_STAGE_WRAP:-}"
+fi
+LIB=/usr/lib/omamobile-fp-ingot
+IMAGE=${INGOT_FP_IMAGE:-$LIB/root}
+BIN=${INGOT_FP_BIN:-$LIB/bin}
+STATE=${INGOT_FP_STATE:-/var/lib/omamobile-fp-ingot}
+LOGS=${INGOT_FP_LOGS:-/var/log/omamobile-fp-ingot-s4}
+USERNAME=${INGOT_FP_USER:-}
+YES=${INGOT_FP_YES:-0}
+SECS=${INGOT_FP_SECONDS:-30}
+FINGER=${INGOT_FP_FINGER:-right-index-finger}
+ID_ARG=
+while (($#)); do
+  case $1 in
+    --image) IMAGE=${2:?}; shift ;;
+    --bin) BIN=${2:?}; shift ;;
+    --state) STATE=${2:?}; shift ;;
+    --logs) LOGS=${2:?}; shift ;;
+    --user) USERNAME=${2:?}; shift ;;
+    --yes) YES=1 ;;
+    -[0-9]*|[0-9]*) ID_ARG=$1 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+STAGE=$LIB/ingot-fp-stage
+[[ -x $STAGE ]] || STAGE=$HERE/ingot-fp-stage
+CTL=/usr/lib/omamobile-fp/omamobile-fp-ctl
+[[ -f $CTL ]] || CTL=$HERE/omamobile-fp-ctl
+[[ -f $CTL ]] || CTL=$HERE/../packages/omamobile-fingerprint/lib/omamobile-fp-ctl
+# the runner's paths (tools/ingot-fp-stage)
+RUN=$TROOT/run/omamobile-fp-ingot
+STAGELOG=$RUN/stage.log
+NSPID=$RUN/ns.pid
+SOCK=$TROOT/run/omamobile-fp/sock/bridge.sock
+SYSFP=$TROOT/sys/devices/platform/fingerprint
+UNIT=omamobile-fp-ingot.service
+
+usage() { sed -n '/^#   ingot-fp-s4-test irq/,/^#   right-index-finger)/p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+
+# --- Output ------------------------------------------------------------------
+
+step() { printf '\n=== S4 %s: %s ===\n' "$STEP" "$*"; }
+info() { printf '    %s\n' "$*"; }
+does() { printf '  * %s\n' "$*"; }
+finger() { printf '\n  >>> FINGER: %s\n\n' "$*"; }
+criteria() { printf '  PASS if: %s\n' "$*"; }
+pause() {
+  ((YES)) && return 0
+  read -r -p "  >>> $* [Enter] " _ < /dev/tty || true
+}
+ask() { # question -> 0 yes, 1 no, 2 unanswered
+  local a
+  if ((YES)); then printf '  ? %s: unanswered (--yes)\n' "$1"; return 2; fi
+  while :; do
+    read -r -p "  ? $1 [y/n] " a < /dev/tty || return 2
+    case $a in y|Y|yes) echo "    answer: yes"; return 0 ;; n|N|no) echo "    answer: no"; return 1 ;; esac
+  done
+}
+
+FAILS=()
+fail() { FAILS+=("$*"); printf '  FAIL: %s\n' "$*"; }
+ok() { printf '  ok: %s\n' "$*"; }
+
+# The tail of everything the stack logged, for a failure.
+stack_tail() {
+  local n=${1:-40} f
+  printf '\n  --- the stack: last %s lines of each log ---\n' "$n"
+  if [[ -s $STAGELOG ]]; then
+    printf '  %s:\n' "$STAGELOG"; tail -n "$n" "$STAGELOG" | sed 's/^/    /'
+  else
+    printf '  %s: missing or empty\n' "$STAGELOG"
+  fi
+  f=$LOGS/stack.out
+  [[ -s $f ]] && { printf '  %s:\n' "$f"; tail -n "$n" "$f" | sed 's/^/    /'; }
+  if [[ -z $TROOT ]] && systemctl -q is-active "$UNIT" 2>/dev/null; then
+    printf '  journalctl -u %s:\n' "$UNIT"
+    journalctl -u "$UNIT" -n "$n" --no-pager 2>/dev/null | sed 's/^/    /'
+  fi
+}
+
+finish() {
+  if ((${#FAILS[@]})); then
+    stack_tail 40
+    printf '\nS4 %s: FAIL (%s)\n' "$STEP" "$(IFS=';'; echo "${FAILS[*]}")"
+    printf 'log: %s\n' "$STEPLOG"
+    exit 1
+  fi
+  printf '\nS4 %s: PASS\nlog: %s\n' "$STEP" "$STEPLOG"
+  exit 0
+}
+
+# --- The stack -----------------------------------------------------------------
+
+stage() { "${WRAP[@]}" "$STAGE" "$@"; }
+stage_args() { echo --image "$IMAGE" --bin "$BIN" --state "$STATE"; }
+
+stack_pid() {
+  local p
+  p=$(cat "$NSPID" 2>/dev/null) || return 1
+  [[ $p =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null && echo "$p"
+}
+running() { stack_pid > /dev/null; }
+
+ctl() { python3 "$CTL" --socket "$SOCK" "$@"; }
+
+# CTL output into $1 (and the terminal); its exit code
+ctl_to() {
+  local out=$1 rc; shift
+  does "omamobile-fp-ctl $*"
+  ctl "$@" 2>&1 | tee "$out" | sed 's/^/    /'
+  rc=${PIPESTATUS[0]}
+  return "$rc"
+}
+
+# Start the bridge stage unless it runs: the unit if it is installed and
+# enabled-able here, else the runner in the background.
+start_stack() {
+  local i p
+  if running; then
+    info "the stack runs already (PID $(stack_pid))"
+  else
+    [[ -d $IMAGE ]] || { fail "no vendor tree $IMAGE (--image)"; return 1; }
+    [[ -d $BIN ]] || { fail "no bin directory $BIN (--bin)"; return 1; }
+    does "starting: $STAGE bridge $(stage_args) (in the background; output in $LOGS/stack.out)"
+    # no stack runs: an old run's log and socket must not read as this one's
+    rm -f "$STAGELOG" "$SOCK"
+    # shellcheck disable=SC2046
+    setsid "${WRAP[@]}" "$STAGE" bridge $(stage_args) >> "$LOGS/stack.out" 2>&1 < /dev/null &
+    p=$!
+    echo "$p" > "$LOGS/stack.runner-pid"
+    for ((i = 0; i < 1800; i++)); do
+      [[ -S $SOCK ]] && grep -q 'stage bridge running' "$STAGELOG" 2>/dev/null && running && break
+      kill -0 "$p" 2>/dev/null || { fail "the runner exited while starting"; return 1; }
+      sleep 0.1
+    done
+    [[ -S $SOCK ]] || { fail "no socket $SOCK after 180 s"; return 1; }
+  fi
+  ok "socket $SOCK ($(stat -c '%U:%G %a' "$SOCK" 2>/dev/null))"
+}
+
+stop_stack() {
+  local i
+  running || { info "no stack running"; return 0; }
+  does "stopping the stack: $STAGE stop"
+  stage stop 2>&1 | sed 's/^/    /'
+  for ((i = 0; i < 300; i++)); do running || break; sleep 0.1; done
+  if running; then fail "the stack still runs after 30 s"; return 1; fi
+  [[ -e $SOCK ]] && { fail "the socket is still there after the stop"; return 1; }
+  ok "stopped; the socket is gone"
+}
+
+# The id from the enrol step (or the command line); fails without one.
+ID=
+need_id() {
+  ID=${ID_ARG:-$(cat "$LOGS/enrolled-id" 2>/dev/null)}
+  [[ $ID =~ ^-?[0-9]+$ ]] && return 0
+  fail "no enrolled id (run enrol first, or pass it: ingot-fp-s4-test $STEP ID)"
+  return 1
+}
+
+listed() { # file id -> the LIST line has the id
+  grep -E "^<- LIST( |$)" "$1" | tail -1 | tr ' ' '\n' | grep -qx -- "$2"
+}
+
+# Everything the runner logged across this test's starts.
+all_logs() {
+  local f any=0
+  for f in "$LOGS"/stack.out "$LOGS"/irq-stack.out; do
+    [[ -s $f ]] && { cat "$f"; any=1; }
+  done
+  ((any)) || cat "$STAGELOG" 2>/dev/null
+  return 0
+}
+
+# --- Steps -------------------------------------------------------------------
+
+s_irq() {
+  local before after rc lines n p
+  step "the sensor's interrupt path (hal stage, ${SECS} s)"
+  info "Runs the hal stage (qseecomd, then the HAL host holding the HAL open for"
+  info "$SECS s) while you touch the sensor. A touch raises the sensor's"
+  info "interrupt (betterlife-fp: irq_count), the driver tells the HAL over"
+  info "netlink, and the HAL reads it through /dev/blfp."
+  criteria "irq_count rose, and the HAL logged interrupt/navigation/finger activity"
+  running && { fail "a stack runs: stop it first (ingot-fp-s4-test stop)"; return; }
+  before=$(cat "$SYSFP/irq_count" 2>/dev/null) || before=unreadable
+  info "irq_count before: $before"
+  : > "$LOGS/irq-stack.out"
+  rm -f "$STAGELOG"
+  # shellcheck disable=SC2046
+  "${WRAP[@]}" "$STAGE" hal $(stage_args) --seconds "$SECS" >> "$LOGS/irq-stack.out" 2>&1 < /dev/null &
+  p=$!
+  for ((n = 0; n < 1200; n++)); do
+    grep -q 'stage hal running' "$STAGELOG" 2>/dev/null && break
+    kill -0 "$p" 2>/dev/null || break
+    sleep 0.1
+  done
+  if grep -q 'stage hal running' "$STAGELOG" 2>/dev/null; then
+    finger "NOW: touch the sensor on the back 5-10 times (touch, lift, wait a second) for about $SECS s, until this step says 'done'"
+  else
+    fail "the hal stage did not start"
+  fi
+  wait "$p"; rc=$?
+  info "done (the runner exited with $rc)"
+  sed -n '/S3 PASS\|S3 FAIL/p' "$LOGS/irq-stack.out" | sed 's/^/    /'
+  after=$(cat "$SYSFP/irq_count" 2>/dev/null) || after=unreadable
+  info "irq_count after: $after"
+  if [[ $before =~ ^[0-9]+$ && $after =~ ^[0-9]+$ ]] && ((after > before)); then
+    ok "irq_count rose by $((after - before))"
+  else
+    fail "irq_count did not rise ($before -> $after)"
+  fi
+  lines=$(grep -v '^ingot-fp:' "$LOGS/irq-stack.out" | grep -iE 'irq|interrupt|netlink|navigat|nav_|finger ?(down|up|on|off)|touch' || true)
+  n=$(grep -c . <<<"$lines")
+  if [[ -n $lines ]]; then
+    ok "$n HAL log lines about interrupts or touches (first 20):"
+    head -n 20 <<<"$lines" | sed 's/^/      /'
+  else
+    fail "the HAL logged no interrupt, navigation or touch activity"
+  fi
+}
+
+s_bridge() {
+  local f=$LOGS/bridge.ctl
+  step "start the bridge stage, STATUS, LIST"
+  info "Starts the bridge stage in the background if it isn't running:"
+  info "qseecomd, then omamobile-fp-bridge-ingot as uid 1000, which opens the HAL"
+  info "and serves fprintd's socket. Leave it running for the next steps."
+  info "(In a second terminal instead: $STAGE bridge $(stage_args))"
+  criteria "the socket appears, STATUS answers READY ... and OK, LIST answers LIST"
+  finger "none"
+  start_stack || return
+  if ctl_to "$f" --timeout 10 STATUS; then ok "STATUS"; else fail "STATUS"; fi
+  grep -q '^<- READY' "$f" || fail "no READY line"
+  grep '^<- READY' "$f" | awk 'NF >= 6 {print "    READY gives a stage count: " $6; f=1} END {if (!f) print "    READY gives no stage count (fprintd will count 20)"}'
+  if ctl_to "$f.list" --timeout 10 LIST; then ok "LIST"; else fail "LIST"; fi
+}
+
+s_enrol() {
+  local f=$LOGS/enrol.ctl id n first
+  step "enrol one finger through the bridge (no fprintd)"
+  info "ENROLL through omamobile-fp-ctl. The HAL asks for one good touch after"
+  info "another; each accepted one is a PROGRESS line counting down."
+  criteria "ENROLLED <id>, and LIST then shows that id"
+  running || { fail "no stack running: run the bridge step first"; return; }
+  finger "touch the sensor with ONE finger, lift, touch again, moving it a little each time, until ENROLLED (up to 5 minutes)"
+  if ctl_to "$f" --timeout 300 ENROLL; then ok "ENROLL"; else fail "ENROLL did not end in ENROLLED"; fi
+  id=$(sed -n 's/^<- ENROLLED \(-\{0,1\}[0-9]*\)$/\1/p' "$f" | tail -1)
+  n=$(grep -c '^<- PROGRESS ' "$f")
+  first=$(sed -n 's/^<- PROGRESS [^ ]* \([0-9]*\)$/\1/p' "$f" | head -1)
+  info "PROGRESS lines: $n (first remaining: ${first:-none}): the HAL's enrolment takes $n good touches"
+  info "  (the bridge can announce that as READY's stage count: READY 0 0 0 $n)"
+  info "ACQUIRED lines: $(grep -c '^<- ACQUIRED ' "$f"), by code: $(sed -n 's/^<- ACQUIRED \([0-9]*\).*/\1/p' "$f" | sort -n | uniq -c | awk '{printf "%s:%s ", $2, $1}')"
+  [[ -n $id ]] || return
+  echo "$id" > "$LOGS/enrolled-id"
+  info "enrolled id $id (saved in $LOGS/enrolled-id)"
+  if ctl_to "$f.list" --timeout 10 LIST && listed "$f.list" "$id"; then ok "LIST has $id"; else fail "LIST lacks $id"; fi
+}
+
+s_verify() {
+  local f=$LOGS/verify.ctl id
+  step "verify: the enrolled finger, then another one"
+  info "Two AUTHs. A NOMATCH counts toward the trusted app's lockout (Android's"
+  info "HALs lock out after 5 failures in a row); this step makes one."
+  criteria "the enrolled finger gives MATCH <id>; another finger gives NOMATCH"
+  running || { fail "no stack running: run the bridge step first"; return; }
+  need_id || return
+  id=$ID
+  finger "touch with the ENROLLED finger"
+  ctl_to "$f.1" --timeout 60 AUTH
+  if grep -qx "<- MATCH $id" "$f.1"; then ok "MATCH $id"; else fail "the enrolled finger: no MATCH $id"; fi
+  pause "next: a DIFFERENT finger. Press Enter, then touch"
+  finger "touch with a DIFFERENT finger (not enrolled)"
+  ctl_to "$f.2" --timeout 60 AUTH
+  if grep -qx '<- NOMATCH' "$f.2"; then ok "NOMATCH"; else fail "another finger: no NOMATCH"; fi
+  grep -q '^<- LOCKOUT' "$f.1" "$f.2" && fail "LOCKOUT (wait, or RESETLOCKOUT)"
+  return 0
+}
+
+s_storage() {
+  local logs pids p c fd t bad=0 rpmb ssd
+  step "what option (a) wrote, and what TrustZone asked for"
+  info "Lists the state directory (names, sizes, owners; never contents), the"
+  info "stubs' logged RPMB and SSD requests, the runner's audit, and the stack's"
+  info "open device files."
+  criteria "the audit passed at every start with no REFUSED line, and no process of the stack has a block device (or any device outside the allowlist) open"
+  finger "none"
+  if [[ -d $STATE ]]; then
+    does "the state directory $STATE ($(du -sh "$STATE" 2>/dev/null | cut -f1)):"
+    find "$STATE" -mindepth 1 -printf '%M %u:%g %10s %TY-%Tm-%Td %TH:%TM %P\n' 2>/dev/null | sort -k6 | sed 's/^/      /'
+  else
+    fail "no state directory $STATE"
+  fi
+  logs=$(all_logs)
+  does "the stubs' requests (from the runner's output of this test's starts):"
+  # the stub's own stderr line (its liblog copy would count twice)
+  rpmb=$(grep -E 'omamobile-rpmb-stub\[[0-9]+\]: listener 0x[0-9a-f]+ request [0-9]+: command 0x[0-9a-f]+' <<<"$logs" || true)
+  ssd=$(grep -E 'omamobile-ssd-stub\[[0-9]+\]: listener 0x[0-9a-f]+ request [0-9]+: command 0x[0-9a-f]+' <<<"$logs" || true)
+  for t in rpmb ssd; do
+    if [[ $t == rpmb ]]; then c=$rpmb; else c=$ssd; fi
+    if [[ -z $c ]]; then
+      info "  $t: no request"
+    else
+      info "  $t: $(grep -c . <<<"$c") requests, by command: $(sed -n 's/.*command \(0x[0-9a-f]*\).*/\1/p' <<<"$c" | sort | uniq -c |
+        awk '{n = $2; d = (n == "0x101") ? " init" : (n == "0x102") ? " read" : (n == "0x103") ? " write" : (n == "0x104") ? " cfg" : (n == "0x202") ? " read" : (n == "0x203") ? " write" : ""; printf "%s%s x%s  ", n, d, $1}')"
+    fi
+  done
+  if [[ -z $rpmb ]]; then info "  => TrustZone did not ask for RPMB"; else info "  => TrustZone asked for RPMB (answered 'failed')"; fi
+  does "the runner's audit at each start:"
+  info "  audit passed: $(grep -c 'ingot-fp: audit passed' <<<"$logs") time(s); REFUSED lines: $(grep -c 'REFUSED' <<<"$logs")"
+  grep -q 'ingot-fp: audit passed' <<<"$logs" || fail "no 'audit passed' in the runner's output"
+  grep -q 'REFUSED' <<<"$logs" && fail "the audit refused something"
+  grep -E '^ingot-fp:   c [0-9:]+ ' <<<"$logs" | sort -u | sed 's/^/      /'
+  if running; then
+    does "device files the stack's processes have open now (by device number):"
+    local -A allowed=() seen=()
+    # the host's nodes the runner copies into the chroot (the real ones,
+    # also in the tests: the processes' own stdin is the host's /dev/null)
+    for t in null zero full random urandom qseecom blfp dma_heap/default_cma_region; do
+      [[ -c /dev/$t ]] && allowed[$(stat -c '%t:%T' "/dev/$t")]=$t
+    done
+    pids=("$(stack_pid)")
+    for ((c = 0; c < ${#pids[@]}; c++)); do   # every descendant of the namespace's PID 1
+      for p in /proc/[0-9]*/stat; do
+        t=$(sed 's/^.*) //' "$p" 2>/dev/null) || continue   # after "(comm) "
+        t=${t#* }; t=${t%% *}                                 # state ppid ...
+        [[ $t == "${pids[c]}" ]] && pids+=("$(basename "$(dirname "$p")")")
+      done
+    done
+    for p in "${pids[@]}"; do
+      for fd in /proc/"$p"/fd/*; do
+        t=$(stat -L -c '%F %t:%T' "$fd" 2>/dev/null) || continue
+        case $t in
+          "block special file "*) info "  $(cat "/proc/$p/comm" 2>/dev/null) ($p): BLOCK device ${t##* } $(readlink "$fd")  <- NOT ALLOWED"; bad=1 ;;
+          "character special file "*)
+            [[ -n ${seen[$p:${t##* }]:-} ]] && continue
+            seen[$p:${t##* }]=1
+            if [[ -n ${allowed[${t##* }]:-} ]]; then
+              info "  $(cat "/proc/$p/comm" 2>/dev/null) ($p): ${allowed[${t##* }]} (${t##* })"
+            else
+              info "  $(cat "/proc/$p/comm" 2>/dev/null) ($p): character device ${t##* } $(readlink "$fd")  <- NOT ALLOWED"; bad=1
+            fi ;;
+        esac
+      done
+    done
+    info "  (${#pids[@]} processes looked at)"
+    ((bad)) && fail "a process of the stack has a device outside the allowlist open"
+  else
+    info "(the stack is not running: no live check of open files)"
+  fi
+  if [[ -z $TROOT ]]; then
+    does "the kernel log about RPMB:"
+    dmesg 2>/dev/null | grep -iE 'rpmb' | tail -n 10 | sed 's/^/      /'
+  fi
+  return 0
+}
+
+s_persist() {
+  local f=$LOGS/persist.ctl id
+  step "do the templates survive a restart of the stack?"
+  info "Stops the stack (bridge first, then qseecomd), starts it again, then"
+  info "LIST and AUTH."
+  criteria "LIST shows the enrolled id again, and the enrolled finger gives MATCH <id>"
+  need_id || return
+  id=$ID
+  stop_stack || return
+  start_stack || return
+  if ctl_to "$f.list" --timeout 10 LIST && listed "$f.list" "$id"; then ok "LIST has $id"; else fail "LIST lacks $id after the restart"; fi
+  finger "touch with the ENROLLED finger"
+  ctl_to "$f.auth" --timeout 60 AUTH
+  if grep -qx "<- MATCH $id" "$f.auth"; then ok "MATCH $id after the restart"; else fail "no MATCH $id after the restart"; fi
+  info "After a reboot: run 'ingot-fp-s4-test persist' again by hand (the stop is"
+  info "then a no-op; it starts the stack, LIST, AUTH): that is persistence across a reboot."
+}
+
+need_user() {
+  [[ -n $USERNAME ]] || USERNAME=$(getent passwd 1000 | cut -d: -f1)
+  [[ -n $USERNAME ]] && return 0
+  fail "no user (--user NAME)"
+  return 1
+}
+
+s_fprintd() {
+  local u lib env rc f=$LOGS/fprintd
+  step "fprintd: list, enrol, verify for your user"
+  info "Needs on the phone: our libfprint (packages/libfprint, 1.94.100-1.8 or"
+  info "later: the omamobile_udfps driver), fprintd, and omamobile-fingerprint's"
+  info "drop-in fprintd.service.d/omamobile-udfps.conf (FP_OMAMOBILE_UDFPS=$SOCK)."
+  info "No omamobile-fp-ctl may be connected meanwhile (one client at a time)."
+  criteria "fprintd-list names the Omarchy Mobile device, fprintd-enroll ends enroll-completed, fprintd-verify gives verify-match"
+  need_user || return
+  u=$USERNAME
+  running || { fail "no stack running: run the bridge step first"; return; }
+  info "libfprint: $(pacman -Q libfprint 2>&1)   fprintd: $(pacman -Q fprintd 2>&1)"
+  lib=$(find /usr/lib -maxdepth 1 -name 'libfprint-2.so.2*' -type f 2>/dev/null | head -1)
+  if [[ -n $lib ]] && grep -qa omamobile_udfps "$lib"; then ok "$lib has omamobile_udfps"; else fail "libfprint without omamobile_udfps (install packages/libfprint)"; fi
+  env=$(systemctl show fprintd -p Environment 2>/dev/null)
+  if [[ $env == *"FP_OMAMOBILE_UDFPS=/run/omamobile-fp/sock/bridge.sock"* ]]; then ok "fprintd's environment names the socket"
+  else fail "fprintd's environment lacks FP_OMAMOBILE_UDFPS (the drop-in; systemctl daemon-reload): $env"; fi
+  ((${#FAILS[@]})) && return
+  does "systemctl restart fprintd (it finds the device at its start)"
+  systemctl restart fprintd.service 2>&1 | sed 's/^/    /'
+  does "fprintd-list $u"
+  LC_ALL=C fprintd-list "$u" 2>&1 | tee "$f.list" | sed 's/^/    /'
+  if grep -q 'Omarchy Mobile' "$f.list"; then ok "fprintd sees the device"; else fail "fprintd lists no Omarchy Mobile device"; fi
+  finger "fprintd-enroll: touch the sensor again and again until enroll-completed"
+  does "fprintd-enroll -f $FINGER $u"
+  LC_ALL=C fprintd-enroll -f "$FINGER" "$u" 2>&1 | tee "$f.enroll" | sed 's/^/    /'
+  info "stages passed: $(grep -c 'enroll-stage-passed' "$f.enroll")"
+  if grep -q 'enroll-completed' "$f.enroll"; then ok "enroll-completed"; : > "$LOGS/fprintd-enrolled"; else fail "fprintd-enroll did not complete"; fi
+  finger "fprintd-verify: touch with the finger you just enrolled"
+  does "fprintd-verify -f $FINGER $u"
+  LC_ALL=C fprintd-verify -f "$FINGER" "$u" 2>&1 | tee "$f.verify" | sed 's/^/    /'
+  rc=0; grep -q 'verify-match' "$f.verify" || rc=1
+  if ((rc == 0)); then ok "verify-match"; else fail "fprintd-verify: no verify-match"; fi
+  does "fprintd-list $u"
+  LC_ALL=C fprintd-list "$u" 2>&1 | sed 's/^/    /'
+}
+
+s_lock() {
+  local u r a
+  step "S5: the Omarchy lock screen with the finger"
+  info "The lock uses PAM service omarchy-lock-fingerprint (pam_fprintd), and only"
+  info "once fprintd lists an enrolled finger for the user. There is no circle"
+  info "on the display on this phone: the sensor is on the back."
+  criteria "the enrolled finger unlocks; another finger doesn't; the PIN/password still unlocks; with the stack stopped the lock falls back to the PIN/password"
+  need_user || return
+  u=$USERNAME
+  if grep -q '^auth[[:space:]].*pam_fprintd.so' /etc/pam.d/omarchy-lock-fingerprint 2>/dev/null; then
+    ok "/etc/pam.d/omarchy-lock-fingerprint uses pam_fprintd"
+  else
+    fail "no /etc/pam.d/omarchy-lock-fingerprint with pam_fprintd (omamobile-fingerprint ships it)"
+  fi
+  if LC_ALL=C fprintd-list "$u" 2>&1 | grep -qE '^ +- #[0-9]+: '; then ok "fprintd lists a finger for $u"
+  else fail "fprintd lists no finger for $u: run the fprintd step first"; fi
+  running || fail "no stack running: run the bridge step first"
+  ((${#FAILS[@]})) && return
+  r=$(wc -l < "$STAGELOG" 2>/dev/null || echo 0)
+  info "1. Lock the phone (the power button, or omarchy-system-lock in the session)."
+  info "2. Wake the screen. Touch the sensor on the back with the enrolled finger."
+  ask "did the enrolled finger unlock the phone within about 2 s?"; a=$?; ((a == 1)) && fail "the finger did not unlock"
+  info "3. Lock again, wake, touch with ANOTHER finger, two or three times."
+  ask "did the phone stay locked?"; a=$?; ((a == 1)) && fail "another finger unlocked"
+  info "4. Unlock with the PIN or password."
+  ask "did the PIN/password unlock?"; a=$?; ((a == 1)) && fail "the PIN/password did not unlock"
+  does "the stack's log during steps 1-4:"
+  tail -n +"$((r + 1))" "$STAGELOG" 2>/dev/null | tail -n 30 | sed 's/^/      /'
+  info "5. Now the fallback: this step stops the stack. Then lock, wake, and unlock"
+  info "   with the PIN/password."
+  pause "Press Enter to stop the stack"
+  stop_stack
+  ask "with the stack stopped, did the PIN/password unlock (and the lock not hang)?"; a=$?
+  ((a == 1)) && fail "no fallback to the PIN/password"
+  info "Start the stack again for the next step: ingot-fp-s4-test bridge"
+  ((YES)) && info "(--yes: the questions are unanswered; a PASS covers only the checks)"
+  return 0
+}
+
+s_delete() {
+  local f=$LOGS/delete.ctl id u
+  step "remove the test fingers"
+  info "DELETE the finger enrolled through the bridge, and fprintd's (if the fprintd"
+  info "step enrolled one)."
+  criteria "DELETED <id>, then LIST without it; fprintd-list shows no finger"
+  finger "none"
+  running || { fail "no stack running: run the bridge step first"; return; }
+  id=${ID_ARG:-$(cat "$LOGS/enrolled-id" 2>/dev/null)}
+  if [[ $id =~ ^-?[0-9]+$ ]]; then
+    if ctl_to "$f" --timeout 30 DELETE "$id" && grep -qx "<- DELETED $id" "$f"; then ok "DELETED $id"; rm -f "$LOGS/enrolled-id"
+    else fail "DELETE $id"; fi
+    if ctl_to "$f.list" --timeout 10 LIST && ! listed "$f.list" "$id"; then ok "LIST without $id"; else fail "LIST still has $id"; fi
+  else
+    info "no id from the enrol step: nothing to delete through the bridge"
+  fi
+  if [[ -e $LOGS/fprintd-enrolled ]]; then
+    need_user || return
+    u=$USERNAME
+    does "fprintd-delete $u"
+    fprintd-delete "$u" 2>&1 | sed 's/^/    /'
+    if LC_ALL=C fprintd-list "$u" 2>&1 | grep -qE '^ +- #[0-9]+: '; then fail "fprintd still lists a finger for $u"
+    else ok "fprintd lists no finger for $u"; rm -f "$LOGS/fprintd-enrolled"; fi
+  fi
+}
+
+s_stop() {
+  step "stop the stack"
+  criteria "the stack is stopped and the socket is gone"
+  stop_stack
+}
+
+# --- Main ----------------------------------------------------------------------
+
+case $STEP in
+  irq|bridge|enrol|verify|storage|persist|fprintd|lock|delete|stop) ;;
+  *) usage ;;
+esac
+[[ -n $TROOT || $EUID -eq 0 ]] || { echo "run as root (on the phone)" >&2; exit 1; }
+[[ -f $CTL ]] || { echo "no omamobile-fp-ctl (looked in /usr/lib/omamobile-fp and $HERE)" >&2; exit 1; }
+[[ -x $STAGE ]] || { echo "no ingot-fp-stage (looked in $LIB and $HERE)" >&2; exit 1; }
+install -d -m 0700 "$LOGS" || exit 1
+STEPLOG=$LOGS/$STEP-$(date +%Y%m%d-%H%M%S).log
+exec > >(tee -a "$STEPLOG") 2>&1
+printf 'ingot-fp-s4-test %s, %s; runner %s, image %s, bin %s, state %s\n' \
+  "$STEP" "$(date -Is)" "$STAGE" "$IMAGE" "$BIN" "$STATE"
+"s_$STEP"
+finish
