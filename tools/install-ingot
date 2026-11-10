@@ -24,6 +24,8 @@
 #     --rootfs    the root image (default: the newest out/ingot/*.img.zst,
 #                 from tools/build-rootfs --local ingot)
 set -euo pipefail
+# Byte-wise character ranges in the checks below ([ -~] is printable ASCII)
+export LC_ALL=C
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 CODENAME=ingot
 FASTBOOT=${FASTBOOT:-fastboot}
