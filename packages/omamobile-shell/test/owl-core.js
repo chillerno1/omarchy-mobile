@@ -323,9 +323,9 @@ test("an OWL widget runs only when it compiles, can run here and is approved", (
 
 test("phone actions and android.* answers, with mocks", () => {
   eq(P.actionArgv("haptic", []), ["fbcli", "-E", "button-pressed"])
-  eq(P.actionArgv("torch", [true]), ["brightnessctl", "--device=white:torch", "--quiet", "set", "100%"])
-  eq(P.actionArgv("torch", ["off"]), ["brightnessctl", "--device=white:torch", "--quiet", "set", "0"])
-  eq(P.actionArgv("torch", ["toggle"])[0], "sh")
+  eq(P.actionArgv("torch", [true]), ["omamobile-torch", "on"])
+  eq(P.actionArgv("torch", ["off"]), ["omamobile-torch", "off"])
+  eq(P.actionArgv("torch", ["toggle"]), ["omamobile-torch", "toggle"])
   eq(P.actionArgv("volume", ["mute"]), ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1"])
   eq(P.actionArgv("volume", [250]), ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "100%"])
   eq(P.actionArgv("media", ["toggle"]), ["playerctl", "play-pause"])

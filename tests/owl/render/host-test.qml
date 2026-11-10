@@ -55,7 +55,7 @@ ShellRoot {
     t.check("haptic with approval asks feedbackd", JSON.stringify(t.executed[0]) === JSON.stringify(["fbcli", "-E", "button-pressed"]), JSON.stringify(t.executed))
     const torchOnly = t.mockWidget("c@1", { commands: [], devices: ["torch"] })
     host.act(torchOnly, "torch", [true])
-    t.check("torch with approval sets the LED", t.executed.length === 2 && t.executed[1][0] === "brightnessctl", JSON.stringify(t.executed))
+    t.check("torch with approval sets the LED", t.executed.length === 2 && JSON.stringify(t.executed[1]) === JSON.stringify(["omamobile-torch", "on"]), JSON.stringify(t.executed))
     host.act(torchOnly, "torch", [false])
     t.check("a second action within a second is held back", t.executed.length === 2 && torchOnly.reported.length === 1)
 

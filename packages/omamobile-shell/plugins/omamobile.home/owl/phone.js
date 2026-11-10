@@ -226,11 +226,10 @@ function approvalMatches(record, program) {
 
 // ---------------------------------------------------------------- host calls
 
-var TORCH = "white:torch"
-
 // The argv a phone action runs (never through a shell unless shown), or
 // null when the action isn't a plain command. The torch is the quick
-// settings tile's LED (leds-lm3644), the haptic a feedbackd event, so the
+// settings tile's LED (omamobile-torch, which the device package's
+// descriptor points at the LED), the haptic a feedbackd event, so the
 // user's feedback profile (silent, quiet) applies.
 function actionArgv(name, args) {
   var a = args || []
@@ -239,10 +238,9 @@ function actionArgv(name, args) {
   case "haptic": return ["fbcli", "-E", "button-pressed"]
   case "torch": {
     var v = a[0]
-    if (v === true || s(0) === "on" || s(0) === "true") return ["brightnessctl", "--device=" + TORCH, "--quiet", "set", "100%"]
-    if (v === false || s(0) === "off" || s(0) === "false") return ["brightnessctl", "--device=" + TORCH, "--quiet", "set", "0"]
-    return ["sh", "-c", "if [ \"$(brightnessctl --device=" + TORCH + " get)\" -gt 0 ]; then brightnessctl --device=" + TORCH + " --quiet set 0; " +
-            "else brightnessctl --device=" + TORCH + " --quiet set 100%; fi"]
+    if (v === true || s(0) === "on" || s(0) === "true") return ["omamobile-torch", "on"]
+    if (v === false || s(0) === "off" || s(0) === "false") return ["omamobile-torch", "off"]
+    return ["omamobile-torch", "toggle"]
   }
   case "notify": return ["notify-send", s(0), s(1)]
   case "copy": return ["wl-copy", "--", s(0)]

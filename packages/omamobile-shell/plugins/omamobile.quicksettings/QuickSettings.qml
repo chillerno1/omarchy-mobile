@@ -1273,8 +1273,9 @@ Item {
     onExited: function(exitCode) { if (exitCode !== 0) keyboard.available = false }
   }
 
-  // The rear flash LED in torch mode (leds-lm3644, white:torch). "100%" is
-  // the device tree's torch cap, not the chip's maximum. brightnessctl goes
+  // The rear flash LED in torch mode, through omamobile-torch: the device
+  // package's descriptor names the LED and the on level (white:torch at
+  // 100%, the device tree's cap, when it doesn't). brightnessctl goes
   // through logind's SetBrightness when it can't write sysfs itself, which
   // the active session may do for leds devices.
   QtObject {
@@ -1291,14 +1292,14 @@ Item {
 
     function toggle() {
       if (!available || torchWrite.running) return
-      torchWrite.command = ["brightnessctl", "--device=white:torch", "--quiet", "set", enabled ? "0" : "100%"]
+      torchWrite.command = ["omamobile-torch", enabled ? "off" : "on"]
       torchWrite.running = true
     }
   }
 
   Process {
     id: torchRead
-    command: ["brightnessctl", "--device=white:torch", "--machine-readable", "info"]
+    command: ["omamobile-torch", "info"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {

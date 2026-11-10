@@ -136,7 +136,7 @@ existed finds them under "Add tiles" too.
 | Location | `omamobile-gnss on` and `off` (omamobile-gnss), through polkit; "In use" while the receiver runs, "No GNSS" without the command or the vendor files |
 | NFC | the controller's rfkill switch (`rfkill block nfc`, `rfkill unblock nfc`); "No NFC" until a controller probes (RADIOS-CAMERA-PLAN section 3) |
 | Rotation lock | `omamobile-autorotate` (omamobile-sensors): locked by `~/.local/state/omamobile/rotation-lock`; unlocking also enables the service. "No sensor" while the sensor proxy has no accelerometer |
-| Torch | The rear flash LED in torch mode (`brightnessctl --device=white:torch`); "No flash LED" without it |
+| Torch | The rear flash LED in torch mode (`omamobile-torch`: the device descriptor's `TORCH_LED` at `TORCH_LEVEL`, `white:torch` at 100% by default); "No flash LED" without it |
 | Do not disturb | The notification service's `notifications` IPC target on this shell instance |
 | Clipboard | Puts the sheet away and opens Omarchy's clipboard history (`omarchy-shell shell summon omarchy.clipboard`, Super+Ctrl+V on the desktop); a pick pastes into the app underneath |
 | Dictation | The voice bar (omamobile.voice: `omamobile-voice start`, a second tap `omamobile-voice done`); a start puts the sheet away so the words land in the app underneath. Its chevron (and a long press) opens the voice settings, as Wi-Fi's and Bluetooth's open their pages. "Listening" while it records, "Transcribing…" after. voxtype is an optional Omarchy install (Install > AI > Dictation): "Not installed" without it, "Not running" while `voxtype.service` (user) is inactive |

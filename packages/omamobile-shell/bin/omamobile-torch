@@ -1,0 +1,45 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# omamobile-torch: the rear flash LED as a torch, for the quick-settings tile
+# and widgets' torch(). The device package names the LED and the "on" level
+# in its descriptor, /usr/share/omamobile/device.conf:
+#   TORCH_LED    the leds class device (default white:torch)
+#   TORCH_LEVEL  what brightnessctl sets for on: a value, or a percentage of
+#                max_brightness (default 100%)
+# brightnessctl writes sysfs itself when it may and otherwise asks logind's
+# SetBrightness, which lets the active session set leds devices.
+#
+#   omamobile-torch info     brightnessctl's machine-readable line
+#   omamobile-torch get      the current brightness
+#   omamobile-torch on|off|toggle
+set -euo pipefail
+
+conf=${OMAMOBILE_DEVICE_CONF:-/usr/share/omamobile/device.conf}
+led=white:torch level=100%
+if [[ -r $conf ]]; then
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^(TORCH_LED|TORCH_LEVEL)=\"?([^\"]*)\"?$ ]] || continue
+    key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+    if [[ $key == TORCH_LED && $value =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+      led=$value
+    elif [[ $key == TORCH_LEVEL && $value =~ ^[0-9]+%?$ ]]; then
+      level=$value
+    else
+      echo "omamobile-torch: ignoring $key=$value in $conf" >&2
+    fi
+  done <"$conf"
+fi
+
+case ${1:-} in
+  info) exec brightnessctl --device="$led" --machine-readable info ;;
+  get) exec brightnessctl --device="$led" get ;;
+  on) exec brightnessctl --device="$led" --quiet set "$level" ;;
+  off) exec brightnessctl --device="$led" --quiet set 0 ;;
+  toggle)
+    current=$(brightnessctl --device="$led" get)
+    if [[ $current =~ ^[0-9]+$ ]] && (( current > 0 )); then
+      exec brightnessctl --device="$led" --quiet set 0
+    fi
+    exec brightnessctl --device="$led" --quiet set "$level" ;;
+  *) echo "Usage: omamobile-torch info|get|on|off|toggle" >&2; exit 2 ;;
+esac

@@ -164,7 +164,7 @@ QtObject {
     }
     if (kind === "volume") return fromCommand("wpctl get-volume @DEFAULT_AUDIO_SINK@", Phone.volumeFrom)
     if (kind === "media") return fromCommand("playerctl metadata --format " + JSON.stringify(Phone.MEDIA_FORMAT) + " 2>/dev/null", Phone.mediaFrom)
-    if (kind === "modes") return fromCommand("brightnessctl --device=white:torch get 2>/dev/null || echo; makoctl mode 2>/dev/null", Phone.modesFrom)
+    if (kind === "modes") return fromCommand("omamobile-torch get 2>/dev/null || echo; makoctl mode 2>/dev/null", Phone.modesFrom)
     if (kind === "system") {
       return fromCommand("cat /proc/meminfo; echo '@@'; cat /proc/uptime; echo '@@'; uname -r; echo '@@'; df -B1 --output=size,used / | tail -1; echo '@@@'; " + Phone.DEVICE_COMMAND, function(t) {
         const halves = t.split("@@@\n")

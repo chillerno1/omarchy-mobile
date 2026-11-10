@@ -1079,6 +1079,8 @@ python3 -B test/doubletap.py >/dev/null || { python3 -B test/doubletap.py | grep
 pass "omamobile-doubletap: double taps and the touchscreen by its capabilities"
 python3 -B -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' bin/omamobile-weather || fail "omamobile-weather parses"
 python3 -B test/weather.py 2>/dev/null || fail "omamobile-weather"
+bash -n bin/omamobile-torch || fail "omamobile-torch parses"
+bash test/torch.sh || fail "omamobile-torch"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 ./install "$tmp/root"
 [[ -x $tmp/root/usr/bin/omamobile-setup-user && -f $tmp/root/usr/share/omamobile/shell/profile/shell.json ]] \
