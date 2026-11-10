@@ -34,7 +34,7 @@ writes. The bootloader takes the kernel, initramfs and command line from
 
 `--boot-only` writes `boot_a` alone (a kernel or initramfs change that
 needs no new DTB or overlay). `--images DIR` takes another image set, laid
-out as `tools/build-ingot-probe --standalone` writes it: `boot_a.img`,
+out as `tools/build-ingot-probe --standalone` writes its `slot-a` directory: `boot_a.img`,
 `vendor_boot.img`, `dtbo.img`, `RELEASE` and `SHA256SUMS`.
 
 ## Safety properties
@@ -145,8 +145,8 @@ decision.
 On the laptop (see `packages/linux-omamobile-ingot/README.md`):
 
 ```sh
-tools/build-ingot-probe --standalone ... --out IMAGES      # boot_a.img, vendor_boot.img, dtbo.img, RELEASE, SHA256SUMS
-KERNEL_DIR=<kernel tree> packages/linux-omamobile-ingot/stage KERNEL_OUT IMAGES
+tools/build-ingot-probe --standalone ... --out IMAGES      # IMAGES/slot-a: boot_a.img, vendor_boot.img, dtbo.img, RELEASE, SHA256SUMS
+KERNEL_DIR=<kernel tree> packages/linux-omamobile-ingot/stage KERNEL_OUT IMAGES/slot-a
 tools/build-packages --local ingot packages/linux-omamobile-ingot packages/omamobile-ingot-boot
 ```
 

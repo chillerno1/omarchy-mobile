@@ -13,9 +13,10 @@
 #   arch/arm64/boot/Image.gz                 the kernel boot_a.img must carry
 #   arch/arm64/boot/dts/qcom/sm8475-osom-ingot.dtb
 #   modules-<release>.tar.zst                the stripped modules, <release>/... inside
-# IMAGES_DIR is what `tools/build-ingot-probe --standalone` writes from
-# that build: boot_a.img (header v4 with an AVB footer, padded to boot_a's
-# 0x6000000 bytes), vendor_boot.img, dtbo.img, RELEASE and SHA256SUMS.
+# IMAGES_DIR is the slot-a directory `tools/build-ingot-probe --standalone`
+# writes from that build (tools/ingot-boot-set): boot_a.img (header v4 with
+# an AVB footer, padded to boot_a's 0x6000000 bytes), vendor_boot.img,
+# dtbo.img, RELEASE and SHA256SUMS.
 #
 # Refused: a -dirty release; a modules tarball that is missing, of another
 # release or without modules.order; no board DTB; an image set that fails
@@ -90,7 +91,7 @@ top=$(tar --zstd -tf "$modules" | sed 's|^\./||; s|/.*||' | sort -u)
 [[ $top == "$rel" ]] || die "$modules holds '$top', not $rel only (a stale tarball? KERNEL_OUT=$out bin/omamobile modules)"
 tar --zstd -tf "$modules" | grep -cE "^(\./)?$rel/modules\.order$" >/dev/null || die "$modules has no modules.order (KERNEL_OUT=$out bin/omamobile modules)"
 [[ -s $dtb ]] || die "no $dtb"
-[[ -d $images ]] || die "no image directory $images (tools/build-ingot-probe --standalone)"
+[[ -d $images ]] || die "no image directory $images (the slot-a directory of tools/build-ingot-probe --standalone)"
 check_set "$images" "$rel"
 # The kernel boot_a.img carries must be this build's, or the modules are
 # another kernel's

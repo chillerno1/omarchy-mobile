@@ -63,6 +63,53 @@ else
   refused "one argument" "usage:" "$t/boot.img"
   [[ ! -e $t/out1.img && ! -e $t/out2.img && ! -e $t/out3.img && ! -e $t/out4.img ]] || fail "a refusal writes no OUT"
   [[ -z $(find "$t" -name '.ingot-boot-footer.*') ]] || fail "a refusal leaves no working copy"
+
+  # --- tools/ingot-boot-set: the set the phone's writer and the kernel
+  # package take. The builder and those two were written apart, so this is
+  # where they meet: the set must pass the checks they share.
+  mkdir "$t/built"
+  cp "$t/boot.img" "$t/built/boot.img"
+  { printf 'VNDRBOOT'; head -c 5000 /dev/urandom; } > "$t/built/vendor_boot.img"
+  { printf '\xd7\xb7\xab\x1e'; head -c 4092 /dev/urandom; } > "$t/built/dtbo.img"
+  echo 7.3.0-rc6-omamobile-push1-g0123456789ab > "$t/built/RELEASE"
+  head -c 100 /dev/urandom > "$t/built/ingot.dtb"
+  (cd "$t/built" && sha256sum boot.img vendor_boot.img dtbo.img ingot.dtb RELEASE > SHA256SUMS)
+  mkset() { tools/ingot-boot-set "$@" > "$t/log" 2>&1; }
+  mkset "$t/built" "$t/built/slot-a" || { cat "$t/log"; fail "a build directory becomes a set"; }
+  [[ $(cd "$t/built/slot-a" && find . -type f | LC_ALL=C sort | tr '\n' ' ') == "./RELEASE ./SHA256SUMS ./boot_a.img ./dtbo.img ./vendor_boot.img " ]] \
+    || fail "the set holds its five files and nothing else"
+  cmp -s "$t/built/slot-a/boot_a.img" "$t/a1.img" || fail "the set's boot_a.img is the footed boot.img"
+  cmp -s "$t/built/slot-a/vendor_boot.img" "$t/built/vendor_boot.img" && cmp -s "$t/built/slot-a/dtbo.img" "$t/built/dtbo.img" \
+    || fail "vendor_boot.img and dtbo.img are copied unchanged"
+  lib=packages/omamobile-ingot-boot/lib/ingot-images.sh
+  if [[ -f $lib ]]; then
+    ( # shellcheck source=../packages/omamobile-ingot-boot/lib/ingot-images.sh
+      source "$lib"
+      d=$t/built/slot-a
+      ib_check_sums "$d" && [[ $(ib_release "$d") == 7.3.0-rc6-omamobile-push1-g0123456789ab ]] \
+        && ib_check_boot "$d/boot_a.img" "$IB_BOOT_A_BYTES" && ib_check_vendor_boot "$d/vendor_boot.img" "$IB_VENDOR_BOOT_A_BYTES" \
+        && ib_check_dtbo "$d/dtbo.img" "$IB_DTBO_A_BYTES" && ib_kernel_of "$d/boot_a.img" "$t/kernel.out" \
+        && cmp -s "$t/kernel.out" "$t/kernel" ) || fail "the set passes the writer's and the kernel package's checks"
+    # The build directory itself is not a set: its sums name other files
+    ( source "$lib"; ! ib_check_sums "$t/built" >/dev/null ) || fail "the build directory is not taken for a set"
+    pass "ingot-boot-set makes the set omamobile-ingot-boot and linux-omamobile-ingot check, kernel included"
+  else
+    pass "ingot-boot-set makes boot_a.img, vendor_boot.img, dtbo.img, RELEASE and SHA256SUMS"
+  fi
+  refused_set() { # what, expected message, arguments
+    local what=$1 msg=$2; shift 2
+    if mkset "$@"; then fail "ingot-boot-set refuses $what"; fi
+    grep -q -- "$msg" "$t/log" || { cat "$t/log"; fail "ingot-boot-set refuses $what with: $msg"; }
+  }
+  refused_set "an existing set" "already exists" "$t/built" "$t/built/slot-a"
+  cp -r "$t/built" "$t/mixed"; rm -rf "$t/mixed/slot-a"
+  head -c 5008 /dev/urandom > "$t/mixed/vendor_boot.img"
+  refused_set "an image that isn't the one its build summed" "does not match" "$t/mixed" "$t/mixed/slot-a"
+  rm "$t/mixed/dtbo.img"
+  refused_set "a build directory without dtbo.img" "has no dtbo.img" "$t/mixed" "$t/mixed/slot-a"
+  [[ ! -e $t/mixed/slot-a && -z $(find "$t" -name '.ingot-boot-set.*') ]] || fail "a refusal leaves no set and no working copy"
+  pass "ingot-boot-set refuses an existing set, a changed image and a missing one, leaving nothing behind"
+
   # A key that isn't the one SOURCE records, in a copy of the tree
   R=$t/repo
   mkdir -p "$R/tools/lib" "$R/device/ingot" "$R/packages/omamobile-boot-update"

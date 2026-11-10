@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # shellcheck shell=bash disable=SC2034 # the constants are for the scripts that source this
 # The Solana Mobile Saga's (ingot) boot image set, as tools/build-ingot-probe
-# --standalone writes it, checked by its structure alone. Sourced by
+# --standalone writes it into slot-a/ (tools/ingot-boot-set), checked by its
+# structure alone. Sourced by
 # omamobile-ingot-boot on the phone and by linux-omamobile-ingot's ./stage
 # on the laptop, so both refuse the same images.
 #

@@ -32,10 +32,11 @@ and image set, the refusals, the layout, `makepkg -A` where installed).
 # the kernel and its modules
 KERNEL_DIR=~/omamobile-kernel/<tree> KERNEL_OUT=~/omamobile-kernel/out-ingot bin/omamobile kernel
 KERNEL_OUT=~/omamobile-kernel/out-ingot bin/omamobile modules
-# the boot images from that kernel (boot_a.img, vendor_boot.img, dtbo.img, RELEASE, SHA256SUMS)
+# the boot images from that kernel; IMAGES/slot-a is the set for slot A
+# (boot_a.img, vendor_boot.img, dtbo.img, RELEASE, SHA256SUMS)
 tools/build-ingot-probe --standalone --kernel ~/omamobile-kernel/out-ingot/arch/arm64/boot/Image.gz ... --out IMAGES
 # into prebuilt/
-KERNEL_DIR=~/omamobile-kernel/<tree> packages/linux-omamobile-ingot/stage ~/omamobile-kernel/out-ingot IMAGES
+KERNEL_DIR=~/omamobile-kernel/<tree> packages/linux-omamobile-ingot/stage ~/omamobile-kernel/out-ingot IMAGES/slot-a
 ```
 
 `stage KERNEL_OUT IMAGES_DIR [PREBUILT]` copies `kernel.release`, the

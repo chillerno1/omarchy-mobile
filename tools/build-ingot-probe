@@ -16,8 +16,11 @@
 # and falls back to LineageOS, which can't use the Arch root.
 # --self-update (needs --arch) also leaves slot A's boot, vendor_boot and
 # dtbo writable (UFS_RW_SELF_UPDATE), so Arch can write its own boot images.
-# --standalone (implies --arch) also makes boot_a.img: boot.img with the AVB
-# footer that flashing it to boot_a needs (tools/ingot-boot-footer).
+# --standalone (implies --arch) also makes slot-a/, the set for slot A:
+# boot_a.img (boot.img with the AVB footer that flashing it to boot_a needs,
+# tools/ingot-boot-footer), vendor_boot.img, dtbo.img, RELEASE and their
+# SHA256SUMS (tools/ingot-boot-set). That directory is what the kernel
+# package stages and the phone's writer takes.
 # Every build writes RELEASE, the packed kernel's release.
 #
 # The kernel must have USB DWC3/QCOM, the eUSB2 PHY, RPMh regulators,
@@ -69,7 +72,7 @@ done
 [[ $(basename "$mkbootimg") == mkbootimg.py ]] || die '--mkbootimg must name AOSP mkbootimg.py'
 [[ $(basename "$mkdtboimg") == mkdtboimg.py ]] || die '--mkdtboimg must name AOSP mkdtboimg.py'
 [[ ! -e $out/boot.img ]] || die "$out/boot.img already exists; choose a fresh output directory"
-[[ ! -e $out/boot_a.img ]] || die "$out/boot_a.img already exists; choose a fresh output directory"
+[[ ! -e $out/slot-a ]] || die "$out/slot-a already exists; choose a fresh output directory"
 if ((standalone)); then
   [[ -n ${AVBTOOL:-} ]] || command -v avbtool >/dev/null || die '--standalone needs avbtool (on PATH, or set AVBTOOL)'
 fi
@@ -98,13 +101,14 @@ docker run --rm --platform linux/arm64 \
   -e ARCH_BOOT="$arch_boot" -e SELF_UPDATE="$self_update" \
   alpine:3.22 sh /src/device/ingot/initramfs/build
 if ((standalone)); then
-  # The container wrote $out's files as root: only create new files here
-  "$ROOT/tools/ingot-boot-footer" "$out/boot.img" "$out/boot_a.img"
+  # The container wrote $out's files as root: only create new files here.
+  # A directory of its own, so its SHA256SUMS names the set and nothing else
+  "$ROOT/tools/ingot-boot-set" "$out" "$out/slot-a"
 fi
 if ((arch_boot)); then
   echo "Built Arch boot images in $out (no phone was accessed). Booted, they leave userdata writable"
   ((self_update == 0)) || echo "Built with --self-update: booted, they also leave boot_a, vendor_boot_a and dtbo_a writable"
-  ((standalone == 0)) || echo "boot_a.img is boot.img with its AVB footer, for boot_a (kernel $(cat "$out/RELEASE"))"
+  ((standalone == 0)) || echo "$out/slot-a is the set for slot A: boot_a.img (boot.img with its AVB footer), vendor_boot.img and dtbo.img (kernel $(cat "$out/RELEASE"))"
 else
   echo "Built boot.img, vendor_boot.img and dtbo.img in $out (no phone was accessed)"
 fi
