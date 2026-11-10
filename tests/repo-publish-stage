@@ -220,3 +220,33 @@ expect_index v2
 expect "without a record, a no-op keeps v1 and drops what the failed v3 copied" base-1-1 app-1-1 app-2-1
 stages v3 "stages v3 after that"
 expect "and the next change keeps only the set it replaces" base-1-1 app-2-1 app-3-1
+
+# never_published(), which verify() runs on every directory before an
+# upload: an index that lists linux-omamobile-ingot (the Saga's bring-up
+# kernel and boot images, a developer's SSH key inside) stops the publish
+{
+  grep -m1 '^DB=' tools/repo-publish
+  grep -m1 '^db_names() ' tools/repo-publish
+  grep -m1 '^NEVER_PUBLISH=' tools/repo-publish
+  sed -n '/^never_published() {$/,/^}$/p' tools/repo-publish
+} > "$t/np.sh"
+grep -q '^never_published() {$' "$t/np.sh" && grep -q '^NEVER_PUBLISH=(.*linux-omamobile-ingot' "$t/np.sh" \
+  || fail "never_published() and NEVER_PUBLISH are in tools/repo-publish"
+sed -n '/^verify() {$/,/^}$/p' tools/repo-publish | grep -qx '  never_published "$dir"' || fail "verify() runs never_published"
+named_index() { # DIR NAME...: an index whose entries carry %NAME%
+  local d=$1 n
+  shift
+  rm -rf "$d" "$t/ndb" && mkdir -p "$d" "$t/ndb"
+  for n; do
+    mkdir -p "$t/ndb/$n-1-1"
+    printf '%%FILENAME%%\n%s-1-1-aarch64.pkg.tar.zst\n\n%%NAME%%\n%s\n' "$n" "$n" > "$t/ndb/$n-1-1/desc"
+  done
+  (cd "$t/ndb" && bsdtar -czf "$d/omamobile.db.tar.gz" -- *)
+}
+np() { bash -c 'die() { echo "$*"; exit 1; }; . "$1"; never_published "$2"' _ "$t/np.sh" "$1" > "$t/log" 2>&1; }
+named_index "$t/ok" omamobile-ingot-boot linux-omamobile omamobile-shell
+np "$t/ok" || { cat "$t/log"; fail "an index without linux-omamobile-ingot passes"; }
+named_index "$t/bad" omamobile-shell linux-omamobile-ingot
+if np "$t/bad"; then fail "an index listing linux-omamobile-ingot is refused"; fi
+grep -qF 'linux-omamobile-ingot, which is never published' "$t/log" || { cat "$t/log"; fail "and says why"; }
+pass "repo-publish refuses an index that lists linux-omamobile-ingot"

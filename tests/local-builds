@@ -97,6 +97,16 @@ if run tools/build-packages --local nosuch packages/omamobile-device-panther; th
 [[ ! -e $R/out/repo ]] || fail "build-packages --local made nothing in out/repo"
 pass "build-packages --local refuses without keys/NAME, and never uses keys/ or out/repo"
 
+# The Saga's bring-up kernel and images (a developer's SSH key) never go
+# into out/repo: without --local, build-packages refuses before anything
+mkdir -p "$R/packages/linux-omamobile-ingot"
+cp packages/linux-omamobile-ingot/PKGBUILD "$R/packages/linux-omamobile-ingot/"
+if run tools/build-packages packages/linux-omamobile-ingot; then fail "build-packages refuses linux-omamobile-ingot without --local"; fi
+grep -qF 'linux-omamobile-ingot is never published: build it with --local' "$t/log" || { cat "$t/log"; fail "and says why"; }
+[[ ! -e $R/out/repo ]] || fail "and makes nothing in out/repo"
+rm -rf "$R/packages/linux-omamobile-ingot"
+pass "build-packages builds linux-omamobile-ingot only with --local"
+
 if (cd "$R" && DEVICE=cheetah tools/build-rootfs --local panther) > "$t/log" 2>&1; then fail "build-rootfs --local refuses another DEVICE"; fi
 grep -q 'builds device panther, not DEVICE=cheetah' "$t/log" || { cat "$t/log"; fail "says the device does not match"; }
 if run tools/build-rootfs --local panther; then fail "build-rootfs --local refuses without keys/panther/public.asc"; fi

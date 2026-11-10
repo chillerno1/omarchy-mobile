@@ -90,7 +90,8 @@ if ((from_main)); then
   # tools/build-packages checks against origin/main before building; a
   # device package refuses to build without them). linux-omamobile's
   # prebuilt/ comes along but is never built here: build-packages builds it
-  # only when named.
+  # only when named. linux-omamobile-ingot's prebuilt/ (a developer's SSH
+  # key in its boot images) is never copied: that package is never published.
   wt=$ROOT/out/publish-tree
   git fetch -q origin main
   [[ -e $wt/.git ]] || git worktree add -q --detach "$wt" origin/main
@@ -100,7 +101,8 @@ if ((from_main)); then
   ln -sfn "$ROOT/out" "$wt/out"
   # git picks them by pathspec: a checkout with none gets an empty list,
   # which copies nothing (a grep over an empty list fails under pipefail).
-  git ls-files -z --others --ignored --exclude-standard -- ':(glob)packages/**/prebuilt/**' ':(glob)packages/**/boot-files/**' |
+  git ls-files -z --others --ignored --exclude-standard -- ':(glob)packages/**/prebuilt/**' ':(glob)packages/**/boot-files/**' \
+      ':(exclude,glob)packages/linux-omamobile-ingot/**' |
     rsync -a --from0 --files-from=- ./ "$wt/"
   say "Publishing from origin/main at $(git -C "$wt" rev-parse --short HEAD)"
   exec "$wt/tools/repo-publish" "${args[@]}"
@@ -115,6 +117,19 @@ db_files() { [[ -f $1/$DB ]] && bsdtar -xOf "$1/$DB" --include='*/desc' | awk '/
 pkg_files() { find "$1" -mindepth 1 -maxdepth 1 -name '*.pkg.tar.*' -printf '%f\n' | sed 's/\.sig$//' | sort -u; }
 # save_sets FILE CURRENT PREVIOUS: record two package sets in FILE at once
 save_sets() { { sed -n 's/^./current &/p' <<<"$2" && sed -n 's/^./previous &/p' <<<"$3"; } > "$1.new" && mv -f -- "$1.new" "$1"; }
+# The package names an index lists, one per line
+db_names() { bsdtar -xOf "$1/$DB" --include='*/desc' | awk '/^%NAME%$/ { getline; print }' | sort -u; }
+# Packages that are never published, whatever an index says: the Saga's
+# bring-up kernel and boot images carry a developer's SSH key and an
+# unpublished kernel (tools/build-packages builds them only with --local)
+NEVER_PUBLISH=(linux-omamobile-ingot)
+never_published() {
+  local name
+  while read -r name; do
+    [[ -n $name && " ${NEVER_PUBLISH[*]} " == *" $name "* ]] || continue
+    die "$1: the index lists $name, which is never published (a local build in out/repo?): remove it and run tools/build-packages again; nothing uploaded"
+  done < <(db_names "$1")
+}
 # "file sha256" for each package an index lists
 db_sums() {
   bsdtar -xOf "$1/$DB" --include='*/desc' |
@@ -169,6 +184,7 @@ verify() {
   local dir=$1 file sum n=0
   [[ -f $dir/$DB && -f $dir/$DB.sig ]] || die "$dir has no signed index"
   signed_ok "$dir/$DB" || die "$dir/$DB: no good signature from the release key $release_key ($resign_hint)"
+  never_published "$dir"
   while read -r file sum; do
     [[ -f $dir/$file ]] || die "$dir: the index lists $file, which is missing"
     [[ $(sha256sum < "$dir/$file" | cut -d' ' -f1) == "$sum" ]] || die "$dir/$file doesn't match the index"

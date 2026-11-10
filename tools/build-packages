@@ -49,6 +49,12 @@
 # effect), and only after `packages/linux-omamobile/stage --verify` confirms
 # the staged build is a kernel-<date> tag on the published omamobile branch.
 #
+# linux-omamobile-ingot (the Solana Mobile Saga's bring-up kernel and boot
+# images, which carry the developer's SSH key) is never published: built
+# only when named, only with --local into that contributor's repository,
+# after its own `stage --verify`; never into out/repo, and never imported
+# there. tools/repo-publish refuses an index that lists it.
+#
 # A device package that ships boot files (its install reads
 # OMAMOBILE_BOOT_FILES) refuses to build without its boot-files/; before it
 # is built here, tools/stage-boot-files --check must find them matching this
@@ -63,7 +69,9 @@ source tools/lib/alarm.sh
 
 SLOW=(mesa hyprland libcamera)
 # Packed from a staged kernel build: built only when named (see above)
-NAMED_ONLY=(linux-omamobile)
+NAMED_ONLY=(linux-omamobile linux-omamobile-ingot)
+# Never in out/repo, so never published: built only with --local (above)
+LOCAL_ONLY=(linux-omamobile-ingot)
 repo=out/repo/aarch64
 # Exit 3 means exactly "built and signed everything but the skipped device
 # packages", which <repo>/../.skipped then lists: any other exit with 3 (a
@@ -108,10 +116,15 @@ if ((${#dirs[@]} == 0)) && ((${#imports[@]} == 0)) && ((resign == 0)); then
   done
   for d in packages/*/; do
     name=$(basename "$d")
-    [[ " ${ORDER[*]} " == *" $name "* ]] || dirs+=("packages/$name")
+    [[ " ${ORDER[*]} " == *" $name "* || " ${NAMED_ONLY[*]} " == *" $name "* ]] || dirs+=("packages/$name")
   done
 fi
-for d in "${dirs[@]}"; do [[ -f $d/PKGBUILD ]] || alarm_die "no PKGBUILD in $d"; done
+for d in "${dirs[@]}"; do
+  [[ -f $d/PKGBUILD ]] || alarm_die "no PKGBUILD in $d"
+  if [[ " ${LOCAL_ONLY[*]} " == *" $(basename "$d") "* && -z $local_name ]]; then
+    alarm_die "$(basename "$d") is never published: build it with --local <codename>, into that repository, never out/repo"
+  fi
+done
 
 if [[ -n $local_name ]]; then
   # A contributor's own key, never the maintainer's (review lesson L-7)
@@ -190,6 +203,9 @@ add_to_repo() {
     base=${file##*/}
     name=$(pkginfo "$file" | sed -n 's/^pkgname = //p')
     [[ -n $name ]] || alarm_die "$base: no .PKGINFO"
+    if [[ " ${LOCAL_ONLY[*]} " == *" $name "* && -z $local_name ]]; then
+      alarm_die "$base is $name, which is never published: not adding it to $repo"
+    fi
     for old in "$repo/$name"-*.pkg.tar.*; do
       [[ -e $old && $old != *.sig ]] || continue
       [[ $(pkginfo "$old" | sed -n 's/^pkgname = //p') == "$name" ]] || continue
@@ -286,7 +302,7 @@ skipped=() kept=()
 for d in "${build[@]}"; do
   name=$(basename "$d")
   if [[ " ${NAMED_ONLY[*]} " == *" $name "* ]]; then
-    "$d/stage" --verify "$d/prebuilt" || alarm_die "$name: the staged kernel is not a published release; nothing built"
+    "$d/stage" --verify "$d/prebuilt" || alarm_die "$name: the staged prebuilt/ fails $d/stage --verify; nothing built"
   fi
   if grep -c 'OMAMOBILE_BOOT_FILES' "$d/install" >/dev/null 2>&1 && ! tools/stage-boot-files --check "$d/boot-files"; then
     echo "SKIPPED: $name $(pkg_version "$d"): its boot files are missing or stale (DEVICE=<codename> KERNEL_OUT=<build> tools/stage-boot-files); building the rest" >&2
