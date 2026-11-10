@@ -21,6 +21,23 @@
 //       the .mdt's ELF class, prints the app id, holds the app for SECONDS
 //       (0: not at all), then QSEECOM_IOCTL_UNLOAD_APP_REQ. SIGINT or
 //       SIGTERM ends the hold early and still unloads.
+//   qseecom-probe [--dev PATH] listen ID[:SIZE][,ID[:SIZE]...]
+//           [--heap PATH] [--reply fail|zero] [--seconds N]
+//       Fake listener services. For each listener id (hex 0x.. or decimal):
+//       fork a process that opens /dev/qseecom, allocates one dma-buf of SIZE
+//       bytes from the heap (default /dev/dma_heap/default_cma_region;
+//       rounded up to a page), mmaps it, registers the listener with
+//       QSEECOM_IOCTL_REGISTER_LISTENER_REQ, then loops on
+//       QSEECOM_IOCTL_RECEIVE_REQ. Each request is logged (timestamp, id,
+//       hex dump of the first 64 bytes), a reply is written into the shared
+//       buffer, and QSEECOM_IOCTL_SEND_RESP_REQ answers it. It opens no
+//       storage/bsg/RPMB device and writes no file: a pure fake, to test
+//       whether TrustZone will start a TA with the listener services present
+//       but answering failure. --reply fail (default) writes the reply the
+//       real listener sends on a failed operation for ids whose layout is
+//       known (only RPMB 0x2000 here), and zeroes the buffer for the rest;
+//       --reply zero always zeroes. SIGINT/SIGTERM, or --seconds N elapsing,
+//       unregisters (QSEECOM_IOCTL_UNREGISTER_LISTENER_REQ) and exits.
 //
 // That layout is the one the vendor's QSEECom library builds (one buffer,
 // whole files concatenated in that order, its length rounded up to 4 KiB,
@@ -43,6 +60,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <linux/dma-buf.h>
@@ -73,6 +91,21 @@ struct qp_app_load_query {		// struct qseecom_qseos_app_load_query
 	__u32 app_arch;			// out
 };
 
+struct qp_register_listener_req {	// struct qseecom_register_listener_req
+	__u32 listener_id;		// in
+	__s32 ifd_data_fd;		// in
+	void *virt_sb_base;		// in
+	__u32 sb_size;			// in
+};
+
+#define QP_IOCTL_REGISTER_LISTENER_REQ \
+	_IOWR(QP_IOC_MAGIC, 1, struct qp_register_listener_req)
+#define QP_IOCTL_UNREGISTER_LISTENER_REQ \
+	_IO(QP_IOC_MAGIC, 2)
+#define QP_IOCTL_RECEIVE_REQ \
+	_IO(QP_IOC_MAGIC, 5)
+#define QP_IOCTL_SEND_RESP_REQ \
+	_IO(QP_IOC_MAGIC, 6)
 #define QP_IOCTL_LOAD_APP_REQ \
 	_IOWR(QP_IOC_MAGIC, 7, struct qp_load_img_req)
 #define QP_IOCTL_UNLOAD_APP_REQ \
@@ -89,6 +122,17 @@ _Static_assert(offsetof(struct qp_load_img_req, app_arch) == 76, "app_arch");
 _Static_assert(offsetof(struct qp_load_img_req, app_id) == 80, "app_id");
 _Static_assert(sizeof(struct qp_qseos_version_req) == 4, "version_req size");
 _Static_assert(sizeof(struct qp_app_load_query) == 72, "app_load_query size");
+_Static_assert(sizeof(struct qp_register_listener_req) == 24, "register_listener_req size");
+_Static_assert(offsetof(struct qp_register_listener_req, listener_id) == 0, "listener_id");
+_Static_assert(offsetof(struct qp_register_listener_req, ifd_data_fd) == 4, "ifd_data_fd");
+_Static_assert(offsetof(struct qp_register_listener_req, virt_sb_base) == 8, "virt_sb_base");
+_Static_assert(offsetof(struct qp_register_listener_req, sb_size) == 16, "sb_size");
+// These match the ioctl constants the vendor QSEEComAPI.so uses (checked in
+// its disassembly): REGISTER 0xc0189701, RECEIVE 0x9705, SEND_RESP 0x9706.
+_Static_assert(QP_IOCTL_REGISTER_LISTENER_REQ == 0xc0189701u, "REGISTER_LISTENER_REQ");
+_Static_assert(QP_IOCTL_UNREGISTER_LISTENER_REQ == 0x9702u, "UNREGISTER_LISTENER_REQ");
+_Static_assert(QP_IOCTL_RECEIVE_REQ == 0x9705u, "RECEIVE_REQ");
+_Static_assert(QP_IOCTL_SEND_RESP_REQ == 0x9706u, "SEND_RESP_REQ");
 _Static_assert(QP_IOCTL_LOAD_APP_REQ == 0xc0549707u, "LOAD_APP_REQ");
 _Static_assert(QP_IOCTL_UNLOAD_APP_REQ == 0x9709u, "UNLOAD_APP_REQ");
 _Static_assert(QP_IOCTL_GET_QSEOS_VERSION_REQ == 0xc004970au, "GET_QSEOS_VERSION_REQ");
@@ -110,6 +154,15 @@ QP_SAME(sizeof(struct qp_qseos_version_req), sizeof(struct qseecom_qseos_version
 QP_SAME(sizeof(struct qp_app_load_query), sizeof(struct qseecom_qseos_app_load_query));
 QP_SAME(offsetof(struct qp_app_load_query, app_id), offsetof(struct qseecom_qseos_app_load_query, app_id));
 QP_SAME(offsetof(struct qp_app_load_query, app_arch), offsetof(struct qseecom_qseos_app_load_query, app_arch));
+QP_SAME(sizeof(struct qp_register_listener_req), sizeof(struct qseecom_register_listener_req));
+QP_SAME(offsetof(struct qp_register_listener_req, listener_id), offsetof(struct qseecom_register_listener_req, listener_id));
+QP_SAME(offsetof(struct qp_register_listener_req, ifd_data_fd), offsetof(struct qseecom_register_listener_req, ifd_data_fd));
+QP_SAME(offsetof(struct qp_register_listener_req, virt_sb_base), offsetof(struct qseecom_register_listener_req, virt_sb_base));
+QP_SAME(offsetof(struct qp_register_listener_req, sb_size), offsetof(struct qseecom_register_listener_req, sb_size));
+QP_SAME(QP_IOCTL_REGISTER_LISTENER_REQ, QSEECOM_IOCTL_REGISTER_LISTENER_REQ);
+QP_SAME(QP_IOCTL_UNREGISTER_LISTENER_REQ, QSEECOM_IOCTL_UNREGISTER_LISTENER_REQ);
+QP_SAME(QP_IOCTL_RECEIVE_REQ, QSEECOM_IOCTL_RECEIVE_REQ);
+QP_SAME(QP_IOCTL_SEND_RESP_REQ, QSEECOM_IOCTL_SEND_RESP_REQ);
 QP_SAME(QP_IOCTL_LOAD_APP_REQ, QSEECOM_IOCTL_LOAD_APP_REQ);
 QP_SAME(QP_IOCTL_UNLOAD_APP_REQ, QSEECOM_IOCTL_UNLOAD_APP_REQ);
 QP_SAME(QP_IOCTL_GET_QSEOS_VERSION_REQ, QSEECOM_IOCTL_GET_QSEOS_VERSION_REQ);
@@ -131,7 +184,9 @@ static void usage(FILE *f)
 	fprintf(f,
 		"usage: qseecom-probe [--dev PATH] version\n"
 		"       qseecom-probe [--dev PATH] query NAME...\n"
-		"       qseecom-probe [--dev PATH] load DIR NAME [--heap PATH] [--hold SECONDS]\n");
+		"       qseecom-probe [--dev PATH] load DIR NAME [--heap PATH] [--hold SECONDS]\n"
+		"       qseecom-probe [--dev PATH] listen ID[:SIZE][,ID[:SIZE]...] [--heap PATH]\n"
+		"                     [--reply fail|zero] [--seconds N]\n");
 }
 
 static const char *errname(int e)
@@ -449,6 +504,344 @@ out:
 	return rc;
 }
 
+// ---- listener services (the `listen` subcommand) --------------------------
+//
+// Default shared-buffer size per known listener id, and the reply layout.
+//
+// What the real qseecomd listeners do, from the vendor libraries' aarch64
+// disassembly (llvm-objdump; reference binaries under vendor/, never built or
+// shipped). A listener's `*_start` entry allocates one dma-buf of a fixed
+// size from a dma-buf heap and calls QSEECom_register_listener(handle, id,
+// sb, size, 0); registration order is: open /dev/qseecom, GET_QSEOS_VERSION,
+// allocate+mmap the dma-buf, then REGISTER_LISTENER. No SET_MEM_PARAM_REQ and
+// no other ioctl precedes it. A pthread then loops on QSEECom_receive_req()
+// and QSEECom_send_resp(), reading the request and writing the reply in the
+// *same* shared buffer. The sizes registered (high confidence, read straight
+// from the `mov w2, #imm` before each register call):
+//   0x2000 librpmb  rpmb_start   0x6400 (25600)
+//   0x3000 libssd   ssd_start    0x5000 (20480)
+//   0xb    libdrmtime atime_start 0x5000 (20480)
+//   0xa    libdrmfs fs_start     0x5000 (20480)
+// gpfs_start (0x7000) registers through a helper whose size I did not pin
+// down; the other ids here (0x9000 qisl, 0x1100 GPreqcancel, 0xc000 ops,
+// 0xb000 spl) were not disassembled. They fall back to a generic 0x5000,
+// which is the size every listener I did read uses except RPMB.
+//
+// Reply layout. RPMB (0x2000) is the one the anti-rollback (app version)
+// check needs, so it is the one established in full. Its listener thread
+// (librpmb.so rpmb_start, .text+0x1334) reads the request in place:
+//   req+0x0  u32 command id (0x101 init, 0x102 read, 0x103 write, 0x104 cfg)
+// and writes the response in the same buffer. On a *failed* read/write it
+// does (librpmb .text+0x75cc): keep command id at +0, store the operation's
+// negative result at +4 (0xffffffff / -1 for a failed device op), store 0x14
+// (the 20-byte response length) at +0xc, and QSEECom_send_resp with len 20:
+//   resp+0x0  u32 command id   (echoed, unchanged)
+//   resp+0x4  u32 status       (0 = success; 0xffffffff = failed op;
+//                               0xfffffff9 = unknown command)
+//   resp+0x8  u32 (0)
+//   resp+0xc  u32 0x14         (response length)
+// So `--reply fail` for RPMB answers "operation failed": command id echoed,
+// status 0xffffffff, length word 0x14. Confidence: high for RPMB.
+//
+// SSD (0x3000) and time (0xb) were traced far enough to see the command id at
+// req+0 and a status word written near the start of the reply, but not far
+// enough to be sure of the failing status value, so they are NOT crafted:
+// under `--reply fail` their buffer is zeroed (the output says so), which
+// still delivers a well-formed, if content-free, response. `--reply zero`
+// always zeroes.
+//
+// Note on the shared buffer: the vendor QSEECom_receive_req, when the QSEOS
+// version is 0x14, copies the shared buffer into a caller buffer and then
+// *zeroes* the shared buffer; the vendor listeners that pass the shared
+// buffer as their own caller buffer rely on the device reporting a version
+// other than 0x14 so that path is skipped. We do not use that library: our
+// RECEIVE_REQ leaves the shared buffer untouched (see the kernel note in the
+// report), so this probe reads the request and writes the reply directly in
+// the mmap, bracketed by DMA_BUF_IOCTL_SYNC as the load path does.
+
+#define QP_LISTEN_DEFAULT_SIZE 0x5000u	// generic default (what ssd/fs/time use)
+#define QP_RPMB_LISTENER_ID    0x2000u
+
+struct qp_known_listener {
+	__u32 id;
+	__u32 size;
+};
+
+static const struct qp_known_listener qp_known_listeners[] = {
+	{ 0x2000, 0x6400 },	// RPMB  (librpmb  rpmb_start)
+	{ 0x3000, 0x5000 },	// SSD   (libssd   ssd_start)
+	{ 0x000b, 0x5000 },	// time  (libdrmtime atime_start)
+	{ 0x000a, 0x5000 },	// fs    (libdrmfs fs_start)
+	{ 0x7000, 0x5000 },	// gpfs  (libdrmfs gpfs_start; size assumed)
+};
+
+static __u32 qp_default_size(__u32 id)
+{
+	for (size_t i = 0; i < sizeof(qp_known_listeners) / sizeof(qp_known_listeners[0]); i++)
+		if (qp_known_listeners[i].id == id)
+			return qp_known_listeners[i].size;
+	return QP_LISTEN_DEFAULT_SIZE;
+}
+
+enum qp_reply_mode { QP_REPLY_FAIL, QP_REPLY_ZERO };
+
+static void qp_timestamp(char *buf, size_t n)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	struct tm tm;
+	localtime_r(&ts.tv_sec, &tm);
+	char hms[16];
+	strftime(hms, sizeof(hms), "%H:%M:%S", &tm);
+	snprintf(buf, n, "%s.%03ld", hms, ts.tv_nsec / 1000000);
+}
+
+static void qp_hexdump64(const unsigned char *p, __u32 sb_size)
+{
+	__u32 n = sb_size < 64 ? sb_size : 64;
+	for (__u32 i = 0; i < n; i += 16) {
+		printf("    %04x  ", i);
+		for (__u32 j = 0; j < 16 && i + j < n; j++)
+			printf("%02x%s", p[i + j], j == 7 ? "  " : " ");
+		printf("\n");
+	}
+}
+
+// Fill the reply in the shared buffer; return the response length to report.
+// *crafted is set when a real layout was reproduced (vs. a bare zeroed buffer).
+static __u32 qp_build_reply(__u32 id, enum qp_reply_mode mode, unsigned char *sb,
+			    __u32 sb_size, int *crafted)
+{
+	*crafted = 0;
+	if (mode == QP_REPLY_FAIL && id == QP_RPMB_LISTENER_ID && sb_size >= 16) {
+		// Echo the command id the TA sent, report a failed operation.
+		__u32 cmd_id;
+		memcpy(&cmd_id, sb, 4);
+		memset(sb, 0, sb_size);
+		memcpy(sb + 0x0, &cmd_id, 4);		// command id, echoed
+		__u32 status = 0xffffffffu;		// failed device op
+		__u32 length = 0x14;			// 20-byte response
+		memcpy(sb + 0x4, &status, 4);
+		memcpy(sb + 0xc, &length, 4);
+		*crafted = 1;
+		return 0x14;
+	}
+	// Unknown layout, or --reply zero: a well-formed but content-free reply.
+	memset(sb, 0, sb_size);
+	return sb_size;
+}
+
+// Run one listener in the current process; returns 0 on a clean exit.
+static int qp_run_listener(__u32 id, __u32 size, const char *heap,
+			   enum qp_reply_mode mode, long seconds)
+{
+	struct sigaction sa = { .sa_handler = on_signal };	// no SA_RESTART
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGALRM, &sa, NULL);
+
+	__u32 buflen = (size + 4095u) & ~4095u;			// page-rounded alloc
+
+	int rc = 1, bfd = -1, hfd = -1;
+	unsigned char *map = MAP_FAILED;
+
+	int qfd = open_dev();
+	if (qfd < 0)
+		return 1;
+
+	// Mirror the vendor order: GET_QSEOS_VERSION before registering.
+	struct qp_qseos_version_req ver = {0};
+	int ret = ioctl(qfd, QP_IOCTL_GET_QSEOS_VERSION_REQ, &ver);
+	int e = errno;
+	report("ioctl GET_QSEOS_VERSION_REQ", ret, e);
+	if (ret == 0)
+		printf("listener 0x%x: qseos_version 0x%x\n", id, ver.qseos_version);
+
+	hfd = open(heap, O_RDONLY | O_CLOEXEC);
+	if (hfd < 0) {
+		report_path("open", heap, errno);
+		goto out;
+	}
+	struct dma_heap_allocation_data alloc = {
+		.len = buflen,
+		.fd_flags = O_RDWR | O_CLOEXEC,
+	};
+	ret = ioctl(hfd, DMA_HEAP_IOCTL_ALLOC, &alloc);
+	e = errno;
+	close(hfd);
+	hfd = -1;
+	report("ioctl DMA_HEAP_IOCTL_ALLOC", ret, e);
+	if (ret < 0)
+		goto out;
+	bfd = alloc.fd;
+	map = mmap(NULL, buflen, PROT_READ | PROT_WRITE, MAP_SHARED, bfd, 0);
+	if (map == MAP_FAILED) {
+		report("mmap dma-buf", -1, errno);
+		goto out;
+	}
+	memset(map, 0, buflen);
+
+	struct qp_register_listener_req req = {
+		.listener_id = id,
+		.ifd_data_fd = bfd,
+		.virt_sb_base = map,
+		.sb_size = size,		// requested size, not the rounded alloc
+	};
+	ret = ioctl(qfd, QP_IOCTL_REGISTER_LISTENER_REQ, &req);
+	e = errno;
+	report("ioctl REGISTER_LISTENER_REQ", ret, e);
+	if (ret < 0)
+		goto out;
+	printf("listener 0x%x: registered, shared buffer %u bytes (alloc %u), reply %s\n",
+	       id, size, buflen, mode == QP_REPLY_ZERO ? "zero" : "fail");
+
+	if (seconds > 0)
+		alarm((unsigned)seconds);
+
+	// The receive loop: block until TrustZone has a request for this id.
+	unsigned long count = 0;
+	while (!stop_signal) {
+		ret = ioctl(qfd, QP_IOCTL_RECEIVE_REQ);
+		e = errno;
+		if (ret < 0) {
+			if (e == EINTR)
+				break;		// signal or alarm: time to stop
+			report("ioctl RECEIVE_REQ", ret, e);
+			break;
+		}
+		if (stop_signal)
+			break;
+		dmabuf_sync(bfd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW,
+			    "ioctl DMA_BUF_IOCTL_SYNC start");
+		char ts[32];
+		qp_timestamp(ts, sizeof(ts));
+		__u32 cmd_id;
+		memcpy(&cmd_id, map, 4);
+		printf("%s listener 0x%x req #%lu: command id 0x%x\n",
+		       ts, id, ++count, cmd_id);
+		qp_hexdump64(map, size);
+		int crafted;
+		__u32 resp_len = qp_build_reply(id, mode, map, size, &crafted);
+		printf("%s listener 0x%x reply: %s, %u bytes\n", ts, id,
+		       crafted ? "crafted failure (layout known)" :
+		       (mode == QP_REPLY_ZERO ? "zeroed (--reply zero)" :
+			"zeroed (layout not established)"),
+		       resp_len);
+		dmabuf_sync(bfd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW,
+			    "ioctl DMA_BUF_IOCTL_SYNC end");
+		ret = ioctl(qfd, QP_IOCTL_SEND_RESP_REQ);
+		e = errno;
+		report("ioctl SEND_RESP_REQ", ret, e);
+		if (ret < 0)
+			break;
+	}
+	if (stop_signal)
+		printf("listener 0x%x: signal %d, unregistering\n", id, (int)stop_signal);
+	rc = 0;
+
+	ret = ioctl(qfd, QP_IOCTL_UNREGISTER_LISTENER_REQ);
+	e = errno;
+	report("ioctl UNREGISTER_LISTENER_REQ", ret, e);
+	if (ret < 0)
+		rc = 1;
+	else
+		printf("listener 0x%x: unregistered\n", id);
+out:
+	if (map != MAP_FAILED)
+		munmap(map, buflen);
+	if (bfd >= 0)
+		close(bfd);
+	if (hfd >= 0)
+		close(hfd);
+	close(qfd);
+	return rc;
+}
+
+#define QP_MAX_LISTENERS 32
+
+static int cmd_listen(const char *spec, const char *heap, enum qp_reply_mode mode,
+		      long seconds)
+{
+	// Parse ID[:SIZE][,ID[:SIZE]...].
+	__u32 ids[QP_MAX_LISTENERS], sizes[QP_MAX_LISTENERS];
+	int n = 0;
+	char *dup = strdup(spec);
+	if (!dup) {
+		fprintf(stderr, "out of memory\n");
+		return 2;
+	}
+	for (char *tok = strtok(dup, ","); tok; tok = strtok(NULL, ",")) {
+		if (n >= QP_MAX_LISTENERS) {
+			fprintf(stderr, "too many listeners (max %d)\n", QP_MAX_LISTENERS);
+			free(dup);
+			return 2;
+		}
+		char *colon = strchr(tok, ':');
+		if (colon)
+			*colon = '\0';
+		char *end;
+		unsigned long id = strtoul(tok, &end, 0);
+		if (*end || tok[0] == '\0' || id == 0 || id > 0xffffffffUL) {
+			fprintf(stderr, "listen: bad listener id: %s\n", tok);
+			free(dup);
+			return 2;
+		}
+		__u32 size;
+		if (colon) {
+			unsigned long s = strtoul(colon + 1, &end, 0);
+			if (*end || colon[1] == '\0' || s == 0 || s > 0x10000000UL) {
+				fprintf(stderr, "listen: bad size: %s\n", colon + 1);
+				free(dup);
+				return 2;
+			}
+			size = (__u32)s;
+		} else {
+			size = qp_default_size((__u32)id);
+		}
+		ids[n] = (__u32)id;
+		sizes[n] = size;
+		n++;
+	}
+	free(dup);
+	if (n == 0) {
+		fprintf(stderr, "listen: no listener ids given\n");
+		return 2;
+	}
+
+	if (n == 1)
+		return qp_run_listener(ids[0], sizes[0], heap, mode, seconds);
+
+	// One child process per listener; each has its own /dev/qseecom handle
+	// (the listener id is bound to the fd). Ctrl-C reaches the whole process
+	// group; --seconds is enforced by each child's own alarm.
+	pid_t pids[QP_MAX_LISTENERS];
+	int started = 0;
+	for (int i = 0; i < n; i++) {
+		pid_t pid = fork();
+		if (pid < 0) {
+			report("fork", -1, errno);
+			break;
+		}
+		if (pid == 0) {
+			_exit(qp_run_listener(ids[i], sizes[i], heap, mode, seconds));
+		}
+		pids[i] = pid;
+		started++;
+	}
+	int rc = 0;
+	for (int i = 0; i < started; i++) {
+		int status;
+		if (waitpid(pids[i], &status, 0) < 0) {
+			report("waitpid", -1, errno);
+			rc = 1;
+		} else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+			rc = 1;
+		}
+	}
+	return rc;
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
@@ -493,6 +886,41 @@ int main(int argc, char **argv)
 		}
 		if (i == argc)
 			return cmd_load(dir, name, heap, hold);
+	}
+	if (strcmp(cmd, "listen") == 0 && i < argc) {
+		const char *spec = argv[i];
+		const char *heap = "/dev/dma_heap/default_cma_region";
+		enum qp_reply_mode mode = QP_REPLY_FAIL;
+		long seconds = 0;
+		for (i += 1; i < argc; i += 2) {
+			if (i + 1 >= argc)
+				break;
+			if (strcmp(argv[i], "--heap") == 0) {
+				heap = argv[i + 1];
+			} else if (strcmp(argv[i], "--reply") == 0) {
+				if (strcmp(argv[i + 1], "fail") == 0)
+					mode = QP_REPLY_FAIL;
+				else if (strcmp(argv[i + 1], "zero") == 0)
+					mode = QP_REPLY_ZERO;
+				else {
+					fprintf(stderr, "--reply: fail or zero, not: %s\n",
+						argv[i + 1]);
+					return 2;
+				}
+			} else if (strcmp(argv[i], "--seconds") == 0) {
+				char *end;
+				seconds = strtol(argv[i + 1], &end, 10);
+				if (*end || seconds < 0) {
+					fprintf(stderr, "--seconds: not a count: %s\n",
+						argv[i + 1]);
+					return 2;
+				}
+			} else {
+				break;
+			}
+		}
+		if (i == argc)
+			return cmd_listen(spec, heap, mode, seconds);
 	}
 	usage(stderr);
 	return 2;
