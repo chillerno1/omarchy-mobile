@@ -41,6 +41,16 @@
 //       known (only RPMB 0x2000 here), and zeroes the buffer for the rest;
 //       --reply zero always zeroes. SIGINT/SIGTERM, or --seconds N elapsing,
 //       unregisters (QSEECOM_IOCTL_UNREGISTER_LISTENER_REQ) and exits.
+//   qseecom-probe [--dev PATH] sendcmd DIR NAME [--heap PATH] [--data N]
+//       A known-answer test of the client shared-buffer path against
+//       Qualcomm's sample trusted app (smplap64). Load DIR/NAME as `load`
+//       does, then on the same handle allocate the client shared buffer the
+//       sample needs, QSEECOM_IOCTL_SET_MEM_PARAM_REQ it, and
+//       QSEECOM_IOCTL_SEND_CMD_REQ with the sample's command 1 ("basic
+//       data", data = N, default 100). The app answers data * 10 with status
+//       0; any other answer fails the test. Then UNLOAD_APP_REQ, also after a
+//       failure. The request/response layout and the buffer handling mirror
+//       libQSEEComAPI.so's QSEECom_send_cmd (see the note above cmd_sendcmd).
 //
 // That layout is the one the vendor's QSEECom library builds (one buffer,
 // whole files concatenated in that order, its length rounded up to 4 KiB,
@@ -101,8 +111,25 @@ struct qp_register_listener_req {	// struct qseecom_register_listener_req
 	__u32 sb_size;			// in
 };
 
+struct qp_send_cmd_req {		// struct qseecom_send_cmd_req
+	void *cmd_req_buf;		// in
+	unsigned int cmd_req_len;	// in
+	void *resp_buf;			// in/out
+	unsigned int resp_len;		// in/out
+};
+
+struct qp_set_sb_mem_param_req {	// struct qseecom_set_sb_mem_param_req
+	__s32 ifd_data_fd;		// in
+	void *virt_sb_base;		// in
+	__u32 sb_len;			// in
+};
+
 #define QP_IOCTL_REGISTER_LISTENER_REQ \
 	_IOWR(QP_IOC_MAGIC, 1, struct qp_register_listener_req)
+#define QP_IOCTL_SEND_CMD_REQ \
+	_IOWR(QP_IOC_MAGIC, 3, struct qp_send_cmd_req)
+#define QP_IOCTL_SET_MEM_PARAM_REQ \
+	_IOWR(QP_IOC_MAGIC, 8, struct qp_set_sb_mem_param_req)
 #define QP_IOCTL_UNREGISTER_LISTENER_REQ \
 	_IO(QP_IOC_MAGIC, 2)
 #define QP_IOCTL_RECEIVE_REQ \
@@ -132,6 +159,17 @@ _Static_assert(offsetof(struct qp_register_listener_req, virt_sb_base) == 8, "vi
 _Static_assert(offsetof(struct qp_register_listener_req, sb_size) == 16, "sb_size");
 // These match the ioctl constants the vendor QSEEComAPI.so uses (checked in
 // its disassembly): REGISTER 0xc0189701, RECEIVE 0x9705, SEND_RESP 0x9706.
+_Static_assert(sizeof(struct qp_send_cmd_req) == 32, "send_cmd_req size");
+_Static_assert(offsetof(struct qp_send_cmd_req, cmd_req_len) == 8, "cmd_req_len");
+_Static_assert(offsetof(struct qp_send_cmd_req, resp_buf) == 16, "resp_buf");
+_Static_assert(offsetof(struct qp_send_cmd_req, resp_len) == 24, "resp_len");
+_Static_assert(sizeof(struct qp_set_sb_mem_param_req) == 24, "set_sb_mem_param_req size");
+_Static_assert(offsetof(struct qp_set_sb_mem_param_req, virt_sb_base) == 8, "virt_sb_base");
+_Static_assert(offsetof(struct qp_set_sb_mem_param_req, sb_len) == 16, "sb_len");
+// QSEECom_send_cmd builds 0xc0209703 and __QSEECom_get_handle 0xc0189708
+// (the vendor library's disassembly).
+_Static_assert(QP_IOCTL_SEND_CMD_REQ == 0xc0209703u, "SEND_CMD_REQ");
+_Static_assert(QP_IOCTL_SET_MEM_PARAM_REQ == 0xc0189708u, "SET_MEM_PARAM_REQ");
 _Static_assert(QP_IOCTL_REGISTER_LISTENER_REQ == 0xc0189701u, "REGISTER_LISTENER_REQ");
 _Static_assert(QP_IOCTL_UNREGISTER_LISTENER_REQ == 0x9702u, "UNREGISTER_LISTENER_REQ");
 _Static_assert(QP_IOCTL_RECEIVE_REQ == 0x9705u, "RECEIVE_REQ");
@@ -162,6 +200,17 @@ QP_SAME(offsetof(struct qp_register_listener_req, listener_id), offsetof(struct 
 QP_SAME(offsetof(struct qp_register_listener_req, ifd_data_fd), offsetof(struct qseecom_register_listener_req, ifd_data_fd));
 QP_SAME(offsetof(struct qp_register_listener_req, virt_sb_base), offsetof(struct qseecom_register_listener_req, virt_sb_base));
 QP_SAME(offsetof(struct qp_register_listener_req, sb_size), offsetof(struct qseecom_register_listener_req, sb_size));
+QP_SAME(sizeof(struct qp_send_cmd_req), sizeof(struct qseecom_send_cmd_req));
+QP_SAME(offsetof(struct qp_send_cmd_req, cmd_req_buf), offsetof(struct qseecom_send_cmd_req, cmd_req_buf));
+QP_SAME(offsetof(struct qp_send_cmd_req, cmd_req_len), offsetof(struct qseecom_send_cmd_req, cmd_req_len));
+QP_SAME(offsetof(struct qp_send_cmd_req, resp_buf), offsetof(struct qseecom_send_cmd_req, resp_buf));
+QP_SAME(offsetof(struct qp_send_cmd_req, resp_len), offsetof(struct qseecom_send_cmd_req, resp_len));
+QP_SAME(sizeof(struct qp_set_sb_mem_param_req), sizeof(struct qseecom_set_sb_mem_param_req));
+QP_SAME(offsetof(struct qp_set_sb_mem_param_req, ifd_data_fd), offsetof(struct qseecom_set_sb_mem_param_req, ifd_data_fd));
+QP_SAME(offsetof(struct qp_set_sb_mem_param_req, virt_sb_base), offsetof(struct qseecom_set_sb_mem_param_req, virt_sb_base));
+QP_SAME(offsetof(struct qp_set_sb_mem_param_req, sb_len), offsetof(struct qseecom_set_sb_mem_param_req, sb_len));
+QP_SAME(QP_IOCTL_SEND_CMD_REQ, QSEECOM_IOCTL_SEND_CMD_REQ);
+QP_SAME(QP_IOCTL_SET_MEM_PARAM_REQ, QSEECOM_IOCTL_SET_MEM_PARAM_REQ);
 QP_SAME(QP_IOCTL_REGISTER_LISTENER_REQ, QSEECOM_IOCTL_REGISTER_LISTENER_REQ);
 QP_SAME(QP_IOCTL_UNREGISTER_LISTENER_REQ, QSEECOM_IOCTL_UNREGISTER_LISTENER_REQ);
 QP_SAME(QP_IOCTL_RECEIVE_REQ, QSEECOM_IOCTL_RECEIVE_REQ);
@@ -188,6 +237,7 @@ static void usage(FILE *f)
 		"usage: qseecom-probe [--dev PATH] version\n"
 		"       qseecom-probe [--dev PATH] query NAME...\n"
 		"       qseecom-probe [--dev PATH] load DIR NAME [--heap PATH] [--hold SECONDS] [--buffer BYTES]\n"
+		"       qseecom-probe [--dev PATH] sendcmd DIR NAME [--heap PATH] [--data N]\n"
 		"       qseecom-probe [--dev PATH] listen ID[:SIZE][,ID[:SIZE]...] [--heap PATH]\n"
 		"                     [--reply fail|zero] [--seconds N]\n");
 }
@@ -368,8 +418,10 @@ static int dmabuf_sync(int fd, __u64 flags, const char *what)
 	return ret;
 }
 
-static int cmd_load(const char *dir, const char *name, const char *heap, long hold,
-		    uint64_t minbuf)
+// Load DIR/NAME on the open handle qfd (steps 1-4 of `load`). Returns 0
+// once the app is loaded, *arch set to its ELF class; the caller unloads.
+static int load_app(int qfd, const char *dir, const char *name, const char *heap,
+		    uint64_t minbuf, unsigned *arch)
 {
 	if (strlen(name) >= QP_MAX_APP_NAME_SIZE) {
 		fprintf(stderr, "%s: name longer than %d bytes\n", name,
@@ -415,16 +467,7 @@ static int cmd_load(const char *dir, const char *name, const char *heap, long ho
 	       (long long)seg[0].size, (unsigned long long)total,
 	       (unsigned long long)buflen);
 
-	struct sigaction sa = { .sa_handler = on_signal };	// no SA_RESTART
-	sigemptyset(&sa.sa_mask);
-	sigaction(SIGINT, &sa, NULL);
-	sigaction(SIGTERM, &sa, NULL);
-
-	// 2. The device first, as the vendor library does.
-	int qfd = open_dev();
-	if (qfd < 0)
-		return 1;
-
+	// 2. (The caller opened the device first, as the vendor library does.)
 	// 3. One dma-buf for the whole image.
 	int rc = 1, bfd = -1;
 	unsigned char *map = MAP_FAILED;
@@ -482,8 +525,47 @@ static int cmd_load(const char *dir, const char *name, const char *heap, long ho
 	if (ret < 0)
 		goto out;
 	printf("%s: loaded, app id %u\n", name, req.app_id);
+	*arch = cls;
 	rc = 0;
+out:
+	if (map != MAP_FAILED)
+		munmap(map, buflen);
+	if (bfd >= 0)
+		close(bfd);
+	return rc;
+}
 
+static void catch_stop_signals(void)
+{
+	struct sigaction sa = { .sa_handler = on_signal };	// no SA_RESTART
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+}
+
+static int unload_app(int qfd, const char *name)
+{
+	int ret = ioctl(qfd, QP_IOCTL_UNLOAD_APP_REQ);
+	report("ioctl UNLOAD_APP_REQ", ret, errno);
+	if (ret < 0)
+		return 1;
+	printf("%s: unloaded\n", name);
+	return 0;
+}
+
+static int cmd_load(const char *dir, const char *name, const char *heap, long hold,
+		    uint64_t minbuf)
+{
+	unsigned arch;
+
+	catch_stop_signals();
+	int qfd = open_dev();
+	if (qfd < 0)
+		return 1;
+	if (load_app(qfd, dir, name, heap, minbuf, &arch)) {
+		close(qfd);
+		return 1;
+	}
 	// 5. Hold, then unload.
 	if (hold > 0 && !stop_signal) {
 		printf("holding %s for %ld s (SIGINT or SIGTERM to stop)\n", name, hold);
@@ -494,18 +576,186 @@ static int cmd_load(const char *dir, const char *name, const char *heap, long ho
 	}
 	if (stop_signal)
 		printf("signal %d: unloading\n", (int)stop_signal);
-	ret = ioctl(qfd, QP_IOCTL_UNLOAD_APP_REQ);
-	e = errno;
-	report("ioctl UNLOAD_APP_REQ", ret, e);
+	int rc = unload_app(qfd, name);
+	close(qfd);
+	return rc;
+}
+
+// ---- sendcmd: a known-answer test against the sample TA (smplap64) --------
+//
+// The sample trusted app's "basic data" command, read from its own code
+// segment (the modem image's smplap64.b01, disassembled). Its command
+// handler takes (cmd_ptr, cmd_len, rsp_ptr, rsp_len), rejects a response
+// buffer of 8 bytes or less ("Response buffer len insufficient") and a
+// command buffer shorter than 40 bytes ("Cmd/rsp buffer lens insufficient"),
+// reads the command id from the first word of cmd_ptr and dispatches through
+// a jump table indexed by it. Command id 1 ("Basic data test") loads a
+// 32-bit word out of the command buffer, computes word * 10 (add w,w,w
+// lsl#2 then lsl#1), writes it to rsp_ptr[0] and zero (success) to
+// rsp_ptr[1], and logs "****PASSED : Basic data test". This matches the
+// public qseecom_sample_client protocol: command CLIENT_CMD1_BASIC_DATA = 1,
+// send_cmd_rsp { int data; int status; }, answer = data * 10, status 0. The
+// probe fills every data word of the request with N so the answer is N * 10
+// whichever word that build multiplies.
+//
+// The shared buffer and the pointers follow libQSEEComAPI.so's
+// QSEECom_send_cmd (its disassembly): the request sits at the shared buffer
+// base, the response right after it, and for a QSEOS version of 0x14 or
+// later each length is rounded up to a multiple of 64 before the response
+// offset is taken. The client shared buffer is the 1024 bytes the sample
+// client registers (the dma-buf page-rounded to 4096) from the
+// qcom,qseecom-ta heap. SET_MEM_PARAM_REQ registers it; SEND_CMD_REQ then
+// carries cmd_req_buf/resp_buf pointing inside it, which is what
+// __validate_send_cmd_inputs() in the kernel requires.
+
+#define QP_SAMPLE_SB_SIZE	1024u	// the sample client's shared buffer
+#define QP_SAMPLE_CMD_BASIC	1u	// CLIENT_CMD1_BASIC_DATA
+#define QP_SAMPLE_CMD_LEN	64u	// >= 40, a multiple of 64
+#define QP_SAMPLE_MULTIPLIER	10u
+
+struct qp_sample_cmd {			// qseecom_sample_client send_cmd
+	__u32 cmd_id;
+	__u32 data;
+	__u32 data2;
+	__u32 len;
+	__u32 start_pkt;
+	__u32 end_pkt;
+	__u32 test_buf_size;
+};
+
+struct qp_sample_rsp {			// qseecom_sample_client send_cmd_rsp
+	__s32 data;			// data * 10
+	__s32 status;			// 0 = success
+};
+
+static int cmd_sendcmd(const char *dir, const char *name, const char *heap,
+		       uint32_t data)
+{
+	unsigned arch;
+
+	catch_stop_signals();
+	int qfd = open_dev();
+	if (qfd < 0)
+		return 1;
+
+	// The vendor library asks QSEOS its version before building the buffer;
+	// it governs the 64-byte rounding of the response offset.
+	struct qp_qseos_version_req ver = {0};
+	int ret = ioctl(qfd, QP_IOCTL_GET_QSEOS_VERSION_REQ, &ver);
+	report("ioctl GET_QSEOS_VERSION_REQ", ret, errno);
+	unsigned version = ret == 0 ? ver.qseos_version : 0;
+	printf("qseos_version 0x%x\n", version);
+
+	if (load_app(qfd, dir, name, heap, 0, &arch)) {
+		close(qfd);
+		return 1;
+	}
+
+	int rc = 1, bfd = -1;
+	unsigned char *sb = MAP_FAILED;
+	uint32_t sb_size = QP_SAMPLE_SB_SIZE;
+	uint64_t alloc_len = (sb_size + 4095u) & ~(uint64_t)4095;	// page-rounded
+
+	int hfd = open(heap, O_RDONLY | O_CLOEXEC);
+	if (hfd < 0) {
+		report_path("open", heap, errno);
+		goto out;
+	}
+	struct dma_heap_allocation_data alloc = {
+		.len = alloc_len,
+		.fd_flags = O_RDWR | O_CLOEXEC,
+	};
+	ret = ioctl(hfd, DMA_HEAP_IOCTL_ALLOC, &alloc);
+	int e = errno;
+	close(hfd);
+	report("ioctl DMA_HEAP_IOCTL_ALLOC (shared buffer)", ret, e);
 	if (ret < 0)
+		goto out;
+	bfd = alloc.fd;
+	sb = mmap(NULL, alloc_len, PROT_READ | PROT_WRITE, MAP_SHARED, bfd, 0);
+	if (sb == MAP_FAILED) {
+		report("mmap shared buffer", -1, errno);
+		goto out;
+	}
+
+	// Register the client shared buffer.
+	struct qp_set_sb_mem_param_req mem = {
+		.ifd_data_fd = bfd,
+		.virt_sb_base = sb,
+		.sb_len = sb_size,
+	};
+	ret = ioctl(qfd, QP_IOCTL_SET_MEM_PARAM_REQ, &mem);
+	report("ioctl SET_MEM_PARAM_REQ", ret, errno);
+	if (ret < 0)
+		goto out;
+
+	// The request at the base, the response right after it; the vendor
+	// rounds the request length up to 64 for version >= 0x14.
+	uint32_t req_len = QP_SAMPLE_CMD_LEN;
+	uint32_t rsp_off = version >= 0x14 ? ((req_len + 63u) & ~63u) : req_len;
+	uint32_t rsp_len = (uint32_t)sizeof(struct qp_sample_rsp);
+	if (rsp_off + rsp_len > sb_size) {
+		fprintf(stderr, "shared buffer too small: need %u, have %u\n",
+			rsp_off + rsp_len, sb_size);
+		goto out;
+	}
+
+	dmabuf_sync(bfd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW,
+		    "ioctl DMA_BUF_IOCTL_SYNC start");
+	memset(sb, 0, sb_size);
+	struct qp_sample_cmd cmd = {
+		.cmd_id = QP_SAMPLE_CMD_BASIC,
+		.data = data,
+		.data2 = data,
+		.len = data,
+		.start_pkt = data,
+		.end_pkt = data,
+		.test_buf_size = data,
+	};
+	memcpy(sb, &cmd, sizeof(cmd));
+	dmabuf_sync(bfd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW,
+		    "ioctl DMA_BUF_IOCTL_SYNC end");
+
+	struct qp_send_cmd_req scmd = {
+		.cmd_req_buf = sb,
+		.cmd_req_len = req_len,
+		.resp_buf = sb + rsp_off,
+		.resp_len = rsp_len,
+	};
+	printf("send_cmd: command %u, data %u, req %u @ +0, resp %u @ +%u\n",
+	       QP_SAMPLE_CMD_BASIC, data, req_len, rsp_len, rsp_off);
+	ret = ioctl(qfd, QP_IOCTL_SEND_CMD_REQ, &scmd);
+	e = errno;
+	report("ioctl SEND_CMD_REQ", ret, e);
+	if (ret < 0)
+		goto out;
+
+	dmabuf_sync(bfd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW,
+		    "ioctl DMA_BUF_IOCTL_SYNC start");
+	struct qp_sample_rsp rsp;
+	memcpy(&rsp, sb + rsp_off, sizeof(rsp));
+	dmabuf_sync(bfd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW,
+		    "ioctl DMA_BUF_IOCTL_SYNC end");
+
+	uint32_t want = data * QP_SAMPLE_MULTIPLIER;
+	printf("response: data %d (0x%x), status %d\n", rsp.data,
+	       (unsigned)rsp.data, rsp.status);
+	if (rsp.status == 0 && (uint32_t)rsp.data == want) {
+		printf("PASS: %s answered %u * %u = %u, status 0\n", name, data,
+		       QP_SAMPLE_MULTIPLIER, want);
+		rc = 0;
+	} else {
+		printf("FAIL: expected data %u (%u * %u) and status 0\n", want,
+		       data, QP_SAMPLE_MULTIPLIER);
 		rc = 1;
-	else
-		printf("%s: unloaded\n", name);
+	}
 out:
-	if (map != MAP_FAILED)
-		munmap(map, buflen);
+	if (sb != MAP_FAILED)
+		munmap(sb, alloc_len);
 	if (bfd >= 0)
 		close(bfd);
+	if (unload_app(qfd, name) != 0)
+		rc = 1;
 	close(qfd);
 	return rc;
 }
@@ -901,6 +1151,32 @@ int main(int argc, char **argv)
 		}
 		if (i == argc)
 			return cmd_load(dir, name, heap, hold, minbuf);
+	}
+	if (strcmp(cmd, "sendcmd") == 0 && i + 2 <= argc) {
+		const char *dir = argv[i], *name = argv[i + 1];
+		const char *heap = "/dev/dma_heap/default_cma_region";
+		uint32_t data = 100;
+		for (i += 2; i < argc; i += 2) {
+			if (i + 1 >= argc)
+				break;
+			if (strcmp(argv[i], "--heap") == 0) {
+				heap = argv[i + 1];
+			} else if (strcmp(argv[i], "--data") == 0) {
+				char *end;
+				unsigned long v = strtoul(argv[i + 1], &end, 0);
+				// data * 10 must stay inside a u32 for the check
+				if (*end || v > UINT32_MAX / QP_SAMPLE_MULTIPLIER) {
+					fprintf(stderr, "--data: not a value in 0..%u: %s\n",
+						UINT32_MAX / QP_SAMPLE_MULTIPLIER, argv[i + 1]);
+					return 2;
+				}
+				data = (uint32_t)v;
+			} else {
+				break;
+			}
+		}
+		if (i == argc)
+			return cmd_sendcmd(dir, name, heap, data);
 	}
 	if (strcmp(cmd, "listen") == 0 && i < argc) {
 		const char *spec = argv[i];
