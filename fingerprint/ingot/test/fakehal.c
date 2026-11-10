@@ -20,6 +20,16 @@
  *                          (default "7")
  *   FAKEHAL_STEP_MS        delay between simulated messages (default 150)
  *   FAKEHAL_LOCKOUT        if 1, authenticate reports LOCKOUT (error 7)
+ *   FAKEHAL_ENUM_HANG      if 1, enumerate never ends: the ids come with a
+ *                          remaining count one too high, so none reaches 0
+ *                          (with no ids, nothing comes at all)
+ *   FAKEHAL_REMOVE_HANG    if 1, remove never answers
+ *   FAKEHAL_REMOVE_ID      if set, remove reports this id removed instead
+ *   FAKEHAL_ENROLL_ERROR   if set, enrol reports this error after its first
+ *                          progress step, and ends
+ *
+ * enroll() writes "fakehal: enroll timeout_sec N" to stderr, so a test sees
+ * the timeout the bridge passed.
  */
 
 #define _GNU_SOURCE
@@ -27,6 +37,7 @@
 #include "../halhost/omamobile-fp-hal.h"
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -70,6 +81,7 @@ static void *worker_main(void *arg)
 	if (fd->job == 1) {		/* enroll */
 		int steps = env_int("FAKEHAL_ENROLL_STEPS", 3);
 		int id = env_int("FAKEHAL_ENROLL_ID", 7);
+		int err = env_int("FAKEHAL_ENROLL_ERROR", 0);
 
 		for (int s = steps; s >= 0 && !fd->cancel; s--) {
 			nap();
@@ -85,6 +97,14 @@ static void *worker_main(void *arg)
 			m.data.enroll.finger.fid = id;
 			m.data.enroll.samples_remaining = s;
 			emit(fd, &m);
+			if (err) {
+				memset(&m, 0, sizeof(m));
+				m.type = FINGERPRINT_ERROR;
+				m.data.error.error = err;
+				emit(fd, &m);
+				fd->busy = 0;
+				return NULL;
+			}
 		}
 		if (fd->cancel) {
 			memset(&m, 0, sizeof(m));
@@ -133,8 +153,10 @@ static void *worker_main(void *arg)
 		buf[sizeof(buf) - 1] = '\0';
 		for (tok = strtok_r(buf, " ", &save); tok && n < 32; tok = strtok_r(NULL, " ", &save))
 			ids[n++] = atoi(tok);
+		int hang = env_int("FAKEHAL_ENUM_HANG", 0) ? 1 : 0;
+
 		nap();
-		if (n == 0) {
+		if (n == 0 && !hang) {
 			memset(&m, 0, sizeof(m));
 			m.type = FINGERPRINT_TEMPLATE_ENUMERATING;
 			m.data.enumerated.finger.fid = 0;
@@ -145,14 +167,14 @@ static void *worker_main(void *arg)
 			memset(&m, 0, sizeof(m));
 			m.type = FINGERPRINT_TEMPLATE_ENUMERATING;
 			m.data.enumerated.finger.fid = ids[i];
-			m.data.enumerated.remaining_templates = n - 1 - i;
+			m.data.enumerated.remaining_templates = n - 1 - i + hang;
 			emit(fd, &m);
 		}
-	} else if (fd->job == 4) {	/* remove */
+	} else if (fd->job == 4 && !env_int("FAKEHAL_REMOVE_HANG", 0)) {	/* remove */
 		nap();
 		memset(&m, 0, sizeof(m));
 		m.type = FINGERPRINT_TEMPLATE_REMOVED;
-		m.data.removed.finger.fid = fd->remove_fid;
+		m.data.removed.finger.fid = env_int("FAKEHAL_REMOVE_ID", (int)fd->remove_fid);
 		m.data.removed.remaining_templates = 0;
 		emit(fd, &m);
 	}
@@ -196,7 +218,13 @@ static uint64_t fake_pre_enroll(struct fingerprint_device_t *dev)
 static int fake_enroll(struct fingerprint_device_t *dev, const hw_auth_token_t *hat,
 		       uint32_t gid, uint32_t to)
 {
-	(void)gid; (void)to;
+	char line[64];
+	int n;
+
+	(void)gid;
+	n = snprintf(line, sizeof(line), "fakehal: enroll timeout_sec %u\n", to);
+	if (n > 0)
+		(void)!write(2, line, n);
 	if (!hat || hat->version != 0)
 		return FP_ERROR_UNABLE_TO_PROCESS;
 	return start_job((struct fake_device *)dev, 1);

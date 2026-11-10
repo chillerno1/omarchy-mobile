@@ -11,7 +11,7 @@
  *
  *   omamobile-fp-bridge-ingot --socket PATH --state DIR [--data-path DIR]
  *                             [--module PATH] [--sid N] [--gid N]
- *                             [--enroll-timeout SEC]
+ *                             [--enroll-timeout SEC] [--list-timeout SEC]
  *
  *   -> ENROLL | AUTH | LIST | DELETE <id> | CANCEL | RESETLOCKOUT | STATUS
  *   <- READY 0 0 0                          on connect (sensor not under the
@@ -29,6 +29,23 @@
  *
  * One operation at a time; one client at a time (a new connection replaces
  * the old one and cancels its operation). The socket is 0600.
+ *
+ * LIST and DELETE end when the HAL says so (an enumerate's or a remove's
+ * remaining count reaching 0). A HAL that never does (some end no
+ * enumerate of an empty group) must not leave the bridge busy for good, so
+ * LIST and DELETE also end on CANCEL, on the client going away, and after
+ * --list-timeout seconds (default 5): a LIST then answers with the ids it
+ * has seen so far (none is a valid answer), a DELETE with ERROR 5 (CANCEL)
+ * or ERROR 3 (the deadline), never DELETED: only the HAL confirms a removal.
+ * The HAL is not told (HAL 2.1's cancel() is for enroll and authenticate).
+ * Only a removal of the id asked (any, for DELETE 0: all) confirms a DELETE,
+ * so a late answer to an abandoned one never confirms the next.
+ *
+ * --enroll-timeout is the HAL 2.1 enroll()'s timeout_sec, which bounds the
+ * whole enrolment ("switches back as soon as enroll is complete ... or after
+ * timeout_sec seconds", libhardware's fingerprint.h), not the wait for one
+ * touch. The default is Android's own (FingerprintService: 60 s); a session
+ * with a person relaying instructions passes more.
  *
  * The auth token for ENROLL (option a: no real secure storage)
  * -----------------------------------------------------------
@@ -95,6 +112,7 @@ static const char *module_path = OMAMOBILE_FP_MODULE_PATH;	/* --module */
 static uint64_t forged_sid;		/* --sid: hat->user_id for enrol */
 static uint32_t active_gid;		/* --gid: set_active_group/enroll gid */
 static uint32_t enroll_timeout = 60;	/* --enroll-timeout seconds */
+static uint32_t list_timeout = 5;	/* --list-timeout seconds (LIST, DELETE) */
 
 /* How long to wait for the HAL to answer a cancel before giving up. The
  * libfprint driver's own backstop is 5 s; we must answer before that. */
@@ -287,11 +305,49 @@ static bool ending_reply;	/* report the end as ERROR 5 (a client CANCEL) */
 static int64_t op_ending_since;
 static bool finger_down;	/* we have told the client FINGER DOWN */
 static int32_t delete_id;	/* the id a DELETE asked to remove */
+static int64_t op_since;	/* when a LIST or DELETE started */
 static char pending[64];	/* a command queued while op_ending */
 
 /* enumerate accumulates ids until remaining_templates reaches 0 */
 static int32_t list_ids[32];
 static int list_n;
+
+/* LIST done: the ids the HAL has enumerated (so far) */
+static void reply_list(void)
+{
+	char list[256];
+	size_t n = 0;
+
+	for (int i = 0; i < list_n && n < sizeof(list) - 12; i++)
+		n += snprintf(list + n, sizeof(list) - n, " %d", list_ids[i]);
+	list[n] = '\0';
+	reply("LIST%s", list);
+	op = OP_NONE;
+}
+
+/*
+ * End a LIST or DELETE the HAL has not finished. WHY: "cancel" (a client's
+ * CANCEL), "timeout" (--list-timeout), or NULL (the client went away: no
+ * reply). A LIST answers with what it has; a DELETE fails, never DELETED.
+ */
+static void end_admin(const char *why)
+{
+	if (op != OP_LIST && op != OP_DELETE)
+		return;
+	if (op == OP_LIST) {
+		say("LIST: no end from the HAL (%s); %d id(s) so far",
+		    why ? why : "client gone", list_n);
+		if (why)
+			reply_list();
+	} else {
+		say("DELETE %d: no answer from the HAL (%s); not confirmed",
+		    delete_id, why ? why : "client gone");
+		if (why)
+			reply("ERROR %d", strcmp(why, "timeout") ? FP_ERROR_CANCELED
+							  : FP_ERROR_TIMEOUT);
+	}
+	op = OP_NONE;
+}
 
 static bool capturing(void)
 {
@@ -383,6 +439,8 @@ static void command(const char *line)
 		pending[0] = '\0';
 		if (op == OP_ENROLL || op == OP_AUTH)
 			end_capture(true);
+		else if (op == OP_LIST || op == OP_DELETE)
+			end_admin("cancel");
 		else if (op == OP_NONE)
 			reply("ERROR %d", FP_ERROR_CANCELED);
 		return;
@@ -401,12 +459,14 @@ static void command(const char *line)
 		start_auth();
 	} else if (!strcmp(line, "LIST")) {
 		list_n = 0;
+		op_since = now_ms();
 		if (fp->enumerate(fp) == 0)
 			op = OP_LIST;
 		else
 			reply("ERROR %d", FP_ERROR_UNABLE_TO_PROCESS);
 	} else if (sscanf(line, "DELETE %d", &id) == 1) {
 		delete_id = id;
+		op_since = now_ms();
 		if (fp->remove(fp, active_gid, (uint32_t)id) == 0)
 			op = OP_DELETE;
 		else
@@ -425,9 +485,6 @@ static void command(const char *line)
 
 static void hal_event(const fingerprint_msg_t *e)
 {
-	char list[256];
-	size_t n = 0;
-
 	switch (e->type) {
 	case FINGERPRINT_ACQUIRED:
 		if (!capturing())
@@ -486,21 +543,30 @@ static void hal_event(const fingerprint_msg_t *e)
 		op_done();
 		return;
 	case FINGERPRINT_TEMPLATE_ENUMERATING:
-		if (op != OP_LIST)
+		if (op != OP_LIST) {
+			say("enumerated %u (remaining %u) outside a LIST: ignored",
+			    e->data.enumerated.finger.fid,
+			    e->data.enumerated.remaining_templates);
 			return;
+		}
 		if (e->data.enumerated.finger.fid != 0 && list_n < (int)(sizeof(list_ids) / sizeof(list_ids[0])))
 			list_ids[list_n++] = e->data.enumerated.finger.fid;
-		if (e->data.enumerated.remaining_templates == 0) {
-			for (int i = 0; i < list_n && n < sizeof(list) - 12; i++)
-				n += snprintf(list + n, sizeof(list) - n, " %d", list_ids[i]);
-			list[n] = '\0';
-			reply("LIST%s", list);
-			op = OP_NONE;
-		}
+		if (e->data.enumerated.remaining_templates == 0)
+			reply_list();
 		return;
 	case FINGERPRINT_TEMPLATE_REMOVED:
-		if (op != OP_DELETE)
+		if (op != OP_DELETE) {
+			say("removed %u (remaining %u) outside a DELETE: ignored",
+			    e->data.removed.finger.fid,
+			    e->data.removed.remaining_templates);
 			return;
+		}
+		if (delete_id != 0 && (int32_t)e->data.removed.finger.fid != delete_id) {
+			say("removed %u (remaining %u), not the %d asked: ignored",
+			    e->data.removed.finger.fid,
+			    e->data.removed.remaining_templates, delete_id);
+			return;
+		}
 		/* one or more REMOVED; complete when the HAL is done */
 		if (e->data.removed.remaining_templates == 0) {
 			reply("DELETED %d", delete_id);
@@ -522,6 +588,7 @@ static void new_client(void)
 		say("new client: dropping the old one");
 		close(client_fd);
 		end_capture(false);
+		end_admin(NULL);
 		pending[0] = '\0';
 	}
 	client_fd = fd;
@@ -540,6 +607,7 @@ static void client_input(void)
 		client_fd = -1;
 		pending[0] = '\0';
 		end_capture(false);
+		end_admin(NULL);
 		return;
 	}
 	client_used += n;
@@ -594,7 +662,7 @@ static void usage(void)
 {
 	say("usage: omamobile-fp-bridge-ingot --socket PATH --state DIR\n"
 	    "         [--data-path DIR] [--module PATH] [--sid N] [--gid N]\n"
-	    "         [--enroll-timeout SEC]");
+	    "         [--enroll-timeout SEC] [--list-timeout SEC]");
 	exit(2);
 }
 
@@ -637,9 +705,10 @@ int main(int argc, char **argv, char **envp)
 		else if (!strcmp(argv[i], "--sid") && v) forged_sid = strtoull(v, NULL, 0), i++;
 		else if (!strcmp(argv[i], "--gid") && v) active_gid = (uint32_t)strtoul(v, NULL, 0), i++;
 		else if (!strcmp(argv[i], "--enroll-timeout") && v) enroll_timeout = (uint32_t)strtoul(v, NULL, 0), i++;
+		else if (!strcmp(argv[i], "--list-timeout") && v) list_timeout = (uint32_t)strtoul(v, NULL, 0), i++;
 		else usage();
 	}
-	if (!socket_path || !state_dir)
+	if (!socket_path || !state_dir || !enroll_timeout || !list_timeout)
 		usage();
 	if (!data_path) {
 		snprintf(data_default, sizeof(data_default), "%s/fpdata", state_dir);
@@ -666,7 +735,8 @@ int main(int argc, char **argv, char **envp)
 		say("cannot listen on %s: %s", socket_path, strerror(errno));
 		return 1;
 	}
-	say("ready on %s", socket_path);
+	say("ready on %s (enroll timeout %u s, LIST/DELETE deadline %u s)",
+	    socket_path, enroll_timeout, list_timeout);
 
 	while (!stop) {
 		struct pollfd fds[3] = {
@@ -696,6 +766,10 @@ int main(int argc, char **argv, char **envp)
 				reply("ERROR %d", FP_ERROR_CANCELED);
 			op_done();
 		}
+		/* a LIST or DELETE the HAL never finished */
+		if ((op == OP_LIST || op == OP_DELETE) &&
+		    now_ms() - op_since >= (int64_t)list_timeout * 1000)
+			end_admin("timeout");
 		if (op == OP_NONE && pending[0]) {
 			char line[sizeof(pending)];
 

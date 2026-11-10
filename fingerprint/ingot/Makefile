@@ -10,6 +10,8 @@
 #
 #   make NDK=/opt/android-ndk CHROOT=...          (Android NDK r27 or later)
 #   make test NDK=... CHROOT=...                  also builds out/fingerprint.fake.so
+#   make check NDK=... CHROOT=...                 and drives the bridge with it
+#                                                 (test/bridge-test, qemu-aarch64)
 #
 # The bridge and the HAL host share the module ABI and bionic start-up in
 # halhost/omamobile-fp-hal.h. out/fingerprint.fake.so is OUR test stand-in
@@ -58,6 +60,10 @@ all: $(OUT)/librpmb.so $(OUT)/libssd.so $(OUT)/omamobile-fp-halhost \
 # Host test build: the fake HAL module, driven by the bridge without a phone.
 test: all $(OUT)/fingerprint.fake.so
 
+# The bridge's protocol engine against the fake HAL, under qemu user mode.
+check: test
+	python3 -I test/bridge-test $(OUT) $(CHROOT)
+
 # A bionic executable with its own _start (see the shared header).
 EXE_LINK = $(CC) $(CFLAGS) $(WARN) -fPIE -pie -nostdlib -fno-stack-protector \
 	-Wl,--dynamic-linker=/system/bin/linker64 -Wl,-z,now -Wl,-z,relro \
@@ -102,4 +108,4 @@ $(OUT)/omamobile-fp-shim.so: $(SHIM_SRC)
 clean:
 	rm -rf $(OUT)
 
-.PHONY: all test clean
+.PHONY: all test check clean
