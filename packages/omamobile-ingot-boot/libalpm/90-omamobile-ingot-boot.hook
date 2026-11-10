@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+# Write the Solana Mobile Saga's slot-A boot images after a transaction
+# that installs or upgrades them (linux-omamobile-ingot's
+# /usr/lib/omamobile/ingot/boot), only when /etc/omamobile/ingot-boot.conf
+# says AUTO_WRITE=yes; no package ships that file. It never reboots. A
+# failure prints its error in pacman's output and leaves the transaction as
+# it is: a post-transaction hook cannot undo one. Named to run after
+# 60-depmod.hook, so the new release's modules.dep exists.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/lib/omamobile/ingot/boot/*
+
+[Action]
+Description = Writing the Saga's boot images to slot A (omamobile-ingot-boot)...
+When = PostTransaction
+Exec = /usr/bin/omamobile-ingot-boot hook

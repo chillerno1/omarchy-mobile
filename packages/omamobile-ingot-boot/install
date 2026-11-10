@@ -1,0 +1,19 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Stage omamobile-ingot-boot into DESTDIR. Activates no write by itself: the
+# pacman hook writes slot A only when /etc/omamobile/ingot-boot.conf says
+# AUTO_WRITE=yes, and the package does not ship that file. The slot check
+# at boot is read-only and is enabled.
+#   ./install DESTDIR
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+d=${1:?Usage: ./install DESTDIR}
+[[ $d == /* && $d != "/" ]] || { echo "Use an absolute staging directory" >&2; exit 1; }
+install -Dm755 bin/omamobile-ingot-boot "$d/usr/bin/omamobile-ingot-boot"
+install -Dm644 lib/ingot-images.sh "$d/usr/lib/omamobile-ingot-boot/ingot-images.sh"
+install -Dm644 libalpm/90-omamobile-ingot-boot.hook "$d/usr/share/libalpm/hooks/90-omamobile-ingot-boot.hook"
+install -Dm644 systemd/omamobile-ingot-slot-check.service "$d/usr/lib/systemd/system/omamobile-ingot-slot-check.service"
+install -d "$d/usr/lib/systemd/system/multi-user.target.wants"
+ln -sfn ../omamobile-ingot-slot-check.service "$d/usr/lib/systemd/system/multi-user.target.wants/omamobile-ingot-slot-check.service"
+install -Dm644 LICENSE "$d/usr/share/licenses/omamobile-ingot-boot/LICENSE"
+install -Dm644 version "$d/usr/share/omamobile/ingot-boot/version"

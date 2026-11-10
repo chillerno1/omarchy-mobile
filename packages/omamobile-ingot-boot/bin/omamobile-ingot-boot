@@ -1,0 +1,765 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Write the Solana Mobile Saga's (ingot) slot-A boot images from the
+# installed linux-omamobile-ingot package, on the phone, guarded and verified.
+#
+#   omamobile-ingot-boot status            what is installed, on slot A and saved
+#   omamobile-ingot-boot slots [--json]    read-only: the slot flags and what they mean
+#   omamobile-ingot-boot preflight [--json]
+#                                          read-only: would a write be allowed now?
+#   omamobile-ingot-boot write [--dry-run] [--yes] [--boot-only] [--images DIR]
+#                                          check, save slot A, write, read back
+#   omamobile-ingot-boot rollback [--dry-run] [--yes]
+#                                          write the saved previous set back
+#   omamobile-ingot-boot hook              the pacman hook (90-omamobile-ingot-boot.hook)
+#
+# On the Saga slot A is ours and slot B holds LineageOS, the way back, which
+# this never writes. The bootloader takes the kernel, initramfs and command
+# line from boot_a, the DTB from vendor_boot_a and an overlay from dtbo_a.
+#
+# What it writes, and only that: boot_a, vendor_boot_a and dtbo_a, a
+# constant below. No option, configuration or file names a partition. Each
+# is found by its GPT name (PARTNAME in /sys/class/block/*/uevent), exactly
+# once, re-checked right before its write, and must be left writable (ro 0)
+# by the running image's storage guard, which this never changes: no
+# blockdev --setrw, no sysfs ro or force_ro, no partition table or slot
+# flag, no fastboot, no reboot.
+#
+# Before a write: the board is osom,ingot and the boot names slot A; the
+# image set passes its SHA256SUMS and its structure (lib/ingot-images.sh);
+# its RELEASE has modules (modules.dep) here; the battery is at 30% or
+# charging. Partitions that already hold their image are skipped. The
+# current contents of the partitions that change go to
+# /var/lib/omamobile/ingot-boot/previous first (replaced only while slot A
+# holds what booted). Each image: dd conv=fsync, then read back by sha256.
+#
+# OMAMOBILE_INGOT_ROOT (tests only) prefixes every path, /sys, /proc and
+# /dev included; only then may a "partition" or a disk be a regular file.
+set -euo pipefail
+shopt -s extglob
+
+R=${OMAMOBILE_INGOT_ROOT:-}
+[[ $R == / ]] && R=
+LIB=${OMAMOBILE_INGOT_BOOT_LIB:-/usr/lib/omamobile-ingot-boot}
+SYS=$R/sys
+PROC=$R/proc
+DEV=$R/dev
+MODULES=$R/usr/lib/modules
+CONF=$R/etc/omamobile/ingot-boot.conf
+STATE=$R/var/lib/omamobile/ingot-boot
+RUN=$R/run/omamobile
+IMAGES_DEFAULT=$R/usr/lib/omamobile/ingot/boot
+BOARD=osom,ingot
+MIN_BATTERY=30
+UNAME_R=${OMAMOBILE_INGOT_UNAME_R:-$(uname -r)}
+DF=${DF:-df}
+SPACE_MARGIN=$((64 * 1024 * 1024))
+
+# The only partitions this tool may ever write. Not configurable.
+readonly TARGETS="boot_a vendor_boot_a dtbo_a"
+
+# shellcheck source-path=SCRIPTDIR/.. source=lib/ingot-images.sh
+source "$LIB/ingot-images.sh"
+
+say() { printf '==> %s\n' "$*"; }
+note() { printf '    %s\n' "$*"; }
+warn() { printf 'warning: omamobile-ingot-boot: %s\n' "$*" >&2; }
+die() { printf 'error: omamobile-ingot-boot: %s\n' "$*" >&2; exit 1; }
+# CONTEXT: what a refusal stops (the read-only commands set their own)
+CONTEXT="not writing slot A: "
+refuse() { printf 'error: omamobile-ingot-boot: %s%s\n' "$CONTEXT" "$*" >&2; exit 1; }
+real_root() { [[ -z $R ]]; }
+
+# ---------------------------------------------------------------- the deny check
+# Defence in depth: whatever the code above it found, a name that is not
+# exactly one of TARGETS, or that looks like anything we must never touch,
+# stops the run here.
+deny_check() {
+  local name=$1
+  case $name in
+    *_b|vbmeta*|misc|devinfo|persist*|modem*|efs*|fsg*|abl*|xbl*|userdata|super|"")  # modem* covers modemst*
+      die "refusing to write '$name': never a partition of slot B, vbmeta, misc, devinfo, persist, the modem's, the bootloader's or userdata" ;;
+  esac
+  [[ " $TARGETS " == *" $name "* ]] || die "refusing to write '$name': only $TARGETS are written"
+}
+
+# ---------------------------------------------------------------- board and slot
+check_board() {
+  local got
+  [[ -r $PROC/device-tree/compatible ]] || refuse "cannot read $PROC/device-tree/compatible"
+  got=$(tr '\0' '\n' < "$PROC/device-tree/compatible" | head -1)
+  [[ $got == "$BOARD" ]] || refuse "this board is '$got', not the Solana Mobile Saga ('$BOARD')"
+}
+
+# The bootloader must say this boot is from slot A: slot B is LineageOS, and
+# a boot that names no slot is not ours to judge.
+check_slot() {
+  local f a=0
+  for f in "$PROC/bootconfig" "$PROC/cmdline"; do
+    [[ -r $f ]] || continue
+    if grep -qE 'androidboot\.slot_suffix *= *"?_b' "$f"; then
+      refuse "the bootloader says this boot is from slot B ($f)"
+    fi
+    grep -qE 'androidboot\.slot_suffix *= *"?_a("|[[:space:]]|$)' "$f" && a=1
+  done
+  ((a)) || refuse "neither $PROC/bootconfig nor $PROC/cmdline says this boot is from slot A (androidboot.slot_suffix=_a)"
+}
+
+# ---------------------------------------------------------------- partitions
+declare -A PART_NODE=() PART_SYS=() PART_BYTES=() PART_DISK=()
+
+partname() { sed -n 's/^PARTNAME=//p' "$1/uevent" 2>/dev/null | head -1; }
+
+# The sysfs entries whose PARTNAME is exactly NAME, on any disk
+scan_partname() {
+  local s
+  for s in "$SYS"/class/block/*; do
+    [[ -f $s/uevent ]] || continue
+    [[ $(partname "$s") == "$1" ]] && echo "${s##*/}"
+  done
+  return 0
+}
+
+# find_partition NAME: exactly one partition named NAME, its node, size and
+# disk. Fills PART_*; refuses otherwise.
+find_partition() {
+  local want=$1 found=() s disk sectors
+  deny_check "$want"
+  mapfile -t found < <(scan_partname "$want")
+  ((${#found[@]})) || refuse "$want not found (no PARTNAME=$want in $SYS/class/block/*/uevent)"
+  ((${#found[@]} == 1)) || refuse "$want appears ${#found[@]} times (${found[*]}): not writing a partition whose name is not unique"
+  s=$SYS/class/block/${found[0]}
+  grep -qx 'DEVTYPE=partition' "$s/uevent" || refuse "$want (${found[0]}) is not a partition"
+  disk=$(basename "$(dirname "$(readlink -f "$s")")")
+  [[ $disk =~ ^sd[a-z]+$ && ${found[0]} =~ ^${disk}[0-9]+$ ]] || refuse "$want is ${found[0]}, not a partition of a UFS disk (sdX)"
+  sectors=$(cat "$s/size" 2>/dev/null || true)
+  [[ $sectors =~ ^[0-9]{1,15}$ && $sectors != 0 ]] || refuse "cannot read the size of ${found[0]} ($want)"
+  PART_NODE[$want]=$DEV/${found[0]}
+  PART_SYS[$want]=$s
+  PART_BYTES[$want]=$((sectors * 512))
+  PART_DISK[$want]=$disk
+}
+
+# check_writable NAME: right before a write (and when planning one): the
+# name is still unique and on the same node, the node is a partition, not a
+# disk, and the guard left it writable. Never changes ro.
+check_writable() {
+  local want=$1 node s found=()
+  deny_check "$want"
+  node=${PART_NODE[$want]:-}
+  [[ -n $node ]] || refuse "$want was not looked up"
+  mapfile -t found < <(scan_partname "$want")
+  ((${#found[@]} == 1)) || refuse "$want is now found ${#found[@]} times"
+  [[ $DEV/${found[0]} == "$node" ]] || refuse "$want moved from ${node##*/} to ${found[0]}"
+  s=${PART_SYS[$want]}
+  [[ $(partname "$s") == "$want" ]] || refuse "$node is no longer $want"
+  grep -qx 'DEVTYPE=partition' "$s/uevent" || refuse "$node is not a partition"
+  [[ ${node##*/} != "${PART_DISK[$want]}" ]] || refuse "$node is a whole disk"
+  if real_root; then
+    [[ -b $node ]] || refuse "$node is not a block device"
+  else
+    [[ -f $node && ! -L $node ]] || refuse "$node (test tree) is not a regular file"
+  fi
+  [[ $(cat "$s/ro" 2>/dev/null) == 0 ]] \
+    || refuse "$node ($want) is read-only: the running image's storage guard keeps it read-only (boot an image built with --self-update)"
+}
+
+sha_head() { head -c "$2" "$1" | sha256sum | cut -d' ' -f1; }
+sha_file() { sha256sum < "$1" | cut -d' ' -f1; }
+
+# The partitions written since this boot, from the kernel's write counters
+# (field 7 of /sys/class/block/<part>/stat, sectors written). A fastboot
+# flash (the recovery) comes before the boot and is not counted; this
+# tool's own write and a rollback are. Every one counts as written when the
+# disk's I/O accounting is off or a counter can't be read.
+written_since_boot() {
+  local p n out=()
+  for p in "$@"; do
+    if [[ $(cat "$SYS/class/block/${PART_DISK[$p]}/queue/iostats" 2>/dev/null) != 1 ]]; then
+      out+=("$p")
+      continue
+    fi
+    n=$(awk '{print $7}' "${PART_SYS[$p]}/stat" 2>/dev/null || true)
+    [[ $n == 0 ]] || out+=("$p")
+  done
+  echo "${out[*]}"
+}
+
+# Test roots only: what the kernel's counter does on a real write
+fake_count_write() {
+  local f
+  real_root && return 0
+  f=${PART_SYS[$1]}/stat
+  [[ -f $f ]] || return 0
+  awk -v s="$(( ($2 + 511) / 512 ))" '{ $7 += s; print }' "$f" > "$f.new" && mv "$f.new" "$f"
+}
+
+free_bytes() {
+  local d=$1 n
+  while [[ ! -d $d ]]; do d=$(dirname "$d"); done
+  n=$("$DF" -P -B1 "$d" | awk 'NR == 2 {print $4}')
+  [[ $n =~ ^[0-9]+$ ]] || refuse "cannot read the free space of $d"
+  echo "$n"
+}
+
+# ---------------------------------------------------------------- battery
+# The first real battery's charge, unless a supply is online or it charges.
+# A phone whose battery driver isn't up yet has no Battery supply: that is
+# a warning, not a refusal.
+battery_blocker() {
+  local d kind present=0 percent=-1 charging=0 cap
+  for d in "$SYS"/class/power_supply/*; do
+    [[ -d $d ]] || continue
+    kind=$(cat "$d/type" 2>/dev/null || true)
+    if [[ $kind == Battery ]]; then
+      [[ $(cat "$d/scope" 2>/dev/null || true) == Device ]] && continue
+      [[ $(cat "$d/present" 2>/dev/null || echo 1) == 0 ]] && continue
+      ((present)) && continue
+      cap=$(cat "$d/capacity" 2>/dev/null || true)
+      [[ $cap =~ ^[0-9]+$ ]] || continue
+      present=1 percent=$cap
+      [[ $(cat "$d/status" 2>/dev/null || true) == @(Charging|Full) ]] && charging=1
+    elif [[ $kind == @(Mains|USB|USB_C|USB_PD|Wireless) && $(cat "$d/online" 2>/dev/null || true) == 1 ]]; then
+      charging=1
+    fi
+  done
+  if ((!present)); then
+    warn "no battery reading in $SYS/class/power_supply: keep the phone on the charger for the write" >&2
+    return 0
+  fi
+  if ((!charging && percent < MIN_BATTERY)); then
+    echo "battery at $percent%: charge to $MIN_BATTERY% or plug in the charger first"
+  fi
+}
+
+# ---------------------------------------------------------------- the image set
+RELEASE=
+# check_images DIR PARTS...: the set's sums and RELEASE, and each image that
+# goes to one of PARTS against that partition's size
+check_images() {
+  local dir=$1 img part msg
+  shift
+  [[ -d $dir ]] || refuse "no image set in $dir (is linux-omamobile-ingot installed?)"
+  msg=$(ib_check_sums "$dir") || refuse "$msg"
+  RELEASE=$(ib_release "$dir") || refuse "$RELEASE"
+  for img in $IB_IMAGES; do
+    part=${IB_TARGET[$img]}
+    [[ " $* " == *" $part "* ]] || continue
+    msg=$(ib_check_image "$img" "$dir/$img" "${PART_BYTES[$part]}") || refuse "$msg"
+  done
+  [[ -s $MODULES/$RELEASE/modules.dep ]] \
+    || refuse "no $MODULES/$RELEASE/modules.dep: the kernel in this set would boot without its modules (no GPU, no Wi-Fi); install linux-omamobile-ingot for $RELEASE and let depmod run"
+}
+
+# ---------------------------------------------------------------- the write
+LOCK_FD=
+take_lock() {
+  mkdir -p "$STATE"
+  exec {LOCK_FD}>"$STATE/.lock"
+  flock -n "$LOCK_FD" || refuse "another omamobile-ingot-boot is running"
+}
+
+confirm() {
+  local what=$1 answer
+  ((YES)) && return 0
+  [[ -t 0 ]] || refuse "$what needs --yes when not run in a terminal"
+  printf 'This writes %s on slot A of this Solana Mobile Saga. Type ingot to go on: ' "$what"
+  read -r answer
+  [[ $answer == ingot ]] || refuse "not confirmed"
+}
+
+# previous_has PART: the saved set holds PART
+previous_has() { [[ -f $STATE/previous/$1.img ]] && grep -qE "  $1\.img$" "$STATE/previous/SHA256SUMS" 2>/dev/null; }
+
+# save_previous PARTS...: the current whole partitions that are about to
+# change, into previous/, with SHA256SUMS, SIZES and the running release.
+# A saved set is replaced only while slot A holds what booted (none of its
+# three partitions written since this boot); otherwise it is kept, and a
+# partition it lacks is added only if that one is still as it booted.
+save_previous() {
+  local p booted=yes written add=() need=0 avail new=$STATE/previous.new have
+  local all=() unknown=()
+  # All three, even for --boot-only: slot A is as it booted only if none
+  # was written. One that can't be found counts as written.
+  for p in $TARGETS; do
+    if [[ -z ${PART_SYS[$p]:-} ]] && ! ( find_partition "$p" ) >/dev/null 2>&1; then unknown+=("$p"); continue; fi
+    [[ -n ${PART_SYS[$p]:-} ]] || find_partition "$p"
+    all+=("$p")
+  done
+  written=$(written_since_boot "${all[@]}")
+  written="$written ${unknown[*]}"
+  written=$(xargs <<<"$written")
+  [[ -z $written ]] || booted=no
+  if [[ $booted == no && -d $STATE/previous ]]; then
+    for p in "$@"; do
+      previous_has "$p" && continue
+      if [[ " $written " == *" $p "* ]]; then
+        note "$p was written since this boot and previous/ has no copy of it: a rollback leaves it as it is now"
+      else
+        add+=("$p")
+      fi
+    done
+    if ((${#add[@]} == 0)); then
+      note "slot A was written since this boot ($written): keeping previous/ ($(cat "$STATE/previous/RELEASE" 2>/dev/null)), the last set that booted"
+      return 0
+    fi
+    note "slot A was written since this boot ($written): keeping previous/, adding ${add[*]} as they booted"
+  else
+    add=("$@")
+    [[ $booted == yes ]] || note "slot A was written since this boot ($written) and nothing was saved before: saving it as it is, marked not booted"
+  fi
+  for p in "${add[@]}"; do need=$((need + PART_BYTES[$p])); done
+  avail=$(free_bytes "$STATE")
+  ((avail > need + SPACE_MARGIN)) \
+    || refuse "not enough space in $STATE to save the current images ($((need / 1048576)) MiB and a $((SPACE_MARGIN / 1048576)) MiB margin needed, $((avail / 1048576)) MiB free)"
+  rm -rf "$new"
+  if [[ $booted == no && -d $STATE/previous ]]; then
+    cp -a "$STATE/previous" "$new"
+  else
+    mkdir -p "$new"
+    # What booted is the running kernel's set; a set written since is not
+    if [[ $booted == yes ]]; then printf '%s\n' "$UNAME_R"; else echo unknown; fi > "$new/RELEASE"
+    printf '%s\n' "$booted" > "$new/BOOTED"
+  fi
+  say "Saving ${add[*]} to $STATE/previous"
+  for p in "${add[@]}"; do
+    head -c "${PART_BYTES[$p]}" "${PART_NODE[$p]}" > "$new/$p.img" || refuse "could not read $p"
+    [[ $(stat -c %s "$new/$p.img") == "${PART_BYTES[$p]}" ]] || refuse "short read of $p"
+  done
+  have=()
+  for p in $TARGETS; do [[ -f $new/$p.img ]] && have+=("$p"); done
+  (cd "$new" && for p in "${have[@]}"; do sha256sum "$p.img"; done) > "$new/SHA256SUMS"
+  for p in "${have[@]}"; do printf '%s %s\n' "$p" "$(stat -c %s "$new/$p.img")"; done > "$new/SIZES"
+  sync
+  rm -rf "$STATE/previous.old"
+  [[ ! -d $STATE/previous ]] || mv "$STATE/previous" "$STATE/previous.old"
+  mv "$new" "$STATE/previous"
+  rm -rf "$STATE/previous.old"
+  sync
+}
+
+# write_one PART FILE: the guarded write and its read-back
+write_one() {
+  local p=$1 file=$2 node size want got
+  check_writable "$p"
+  deny_check "$p"
+  node=${PART_NODE[$p]}
+  size=$(stat -c %s "$file")
+  ((size <= PART_BYTES[$p])) || die "$file is larger than $p"
+  want=$(sha_file "$file")
+  dd if="$file" of="$node" bs=1M conv=fsync,notrunc status=none \
+    || die "writing $p ($node) failed: slot A is incomplete. Run 'omamobile-ingot-boot rollback' BEFORE restarting"
+  fake_count_write "$p" "$size"
+  # Drop the kernel's cached copy so the read-back comes from the device
+  if real_root; then blockdev --flushbufs "$node" || true; fi
+  got=$(sha_head "$node" "$size")
+  [[ $want == "$got" ]] \
+    || die "read-back of $p ($node) does not match what was written: slot A is incomplete. Run 'omamobile-ingot-boot rollback' BEFORE restarting"
+  say "$p (${node##*/}) written and verified"
+}
+
+record_current() {
+  local src=$1 rel=$2 p f
+  shift 2
+  rm -rf "$STATE/current.new" && mkdir -p "$STATE/current.new"
+  : > "$STATE/current.new/SHA256SUMS"
+  : > "$STATE/current.new/SIZES"
+  for p in "$@"; do
+    f=$(src_file "$src" "$p")
+    printf '%s  %s.img\n' "$(sha_file "$f")" "$p" >> "$STATE/current.new/SHA256SUMS"
+    printf '%s %s\n' "$p" "$(stat -c %s "$f")" >> "$STATE/current.new/SIZES"
+  done
+  printf '%s\n' "${rel:-unknown}" > "$STATE/current.new/RELEASE"
+  rm -rf "$STATE/current"
+  mv "$STATE/current.new" "$STATE/current"
+}
+
+# The file that goes to PART: an image set names it by image, the saved
+# set by partition
+MODE=
+src_file() {
+  local p=$2 img
+  if [[ $MODE == rollback ]]; then echo "$1/$p.img"; return; fi
+  for img in $IB_IMAGES; do [[ ${IB_TARGET[$img]} == "$p" ]] && { echo "$1/$img"; return; }; done
+  die "no image for $p"
+}
+
+# do_write MODE: write (an image set) or rollback (previous/)
+do_write() {
+  local src p f parts=() changed=() why msg
+  MODE=$1
+  check_board
+  check_slot
+  ((DRY_RUN)) || take_lock
+  if [[ $MODE == write ]]; then
+    src=${IMAGES:-$IMAGES_DEFAULT}
+    if ((BOOT_ONLY)); then parts=(boot_a); else read -ra parts <<<"$TARGETS"; fi
+    for p in "${parts[@]}"; do find_partition "$p"; done
+    check_images "$src" "${parts[@]}"
+  else
+    src=$STATE/previous
+    [[ -d $src ]] || refuse "no saved images in $src"
+    (cd "$src" && sha256sum --quiet --strict -c SHA256SUMS) || refuse "$src fails its checksums"
+    while read -r _ f; do
+      p=${f%.img}
+      [[ $f == *.img && " $TARGETS " == *" $p "* ]] || refuse "$src/SHA256SUMS names '$f', which is not a saved slot-A partition"
+      parts+=("$p")
+    done < "$src/SHA256SUMS"
+    ((${#parts[@]})) || refuse "$src holds no images"
+    RELEASE=$(head -1 "$src/RELEASE" 2>/dev/null || true)
+    for p in "${parts[@]}"; do
+      find_partition "$p"
+      [[ $(stat -c %s "$src/$p.img") == "${PART_BYTES[$p]}" ]] || refuse "$src/$p.img is not the size of $p: not a copy of it"
+      [[ $(awk -v p="$p" '$1 == p {print $2}' "$src/SIZES" 2>/dev/null) == "${PART_BYTES[$p]}" ]] || refuse "$src/SIZES does not record $p's size"
+    done
+    [[ $(cat "$src/BOOTED" 2>/dev/null) != no ]] || note "the saved set was taken after a write in the same boot (BOOTED=no): it may not boot either"
+    if [[ -n $RELEASE && ! -s $MODULES/$RELEASE/modules.dep ]]; then
+      warn "the saved set's kernel is $RELEASE, and $MODULES/$RELEASE/modules.dep is missing: it would boot without its modules. Install linux-omamobile-ingot for $RELEASE from the cache (pacman -U) as well"
+    fi
+  fi
+  for p in "${parts[@]}"; do
+    check_writable "$p"
+    f=$(src_file "$src" "$p")
+    if [[ $(sha_head "${PART_NODE[$p]}" "$(stat -c %s "$f")") != "$(sha_file "$f")" ]]; then changed+=("$p"); fi
+  done
+  say "Plan ($MODE${RELEASE:+, $RELEASE}):"
+  for p in "${parts[@]}"; do
+    f=$(src_file "$src" "$p")
+    if [[ " ${changed[*]} " == *" $p "* ]]; then why="write"; else why="already there"; fi
+    note "$(printf '%-16s -> %-22s %10s bytes  %s' "${f##*/}" "$p (${PART_NODE[$p]##*/})" "$(stat -c %s "$f")" "$why")"
+  done
+  if ((${#changed[@]} == 0)); then
+    say "Slot A already holds these images: nothing to write"
+    if ((!DRY_RUN)); then
+      rm -f "$STATE/incomplete"
+      record_current "$src" "$RELEASE" "${parts[@]}"
+    fi
+    return 0
+  fi
+  if ((DRY_RUN)); then
+    say "Dry run: nothing written"
+    return 0
+  fi
+  why=$(battery_blocker)
+  [[ -z $why ]] || refuse "$why"
+  confirm "${changed[*]}"
+  [[ $MODE != write ]] || save_previous "${changed[@]}"
+  printf '%s %s\n' "$MODE" "${RELEASE:-?}" > "$STATE/incomplete"
+  sync
+  for p in "${changed[@]}"; do write_one "$p" "$(src_file "$src" "$p")"; done
+  for p in "${parts[@]}"; do
+    f=$(src_file "$src" "$p")
+    [[ $(sha_head "${PART_NODE[$p]}" "$(stat -c %s "$f")") == "$(sha_file "$f")" ]] \
+      || die "$p does not hold its image after the write: slot A is incomplete. Run 'omamobile-ingot-boot rollback' BEFORE restarting"
+  done
+  rm -f "$STATE/incomplete"
+  record_current "$src" "$RELEASE" "${parts[@]}"
+  sync
+  say "Slot A holds ${RELEASE:-the saved images} now. Restart the phone to boot it (nothing restarts by itself)."
+  if [[ $MODE == write ]]; then
+    note "Before restarting, copy the saved set to a computer: scp -r root@<phone>:$STATE/previous ./ingot-previous"
+  fi
+}
+
+# ---------------------------------------------------------------- slots
+# The slot flags, read-only, from the GPT of the disk that holds boot_a.
+# The bootloader keeps them in the GPT entry attributes of boot_a and
+# boot_b: bits 48-49 priority, 50 active, 51-53 tries left, 54 successful,
+# 55 unbootable (its reference source; to be confirmed on the phone).
+# Prints KEY=VALUE lines: a_active a_priority a_tries a_successful
+# a_unbootable, the same for b_, then disk and block.
+read_slots() {
+  local disk node bs
+  CONTEXT="cannot read the slot flags: "
+  find_partition boot_a >/dev/null
+  disk=${PART_DISK[boot_a]}
+  node=$DEV/$disk
+  bs=$(cat "$SYS/class/block/$disk/queue/logical_block_size" 2>/dev/null || true)
+  [[ $bs == @(512|4096) ]] || die "cannot read the logical block size of $disk ($SYS/class/block/$disk/queue/logical_block_size)"
+  if real_root; then
+    [[ -b $node ]] || die "the whole-disk node $node is missing: cannot read the slot flags"
+  else
+    [[ -f $node ]] || die "the whole-disk node $node is missing: cannot read the slot flags"
+  fi
+  [[ -r $node ]] || die "cannot read $node (run as root): cannot read the slot flags"
+  python3 -I - "$node" "$bs" "$disk" <<'PY'
+import struct, sys, zlib
+path, bs, disk = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+def fail(msg):
+    print("error: omamobile-ingot-boot: " + msg, file=sys.stderr)
+    sys.exit(1)
+try:
+    f = open(path, "rb")
+    f.seek(bs)
+    hdr = f.read(bs)
+except OSError as e:
+    fail(f"cannot read {path}: {e}")
+if len(hdr) < 92 or hdr[:8] != b"EFI PART":
+    fail(f"{path}: no GPT header (EFI PART) at LBA 1 with {bs}-byte blocks")
+hsize = struct.unpack_from("<I", hdr, 12)[0]
+if not 92 <= hsize <= bs:
+    fail(f"{path}: odd GPT header size {hsize}")
+want = struct.unpack_from("<I", hdr, 16)[0]
+h = bytearray(hdr[:hsize]); h[16:20] = b"\0\0\0\0"
+if zlib.crc32(bytes(h)) & 0xffffffff != want:
+    fail(f"{path}: the GPT header's CRC does not match")
+lba, count, esize, ecrc = struct.unpack_from("<QIII", hdr, 72)
+if esize < 128 or count == 0 or count > 1024:
+    fail(f"{path}: odd GPT entry array ({count} entries of {esize} bytes)")
+f.seek(lba * bs)
+arr = f.read(count * esize)
+if len(arr) != count * esize or zlib.crc32(arr) & 0xffffffff != ecrc:
+    fail(f"{path}: the GPT entry array does not match its CRC")
+found = {}
+for i in range(count):
+    e = arr[i * esize:(i + 1) * esize]
+    if e[:16] == b"\0" * 16:
+        continue
+    name = e[56:128].decode("utf-16-le", "replace").split("\0")[0]
+    if name in ("boot_a", "boot_b"):
+        if name in found:
+            fail(f"{path}: {name} appears twice in the GPT")
+        found[name] = struct.unpack_from("<Q", e, 48)[0]
+for name in ("boot_a", "boot_b"):
+    if name not in found:
+        fail(f"{path}: no {name} in the GPT")
+print(f"disk={disk}")
+print(f"block={bs}")
+for name, k in (("boot_a", "a"), ("boot_b", "b")):
+    v = found[name]
+    print(f"{k}_priority={(v >> 48) & 3}")
+    print(f"{k}_active={(v >> 50) & 1}")
+    print(f"{k}_tries={(v >> 51) & 7}")
+    print(f"{k}_successful={(v >> 54) & 1}")
+    print(f"{k}_unbootable={(v >> 55) & 1}")
+PY
+}
+
+# slots_verdict: from S_* (read_slots' values), VERDICT (ok, attention or
+# danger), TEXT (plain language) and EXIT (0, 2 or 3)
+declare -A S=()
+slots_verdict() {
+  local b_ok=0 n=${S[a_tries]}
+  [[ ${S[b_successful]} == 1 && ${S[b_unbootable]} == 0 ]] && b_ok=1
+  if [[ ${S[a_active]} != 1 || ${S[a_unbootable]} == 1 ]]; then
+    if ((b_ok)); then
+      VERDICT=danger EXIT=3
+      TEXT="DANGER: slot A is not the bootloader's choice (active ${S[a_active]}, unbootable ${S[a_unbootable]}) and slot B is eligible: the next boot goes to slot B, whose system cannot use this userdata. Fix it from fastboot: 'fastboot set_active b' then 'fastboot set_active a' in the same session, then check 'fastboot getvar all'."
+    else
+      VERDICT=attention EXIT=2
+      TEXT="slot A is not the bootloader's choice (active ${S[a_active]}, unbootable ${S[a_unbootable]}) and slot B is not eligible: the next boot stops in fastboot; 'fastboot set_active a' from a computer gives slot A 7 tries."
+    fi
+  elif [[ ${S[a_successful]} == 1 ]]; then
+    VERDICT=ok EXIT=0
+    TEXT="slot A is marked successful: it boots without counting tries."
+  elif ((b_ok)); then
+    VERDICT=danger EXIT=3
+    TEXT="DANGER: slot A is not marked successful and slot B is: after $n more normal boots the bootloader switches to slot B, whose system cannot use this userdata. Fix it from fastboot: 'fastboot set_active b' then 'fastboot set_active a' in the same session, then check 'fastboot getvar all'."
+  else
+    if ((n <= 2)); then VERDICT=attention EXIT=2; else VERDICT=ok EXIT=0; fi
+    TEXT="$n normal boots left, then the phone stops in fastboot; 'fastboot set_active a' from a computer gives 7 more."
+  fi
+}
+
+load_slots() {
+  local out line
+  out=$(read_slots) || return 1
+  while IFS= read -r line; do S[${line%%=*}]=${line#*=}; done <<<"$out"
+}
+
+slots_json() {
+  python3 -I -c '
+import json, sys
+a = sys.argv[1:]
+keys = ["active", "priority", "tries", "successful", "unbootable"]
+d = {"disk": a[0], "verdict": a[1], "text": a[2],
+     "boot_a": dict(zip(keys, map(int, a[3:8]))), "boot_b": dict(zip(keys, map(int, a[8:13])))}
+print(json.dumps(d, sort_keys=True))' "${S[disk]}" "$VERDICT" "$TEXT" \
+    "${S[a_active]}" "${S[a_priority]}" "${S[a_tries]}" "${S[a_successful]}" "${S[a_unbootable]}" \
+    "${S[b_active]}" "${S[b_priority]}" "${S[b_tries]}" "${S[b_successful]}" "${S[b_unbootable]}"
+}
+
+cmd_slots() {
+  local mode=${1:-} k json
+  [[ -z $mode || $mode == --json || $mode == --service ]] || die "slots takes --json or --service"
+  if [[ $mode == --service ]]; then
+    # The boot-time check: harmless whatever happens, the verdict at
+    # warning level in the journal when it needs a look, and a JSON copy
+    mkdir -p "$RUN" 2>/dev/null || true
+    if ! load_slots 2>"$RUN/ingot-slots.err"; then
+      printf '<4>omamobile-ingot-boot: cannot read the slot flags: %s\n' "$(cat "$RUN/ingot-slots.err" 2>/dev/null)"
+      rm -f "$RUN/ingot-slots.json" "$RUN/ingot-slots.err"
+      return 1
+    fi
+    rm -f "$RUN/ingot-slots.err"
+    slots_verdict
+    json=$(slots_json)
+    printf '%s\n' "$json" > "$RUN/ingot-slots.json.new" && mv "$RUN/ingot-slots.json.new" "$RUN/ingot-slots.json"
+    if [[ $VERDICT == ok ]]; then printf '<6>%s\n' "$TEXT"; else printf '<4>%s\n' "$TEXT"; fi
+    return "$EXIT"
+  fi
+  load_slots || exit 1
+  slots_verdict
+  if [[ $mode == --json ]]; then
+    slots_json
+  else
+    printf '%-8s %-7s %-9s %-6s %-11s %s\n' slot active priority tries successful unbootable
+    for k in a b; do
+      printf '%-8s %-7s %-9s %-6s %-11s %s\n' "boot_$k" "${S[${k}_active]}" "${S[${k}_priority]}" "${S[${k}_tries]}" \
+        "${S[${k}_successful]}" "${S[${k}_unbootable]}"
+    done
+    echo "(GPT of /dev/${S[disk]}, the flags as the bootloader's reference source defines them; not yet confirmed on a phone)"
+    echo "$TEXT"
+  fi
+  exit "$EXIT"
+}
+
+# ---------------------------------------------------------------- the other commands
+# Does slot A still hold what current/ records?
+current_state() {
+  local p size want
+  [[ -f $STATE/current/SIZES && -f $STATE/current/SHA256SUMS ]] || { echo none; return 0; }
+  while read -r p size; do
+    want=$(awk -v f="$p.img" '$2 == f {print $1}' "$STATE/current/SHA256SUMS")
+    [[ $size =~ ^[0-9]+$ && -n $want && -n ${PART_NODE[$p]:-} ]] || { echo stale; return 0; }
+    [[ $(sha_head "${PART_NODE[$p]}" "$size") == "$want" ]] || { echo stale; return 0; }
+  done < "$STATE/current/SIZES"
+  echo yes
+}
+
+cmd_status() {
+  local p s board slot
+  board=$(tr '\0' '\n' < "$PROC/device-tree/compatible" 2>/dev/null | head -1 || true)
+  slot=$(grep -ohE 'androidboot\.slot_suffix *= *"?_[ab]' "$PROC/bootconfig" "$PROC/cmdline" 2>/dev/null | head -1 | grep -oE '_[ab]$' || true)
+  echo "board:       ${board:-unknown}$([[ $board == "$BOARD" ]] || echo " (not the Saga)")"
+  echo "boot slot:   ${slot:-not named}"
+  echo "running:     $UNAME_R"
+  echo "auto write:  $(conf_auto_write 2>/dev/null || echo "unreadable") ($CONF)"
+  echo "image set:   $(head -1 "$IMAGES_DEFAULT/RELEASE" 2>/dev/null || echo none) ($IMAGES_DEFAULT)"
+  for p in $TARGETS; do
+    if ( find_partition "$p" >/dev/null 2>&1 ); then
+      find_partition "$p"
+      s=writable
+      [[ $(cat "${PART_SYS[$p]}/ro" 2>/dev/null) == 0 ]] || s="read-only (storage guard)"
+      echo "partition:   $p ${PART_NODE[$p]##*/} ${PART_BYTES[$p]} bytes, $s"
+    else
+      echo "partition:   $p not found, or its name is not unique"
+    fi
+  done
+  case $(current_state) in
+    yes) echo "slot A:      $(cat "$STATE/current/RELEASE") (written by this tool)" ;;
+    stale) echo "slot A:      changed outside omamobile-ingot-boot (last written here: $(cat "$STATE/current/RELEASE" 2>/dev/null))" ;;
+    *) echo "slot A:      not written by this tool" ;;
+  esac
+  echo "previous:    $(cat "$STATE/previous/RELEASE" 2>/dev/null || echo none)$([[ -d $STATE/previous ]] && echo " ($(awk '{print $1}' "$STATE/previous/SIZES" 2>/dev/null | tr '\n' ' ')booted: $(cat "$STATE/previous/BOOTED" 2>/dev/null || echo unknown))")"
+  [[ ! -e $STATE/incomplete ]] || echo "INCOMPLETE:  $(cat "$STATE/incomplete") (omamobile-ingot-boot rollback before restarting)"
+  if ( load_slots >/dev/null 2>&1 ); then
+    load_slots
+    slots_verdict
+    echo "slots:       A active ${S[a_active]} tries ${S[a_tries]} successful ${S[a_successful]}; B successful ${S[b_successful]} unbootable ${S[b_unbootable]}"
+    echo "             $TEXT"
+  else
+    echo "slots:       unreadable (omamobile-ingot-boot slots says why)"
+  fi
+}
+
+# Read-only: everything a write checks, without writing
+cmd_preflight() {
+  local json=0 out problem="" a
+  for a in "$@"; do
+    case $a in --json) json=1 ;; *) die "preflight takes --json" ;; esac
+  done
+  out=$( (
+    check_board
+    check_slot
+    for p in $TARGETS; do find_partition "$p"; check_writable "$p"; done
+    # shellcheck disable=SC2086 # the three names
+    check_images "${IMAGES:-$IMAGES_DEFAULT}" $TARGETS
+    why=$(battery_blocker 2>/dev/null)
+    [[ -z $why ]] || refuse "$why"
+    need=0
+    for p in $TARGETS; do need=$((need + PART_BYTES[$p])); done
+    avail=$(free_bytes "$STATE")
+    ((avail > need + SPACE_MARGIN)) || refuse "not enough space in $STATE to save slot A ($((need / 1048576)) MiB needed, $((avail / 1048576)) MiB free)"
+    echo "release=$RELEASE"
+  ) 2>&1) || problem=$(grep -m1 '^error:' <<<"$out" | sed 's/^error: omamobile-ingot-boot: //; s/^not writing slot A: //')
+  a=$(sed -n 's/^release=//p' <<<"$out")
+  if ((json)); then
+    python3 -I -c 'import json, sys; print(json.dumps({"ok": not sys.argv[1], "problem": sys.argv[1], "release": sys.argv[2]}, sort_keys=True))' "$problem" "$a"
+  elif [[ -n $problem ]]; then
+    echo "not ready: $problem"
+  else
+    echo "ready: a write of $a would be allowed"
+  fi
+  [[ -z $problem ]]
+}
+
+# /etc/omamobile/ingot-boot.conf: AUTO_WRITE=yes|no (default no). Data,
+# never sourced; anything else in it is an error.
+conf_auto_write() {
+  local line n=0 v=no
+  if [[ -f $CONF ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      n=$((n + 1))
+      [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+      if [[ $line =~ ^AUTO_WRITE=\"?(yes|no)\"?$ ]]; then
+        v=${BASH_REMATCH[1]}
+      else
+        echo "error: omamobile-ingot-boot: $CONF:$n: expected AUTO_WRITE=yes|no, got '$line'" >&2
+        return 1
+      fi
+    done < "$CONF"
+  fi
+  echo "$v"
+}
+
+cmd_hook() {
+  local v
+  v=$(conf_auto_write) || die "$CONF is not readable as AUTO_WRITE=yes|no: slot A left alone"
+  if [[ $v != yes ]]; then
+    say "Slot A left alone: $CONF does not say AUTO_WRITE=yes (write by hand: sudo omamobile-ingot-boot write)"
+    return 0
+  fi
+  YES=1
+  do_write write
+}
+
+usage() { sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'; }
+
+DRY_RUN=0 YES=0 BOOT_ONLY=0 IMAGES=
+abs_images() { if [[ -n $IMAGES && $IMAGES != /* ]]; then IMAGES=$PWD/$IMAGES; fi; }
+main() {
+  local cmd=${1:-} rest=()
+  (($#)) && shift
+  case $cmd in
+    -h|--help|help) usage; return 0 ;;
+    status) (($# == 0)) || die "status takes no arguments"; cmd_status ;;
+    slots) (($# <= 1)) || die "slots takes --json or --service"; cmd_slots "$@" ;;
+    preflight)
+      while (($#)); do
+        case $1 in
+          --images) IMAGES=${2:?--images needs a directory}; shift ;;
+          *) rest+=("$1") ;;
+        esac
+        shift
+      done
+      abs_images
+      cmd_preflight ${rest[@]+"${rest[@]}"} ;;
+    write|rollback)
+      while (($#)); do
+        case $1 in
+          --dry-run) DRY_RUN=1 ;;
+          --yes) YES=1 ;;
+          --boot-only) [[ $cmd == write ]] || die "--boot-only is for write"; BOOT_ONLY=1 ;;
+          --images) [[ $cmd == write ]] || die "--images is for write"; IMAGES=${2:?--images needs a directory}; shift ;;
+          *) die "unknown argument $1" ;;
+        esac
+        shift
+      done
+      abs_images
+      do_write "$cmd" ;;
+    hook) (($# == 0)) || die "hook takes no arguments"; cmd_hook ;;
+    *) usage >&2; exit 64 ;;
+  esac
+}
+main "$@"
