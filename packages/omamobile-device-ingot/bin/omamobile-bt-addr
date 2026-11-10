@@ -1,0 +1,44 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Give the Saga's Bluetooth controller (WCN6855 on UART20, hci_uart QCA) a
+# stable address. The bootloader gives our device tree none
+# (local-bd-address), so the controller registers as unconfigured,
+# missing its public address, and stays off until it gets one. The address
+# is made on the phone, from /etc/machine-id: locally administered and
+# unicast, the same at every boot, and different on every phone. It is
+# never stored or printed.
+#   omamobile-bt-addr hciN   (started by udev through omamobile-bt-addr@.service)
+#
+# On an unconfigured controller, Set Public Address is the way to
+# configure it, and needs no power-on (AGENTS.md's power-on-first rule is
+# for a configured controller, whose index the kernel withdrew when its
+# address was set before it had ever been powered). A controller that
+# comes up configured already has an address and is left alone.
+set -euo pipefail
+hci=${1:?Usage: omamobile-bt-addr hciN}
+index=${hci#hci}
+[[ $index =~ ^[0-9]+$ ]] || { echo "not a controller: $hci" >&2; exit 1; }
+machine_id=${OMAMOBILE_MACHINE_ID:-/etc/machine-id}
+btmgmt=${OMAMOBILE_BTMGMT:-btmgmt}
+log() { echo "omamobile-bt-addr: $hci: $*"; }
+
+# hciN appears before hci_qca has downloaded the firmware and NVM; mgmt
+# reports its options only after that.
+need=''
+for ((i = 0; i < ${OMAMOBILE_BT_WAIT:-60}; i++)); do
+  cfg=$("$btmgmt" --index "$index" config 2> /dev/null || true)
+  if [[ $cfg == *"missing options:"*public-address* ]]; then need=1; break; fi
+  if [[ $cfg == *"missing options:"* ]]; then log "configured already, address left as it is"; exit 0; fi
+  sleep 0.5
+done
+[[ -n $need ]] || { log "never reported its configuration: left alone"; exit 0; }
+
+id=$(< "$machine_id") || { log "no $machine_id: left unconfigured"; exit 0; }
+[[ $id =~ ^[0-9a-f]{32}$ ]] || { log "$machine_id is not a machine id: left unconfigured"; exit 0; }
+h=$(printf 'omamobile-bt-addr:%s' "$id" | sha256sum)
+# First octet: locally administered (bit 1 set), unicast (bit 0 clear).
+addr=$(printf '%02X:%s:%s:%s:%s:%s' $(((16#${h:0:2} & 0xfc) | 0x02)) \
+  "${h:2:2}" "${h:4:2}" "${h:6:2}" "${h:8:2}" "${h:10:2}")
+addr=${addr^^}
+"$btmgmt" --index "$index" public-addr "$addr" > /dev/null || { log "setting the address failed"; exit 1; }
+log "set a stable address derived from the machine id"

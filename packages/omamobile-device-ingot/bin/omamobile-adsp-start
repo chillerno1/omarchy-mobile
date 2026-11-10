@@ -1,0 +1,66 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Start the Saga's ADSP once the root file system is mounted: its firmware
+# (qcom/sm8475/osom/ingot/adsp.mdt, the phone's own, installed by
+# omamobile-ingot-firmware) is on the root, not in the initramfs, so the
+# remoteproc's own start at probe finds nothing. The battery (qcom_battmgr
+# over pmic_glink) and audio depend on it.
+#   omamobile-adsp-start   (run by omamobile-adsp.service)
+#
+# It only ever writes "start" to an offline ADSP: a running one is left
+# alone, and one in any other state (crashed, booting) is reported and left
+# alone too. It never stops or restarts the ADSP. A hang marker in
+# /var/lib/omamobile is written and synced before the start and removed
+# after it, so if a start hangs or resets the phone, the next boot skips
+# the ADSP (remove the marker to try again).
+set -euo pipefail
+sysfs=${OMAMOBILE_SYSFS:-/sys}
+marker=${OMAMOBILE_ADSP_MARKER:-/var/lib/omamobile/adsp-start-pending}
+firmware=qcom/sm8475/osom/ingot/adsp.mdt
+log() { echo "omamobile-adsp: $*"; }
+
+if [[ -e $marker ]]; then
+  log "a previous ADSP start did not finish (a hang or a reset?): skipped this boot. Remove $marker to try again"
+  exit 0
+fi
+
+# The remoteproc whose firmware is ours, else the one named adsp. It
+# registers when its module probes, which can be after this unit starts.
+find_adsp() {
+  local d by_fw=() by_name=()
+  for d in "$sysfs"/class/remoteproc/remoteproc*; do
+    [[ -r $d/state ]] || continue
+    [[ -r $d/firmware && $(< "$d/firmware") == "$firmware" ]] && by_fw+=("$d")
+    [[ -r $d/name && $(< "$d/name") == adsp ]] && by_name+=("$d")
+  done
+  if ((${#by_fw[@]} == 1)); then rproc=${by_fw[0]}; return 0; fi
+  if ((${#by_fw[@]} == 0 && ${#by_name[@]} == 1)); then rproc=${by_name[0]}; return 0; fi
+  ((${#by_fw[@]} + ${#by_name[@]} > 1)) && { log "more than one remoteproc looks like the ADSP: left alone"; exit 1; }
+  return 1
+}
+rproc=''
+tries=${OMAMOBILE_ADSP_WAIT:-60}
+for ((i = 0; i < tries; i++)); do
+  find_adsp && break
+  sleep 0.5
+done
+[[ -n $rproc ]] || { log "no ADSP remoteproc appeared: nothing to do"; exit 0; }
+
+st=$(< "$rproc/state")
+case $st in
+  running) log "${rproc##*/} is running already"; exit 0 ;;
+  offline) ;;
+  *) log "${rproc##*/} is $st: left alone (this unit never restarts the ADSP)"; exit 0 ;;
+esac
+
+mkdir -p "${marker%/*}"
+: > "$marker"
+sync -f "$marker"
+if ! echo start > "$rproc/state"; then
+  rm -f "$marker"; sync -f "${marker%/*}"
+  log "${rproc##*/} refused to start (see the kernel log)"
+  exit 1
+fi
+rm -f "$marker"
+sync -f "${marker%/*}"
+log "${rproc##*/} is $(< "$rproc/state")"

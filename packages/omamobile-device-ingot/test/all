@@ -11,6 +11,7 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
 bash -n build || fail "build parses"
 bash -n install || fail "install parses"
+for f in bin/*; do bash -n "$f" || fail "$f parses"; done
 pass "scripts parse"
 
 grep -q '\.\./\.\.' build install && fail "build or install reaches outside the package directory"
@@ -55,14 +56,27 @@ for f in usr/bin/reboot-to \
          usr/lib/systemd/network/20-usb-gadget.network \
          usr/lib/systemd/logind.conf.d/10-omamobile-power-key.conf \
          usr/lib/NetworkManager/conf.d/10-omamobile-usb.conf \
+         usr/lib/NetworkManager/conf.d/20-omamobile-wifi-mac.conf \
+         usr/lib/modprobe.d/omamobile-wifi.conf \
+         usr/lib/environment.d/50-omamobile-libcamera.conf \
+         usr/lib/udev/rules.d/80-omamobile-bt-addr.rules \
+         usr/lib/systemd/system/omamobile-adsp.service \
+         usr/lib/systemd/system/omamobile-bt-addr@.service \
+         usr/bin/omamobile-ingot-firmware \
+         usr/bin/omamobile-adsp-start \
+         usr/bin/omamobile-bt-addr \
+         usr/share/omamobile/ingot/firmware.map \
          usr/share/omamobile/device.conf \
          usr/share/omamobile/device-ingot/version \
          usr/share/licenses/omamobile-device-ingot/LICENSE \
          etc/pacman.d/omamobile-mirrorlist; do
   [[ -f $tmp/root/$f ]] || fail "install stages $f"
 done
-grep -q 'KERNEL=="sda", MODE="0000"' "$tmp/root/usr/lib/udev/rules.d/10-omamobile-storage.rules" \
-  || fail "the whole-disk node is made inaccessible"
+# sda (the main LUN) and, since 0.1.4, sde (slot A's boot LUN, which a
+# later initramfs leaves writable at the disk level) lose their whole-disk
+# nodes to users and desktop tools.
+grep -q 'KERNEL=="sda|sde", MODE="0000"' "$tmp/root/usr/lib/udev/rules.d/10-omamobile-storage.rules" \
+  || fail "the whole-disk nodes of sda and sde are made inaccessible"
 grep -q 'ID_PART_ENTRY_NAME}!="userdata"' "$tmp/root/usr/lib/udev/rules.d/10-omamobile-storage.rules" \
   || fail "userdata is the only partition desktop tools may see"
 grep -q 'KERNEL=="sd\[a-z\]\[0-9\]\*"' "$tmp/root/usr/lib/udev/rules.d/10-omamobile-storage.rules" \
@@ -93,4 +107,323 @@ for absent in usr/bin/omamobile-boot-success usr/bin/omamobile-bootctl \
               usr/lib/systemd/logind.conf.d/10-omamobile-lid.conf; do
   [[ ! -e $tmp/root/$absent ]] || fail "install includes $absent"
 done
-pass "install stages the udev rule, the USB link, and the mirrorlist, and nothing that marks a slot or starts hardware"
+pass "install stages the udev rule, the USB link, and the mirrorlist, and nothing that marks a slot or starts the modem, Wi-Fi bring-up or a camera"
+
+# --- 0.1.4: the phone's own firmware, the ADSP, Bluetooth, Wi-Fi policy ---
+r=$tmp/root
+[[ -z $(find "$r/usr/lib/firmware" -type f 2>/dev/null) ]] || fail "the package stages no firmware (the phone's own is installed on the phone)"
+pass "no firmware in the package"
+
+[[ $(readlink "$r/usr/lib/systemd/system/multi-user.target.wants/omamobile-adsp.service") == ../omamobile-adsp.service ]] \
+  || fail "the ADSP unit is enabled by a vendor wants link"
+for u in "$r"/usr/lib/systemd/system/omamobile-*.service; do
+  grep -qx 'Type=oneshot' "$u" || fail "${u##*/} is a oneshot"
+  grep -q '^TimeoutStartSec=[0-9]' "$u" || fail "${u##*/} has a start timeout, so it can't hold up boot"
+  grep -q '^Requires=\|^RequiredBy=\|^ExecStop=' "$u" && fail "${u##*/} has no Requires, RequiredBy or ExecStop"
+done
+adsp=$r/usr/lib/systemd/system/omamobile-adsp.service
+grep -qx 'ConditionPathExists=/usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.mdt' "$adsp" \
+  || fail "the ADSP unit is inert until its firmware is installed"
+grep -q '^After=.*local-fs.target' "$adsp" || fail "the ADSP starts once the root file system is mounted"
+grep -q '^Before=bluetooth.service' "$r/usr/lib/systemd/system/omamobile-bt-addr@.service" \
+  || fail "the Bluetooth address is set before bluetoothd starts"
+grep -q 'DRIVERS=="hci_uart_qca".*omamobile-bt-addr@%k.service' "$r/usr/lib/udev/rules.d/80-omamobile-bt-addr.rules" \
+  || fail "udev starts the address unit for the QCA controller"
+[[ -z $(find "$r/usr/lib/systemd" -path '*.wants/*' -name 'omamobile-bt-addr*') ]] || fail "the address unit is started by udev only"
+pass "the ADSP and Bluetooth units are oneshots with timeouts, inert without firmware or hardware"
+
+wifi=$r/usr/lib/modprobe.d/omamobile-wifi.conf
+for o in dbg_wcn_cbc=1 dbg_skip_wmm=1 dbg_no_p2p=1; do
+  grep -qx "options ath11k $o" "$wifi" || fail "ath11k gets $o"
+done
+# Every option shipped exists in the ingot kernel, when that tree is here.
+kdir=${OMAMOBILE_INGOT_KERNEL:-$HOME/omamobile-kernel/wt-ingot}
+if [[ -d $kdir/drivers/net/wireless/ath/ath11k ]]; then
+  while read -r _ mod opt; do
+    [[ $mod == ath11k ]] || fail "only ath11k options: $mod"
+    grep -rqE "module_param(_named)?\\(${opt%%=*}," "$kdir/drivers/net/wireless/ath/ath11k" \
+      || fail "ath11k has no parameter ${opt%%=*} in $kdir"
+  done < <(grep '^options ' "$wifi")
+  pass "every ath11k option exists in the ingot kernel tree"
+fi
+grep -qx 'match-device=driver:ath11k_pci' "$r/usr/lib/NetworkManager/conf.d/20-omamobile-wifi-mac.conf" \
+  && grep -qx 'wifi.cloned-mac-address=stable' "$r/usr/lib/NetworkManager/conf.d/20-omamobile-wifi-mac.conf" \
+  || fail "Wi-Fi on ath11k uses a stable generated address"
+env=$r/usr/lib/environment.d/50-omamobile-libcamera.conf
+grep -qx 'LIBCAMERA_SOFTISP_MODE=cpu' "$env" || fail "the software ISP runs on the CPU"
+grep -qE '^[A-Z_]+=$' "$env" && fail "environment.d can't unset a variable: no empty values"
+pass "modprobe, NetworkManager and environment.d policy"
+
+# README names every staged file.
+while IFS= read -r f; do
+  grep -qF "${f##*/}" README.md || fail "README.md names ${f##*/}"
+done < <(cd "$r" && find . \( -type f -o -type l \) ! -path ./usr/share/licenses/\*)
+pass "the README names every staged file"
+
+# --- omamobile-ingot-firmware against a stand-in partition ------------------
+fw=$PWD/bin/omamobile-ingot-firmware
+"$fw" --help | grep -q 'omamobile-ingot-firmware plan' || fail "--help prints the usage"
+f=$tmp/fw
+mkdir -p "$f/sys/class/block/sda5" "$f/sys/class/block/sda6" "$f/sys/class/block/sda"
+printf 'MAJOR=8\nMINOR=5\nDEVNAME=sda5\nDEVTYPE=partition\nPARTN=5\nPARTNAME=modem_a\n' > "$f/sys/class/block/sda5/uevent"
+echo 1 > "$f/sys/class/block/sda5/ro"
+printf 'MAJOR=8\nMINOR=6\nDEVNAME=sda6\nDEVTYPE=partition\nPARTNAME=modem_b\n' > "$f/sys/class/block/sda6/uevent"
+echo 1 > "$f/sys/class/block/sda6/ro"
+printf 'MAJOR=8\nMINOR=0\nDEVNAME=sda\nDEVTYPE=disk\n' > "$f/sys/class/block/sda/uevent"
+echo '22 1 259:3 / / rw,relatime - ext4 /dev/sda20 rw' > "$f/mountinfo"
+# A made-up image/ tree: ELF magic and random bytes, nothing from a phone.
+s=$f/src; mkdir -p "$s/IMAGE/wlan" "$s/verinfo"
+elf() { { printf '\177ELF'; head -c "$2" /dev/urandom; } > "$1"; }
+elf "$s/IMAGE/ADSP.MDT" 200
+for i in 0 1 2 3; do head -c $((100 + i)) /dev/urandom > "$s/IMAGE/ADSP.B0$i"; done
+elf "$s/IMAGE/a730_zap.mdt" 64
+for i in 0 1 2; do head -c 40 /dev/urandom > "$s/IMAGE/a730_zap.b0$i"; done
+head -c 300 /dev/urandom > "$s/IMAGE/wlan/amss20.bin"
+head -c 30 /dev/urandom > "$s/IMAGE/wlan/m3.bin"
+elf "$s/IMAGE/wlan/bdwlang.elf" 1001
+head -c 10 /dev/urandom > "$s/verinfo/ver_info.txt"
+fr=$f/root; mkdir -p "$fr/usr/share/omamobile/ingot"
+cp share/firmware.map "$fr/usr/share/omamobile/ingot/"
+klog=$f/klog; : > "$klog"
+export OMAMOBILE_INGOT_FW_ROOT=$fr OMAMOBILE_INGOT_FW_SYSFS=$f/sys \
+  OMAMOBILE_INGOT_FW_MOUNTINFO=$f/mountinfo OMAMOBILE_INGOT_FW_SOURCE=$s \
+  OMAMOBILE_INGOT_FW_KLOG=$klog
+ingot_fw() { "$fw" "$@" > "$f/out" 2>&1; }
+refuses() { # WHY PATTERN ARGS...
+  local why=$1 pat=$2; shift 2
+  if ingot_fw "$@"; then fail "refuses: $why"; fi
+  grep -q -- "$pat" "$f/out" || { cat "$f/out" >&2; fail "refuses: $why (says '$pat')"; }
+}
+snapshot() { (cd "$fr" && find . -printf '%p %s %m\n' | sort); }
+
+before=$(snapshot)
+ingot_fw plan || { cat "$f/out" >&2; fail "plan runs"; }
+[[ $(snapshot) == "$before" ]] || fail "plan writes nothing"
+grep -q 'found     IMAGE/ADSP.MDT (+ 4 segments) -> /usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.mdt' "$f/out" || fail "plan finds the split ADSP image, case-insensitively, with its segments"
+grep -q 'found     IMAGE/a730_zap.mdt (+ 3 segments) -> /usr/lib/firmware/qcom/sm8475/osom/ingot/a730_zap.mbn' "$f/out" || fail "plan finds the split zap shader for the .mbn name"
+grep -q 'found     IMAGE/wlan/amss20.bin -> /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/amss.bin' "$f/out" || fail "plan finds amss20.bin in a subfolder"
+grep -q 'missing   /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/regdb.bin' "$f/out" || fail "plan reports a missing source"
+grep -q 'board-2.bin: skipped, no wifi_board_name' "$f/out" || fail "plan skips the board file without a name"
+grep -q "failed to fetch board data" "$f/out" || fail "plan explains how to read the board name"
+grep -q '  IMAGE/wlan/bdwlang.elf' "$f/out" || fail "plan lists what is under image/"
+grep -q 'ver_info' "$f/out" && fail "plan lists only image/"
+pass "plan: found, missing and skipped entries, and nothing written"
+
+before=$(snapshot)
+ingot_fw install --dry-run || { cat "$f/out" >&2; fail "install --dry-run runs"; }
+[[ $(snapshot) == "$before" ]] || fail "install --dry-run writes nothing"
+grep -q '  new       /usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.b03' "$f/out" || fail "dry run names each segment"
+pass "install --dry-run writes nothing"
+
+ingot_fw install || { cat "$f/out" >&2; fail "install runs"; }
+q=$fr/usr/lib/firmware/qcom/sm8475/osom/ingot w=$fr/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1
+cmp -s "$s/IMAGE/ADSP.MDT" "$q/adsp.mdt" && cmp -s "$s/IMAGE/ADSP.B03" "$q/adsp.b03" || fail "the ADSP set is copied"
+cmp -s "$s/IMAGE/a730_zap.mdt" "$q/a730_zap.mbn" && cmp -s "$s/IMAGE/a730_zap.b02" "$q/a730_zap.b02" \
+  || fail "the zap set is copied under the names the loader asks for"
+cmp -s "$s/IMAGE/wlan/amss20.bin" "$w/amss.bin" && cmp -s "$s/IMAGE/wlan/m3.bin" "$w/m3.bin" || fail "the Wi-Fi firmware is copied"
+[[ ! -e $w/board-2.bin && ! -e $w/regdb.bin ]] || fail "no board file without a name, nothing for a missing source"
+for x in "$q"/* "$w"/*; do [[ $(stat -c %a "$x") == 644 ]] || fail "${x##*/} is 0644"; done
+[[ -z $(find "$fr/usr/lib/firmware" -name '.*') ]] || fail "no temporary files are left"
+rec=$fr/var/lib/omamobile/ingot-firmware/installed.sha256
+[[ $(grep -c . "$rec") == 11 ]] || fail "the record holds the 11 installed files"
+grep -q "^$(sha256sum < "$s/IMAGE/ADSP.B00" | cut -d' ' -f1)  /usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.b00$" "$rec" \
+  || fail "the record holds each file's sha256 and path"
+ingot_fw status || { cat "$f/out" >&2; fail "status is clean after an install"; }
+grep -q 'ok        /usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.mdt' "$f/out" || fail "status checks each recorded file"
+grep -q 'absent    /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/board-2.bin' "$f/out" || fail "status names what is not installed"
+pass "install copies the sets 0644 and records their checksums; status agrees"
+
+ingot_fw install || fail "a second install runs"
+grep -q 'Installed 0 file' "$f/out" || fail "a second install changes nothing"
+echo changed >> "$w/m3.bin"
+if ingot_fw status; then fail "status fails on a changed file"; fi
+grep -q 'changed   /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/m3.bin' "$f/out" || fail "status names the changed file"
+if ingot_fw install; then fail "install reports a kept file"; fi
+grep -q 'keep      /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/m3.bin' "$f/out" || fail "a file changed after install is kept"
+grep -q changed "$w/m3.bin" || fail "the changed file is untouched"
+ingot_fw install --replace || fail "install --replace runs"
+cmp -s "$s/IMAGE/wlan/m3.bin" "$w/m3.bin" || fail "--replace overwrites it"
+pass "a file changed or copied by hand is kept unless --replace"
+
+# A newer image in the partition replaces a file this tool installed.
+head -c 31 /dev/urandom > "$s/IMAGE/wlan/m3.bin"
+ingot_fw install || fail "an update runs"
+grep -q 'update    /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/m3.bin' "$f/out" && cmp -s "$s/IMAGE/wlan/m3.bin" "$w/m3.bin" \
+  || fail "a file this tool installed is updated"
+pass "a file this tool installed is updated from a newer source"
+
+# The board file, from the board data and a board name set in /etc.
+name='bus=pci,vendor=17cb,device=1103,subsystem-vendor=aaaa,subsystem-device=bbbb,qmi-chip-id=2,qmi-board-id=255,variant=Test_Board'
+mkdir -p "$fr/etc/omamobile"
+echo "wifi_board_name=$name" > "$fr/etc/omamobile/ingot-firmware.conf"
+echo hand-made > "$w/board-2.bin"
+if ingot_fw install; then fail "install reports the kept hand-made board file"; fi
+grep -qx hand-made "$w/board-2.bin" || fail "a hand-made board-2.bin is kept without --replace"
+ingot_fw install --replace || { cat "$f/out" >&2; fail "install --replace builds the board file"; }
+# Parse it as ath11k_core_fetch_board_data_api_n and ..._parse_bd_ie_board do.
+python3 -I - "$w/board-2.bin" "$name" "$s/IMAGE/wlan/bdwlang.elf" <<'PY' || fail "board-2.bin parses as ath11k's board container and holds the board data under the name"
+import struct, sys
+data = open(sys.argv[1], "rb").read(); name = sys.argv[2].encode(); bdf = open(sys.argv[3], "rb").read()
+magic = b"QCA-ATH11K-BOARD\0"
+assert data.startswith(magic)
+off = (len(magic) + 3) & ~3; found = None
+assert len(data) % 4 == 0
+while len(data) - off > 8:
+    ie_id, ie_len = struct.unpack_from("<II", data, off); off += 8
+    assert len(data) - off >= (ie_len + 3) & ~3
+    if ie_id == 0:
+        b, end, match = off, off + ie_len, False
+        while end - b > 8:
+            sid, slen = struct.unpack_from("<II", data, b); b += 8
+            assert end - b >= (slen + 3) & ~3
+            if sid == 0 and data[b:b + slen] == name: match = True
+            elif sid == 1 and match: found = data[b:b + slen]
+            b += (slen + 3) & ~3
+    off += (ie_len + 3) & ~3
+assert found == bdf, "no board data under the name"
+PY
+grep -q "^$(sha256sum < "$w/board-2.bin" | cut -d' ' -f1)  /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/board-2.bin$" "$rec" \
+  || fail "the board file is recorded"
+pass "board-2.bin: ath11k's container around the phone's board data, under the name from /etc"
+
+echo 'wifi_board_name=bus=pci;rm -rf /' > "$fr/etc/omamobile/ingot-firmware.conf"
+refuses "a board name that isn't one" "is not a board name" plan
+rm "$fr/etc/omamobile/ingot-firmware.conf"
+
+# The board-name hint reads the kernel log and the PCI device.
+mkdir -p "$f/sys/bus/pci/devices/0000:01:00.0/of_node"
+p=$f/sys/bus/pci/devices/0000:01:00.0
+echo 0x17cb > "$p/vendor"; echo 0x1103 > "$p/device"
+echo 0x1234 > "$p/subsystem_vendor"; echo 0x5678 > "$p/subsystem_device"
+printf 'Test_Board\0' > "$p/of_node/qcom,calibration-variant"
+cat > "$klog" <<'LOG'
+[    9.1] ath11k_pci 0000:01:00.0: chip_id 0x2 chip_family 0xb board_id 0xff soc_id 0x400c0210
+[    9.2] ath11k_pci 0000:01:00.0: failed to fetch board data for bus=pci,vendor=17cb,device=1103,subsystem-vendor=1234,subsystem-device=5678,qmi-chip-id=2,qmi-board-id=255,variant=Test_Board from ath11k/WCN6855/hw2.1/board-2.bin
+LOG
+ingot_fw plan || fail "plan runs with a log"
+grep -q 'from this boot.s log: bus=pci,vendor=17cb,device=1103,subsystem-vendor=1234,subsystem-device=5678,qmi-chip-id=2,qmi-board-id=255,variant=Test_Board$' "$f/out" \
+  || fail "plan shows the name from the kernel log"
+grep -q '    bus=pci,vendor=17cb,device=1103,subsystem-vendor=1234,subsystem-device=5678,qmi-chip-id=2,qmi-board-id=255,variant=Test_Board$' "$f/out" \
+  || fail "plan builds the same name from the chip ids, the PCI device and the device tree"
+pass "plan shows how to find the board name"
+
+# Ambiguous and non-ELF sources are reported, the others still installed.
+cp "$s/IMAGE/wlan/amss20.bin" "$s/IMAGE/wlan/AMSS20.BIN.bak"
+mkdir -p "$s/IMAGE/other"; cp "$s/IMAGE/wlan/amss20.bin" "$s/IMAGE/other/amss20.bin"
+if ingot_fw plan; then fail "plan reports an ambiguous source"; fi
+grep -q 'ambiguous image/\*/amss20.bin matches 2 files' "$f/out" || fail "an ambiguous source is named"
+grep -q 'found     IMAGE/ADSP.MDT' "$f/out" || fail "an ambiguous source doesn't stop the others"
+rm -r "$s/IMAGE/other" "$s/IMAGE/wlan/AMSS20.BIN.bak"
+echo 'not an image' > "$s/IMAGE/ADSP.MDT"
+if ingot_fw plan; then fail "plan reports a non-ELF image"; fi
+grep -q 'IMAGE/ADSP.MDT, but it is not an ELF image' "$f/out" || fail "a non-ELF image is skipped"
+elf "$s/IMAGE/ADSP.MDT" 200
+pass "ambiguous and broken sources are reported, never fatal for the others"
+
+# A single image installs under the name the device tree asks for.
+mkdir -p "$f/src2/image"; elf "$f/src2/image/adsp.mbn" 500
+OMAMOBILE_INGOT_FW_SOURCE=$f/src2 ingot_fw install --replace || true
+cmp -s "$f/src2/image/adsp.mbn" "$q/adsp.mdt" || fail "a single adsp.mbn installs as adsp.mdt"
+pass "a single image installs under the DT's name"
+
+# Refusals: the partition, the map, the options.
+mv "$f/sys/class/block/sda5/uevent" "$f/uevent.saved"
+refuses "no modem_a" "exactly one partition named modem_a, found 0" plan
+mv "$f/uevent.saved" "$f/sys/class/block/sda5/uevent"
+mkdir -p "$f/sys/class/block/sdb7"; cp "$f/sys/class/block/sda5/uevent" "$f/sys/class/block/sdb7/uevent"
+refuses "two partitions named modem_a" "found 2" plan
+rm -r "$f/sys/class/block/sdb7"
+echo 0 > "$f/sys/class/block/sda5/ro"
+refuses "a writable modem_a" "is not read-only" install
+echo 1 > "$f/sys/class/block/sda5/ro"
+echo '40 22 8:5 / /mnt ro,relatime - vfat /dev/sda5 ro' >> "$f/mountinfo"
+refuses "a mounted modem_a" "mounted already" plan
+echo '22 1 259:3 / / rw,relatime - ext4 /dev/sda20 rw' > "$f/mountinfo"
+m=$fr/usr/share/omamobile/ingot/firmware.map; cp "$m" "$f/map.saved"
+echo 'image/x.bin|/usr/lib/firmware/x.bin|outside' >> "$m"
+refuses "a destination outside the two folders" "is outside" plan
+cp "$f/map.saved" "$m"; echo 'image/x.bin|/usr/lib/firmware/qcom/sm8475/osom/ingot/../../../../../etc/x|dots' >> "$m"
+refuses "a destination with .." "is outside" plan
+cp "$f/map.saved" "$m"; echo 'image/x.bin|/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/sub/x.bin|subfolder' >> "$m"
+refuses "a destination in a subfolder" "is outside" plan
+cp "$f/map.saved" "$m"; echo 'image/x.bin /usr/lib/firmware/x.bin' >> "$m"
+refuses "a line that isn't one" "not source-glob|destination|note" plan
+cp "$f/map.saved" "$m"; echo '../x.bin|/usr/lib/firmware/qcom/sm8475/osom/ingot/x.bin|up' >> "$m"
+refuses "a source outside the partition" "bad source" plan
+cp "$f/map.saved" "$m"
+refuses "an unknown option" "unknown option" install --force
+refuses "an unknown command" "unknown command" copy
+refuses "options to plan" "plan takes no options" plan --replace
+if ((EUID != 0)); then
+  OMAMOBILE_INGOT_FW_ROOT='' OMAMOBILE_INGOT_FW_MAP=$m refuses "install without root" "run as root" install
+  OMAMOBILE_INGOT_FW_ROOT='' OMAMOBILE_INGOT_FW_MAP=$m OMAMOBILE_INGOT_FW_SOURCE='' refuses "a real mount without root" "run as root" plan
+fi
+pass "omamobile-ingot-firmware refuses a missing, doubled, writable or mounted modem_a, a bad map line and bad options"
+unset OMAMOBILE_INGOT_FW_ROOT OMAMOBILE_INGOT_FW_SYSFS OMAMOBILE_INGOT_FW_MOUNTINFO OMAMOBILE_INGOT_FW_SOURCE OMAMOBILE_INGOT_FW_KLOG
+
+# --- omamobile-adsp-start against a stand-in remoteproc ---------------------
+a=$tmp/adsp; mkdir -p "$a/sys/class/remoteproc/remoteproc0" "$a/sys/class/remoteproc/remoteproc1"
+rp=$a/sys/class/remoteproc/remoteproc1
+echo cdsp > "$a/sys/class/remoteproc/remoteproc0/name"; echo offline > "$a/sys/class/remoteproc/remoteproc0/state"
+echo qcom/sm8475/osom/ingot/cdsp.mdt > "$a/sys/class/remoteproc/remoteproc0/firmware"
+echo adsp > "$rp/name"; echo qcom/sm8475/osom/ingot/adsp.mdt > "$rp/firmware"
+adsp_start() { OMAMOBILE_SYSFS=$a/sys OMAMOBILE_ADSP_MARKER=$a/marker OMAMOBILE_ADSP_WAIT=1 bin/omamobile-adsp-start > "$a/out" 2>&1; }
+echo offline > "$rp/state"
+adsp_start || fail "the ADSP start runs"
+[[ $(< "$rp/state") == start ]] || fail "an offline ADSP gets start"
+[[ $(< "$a/sys/class/remoteproc/remoteproc0/state") == offline ]] || fail "the other remoteproc is untouched"
+[[ ! -e $a/marker ]] || fail "the hang marker is removed after the start"
+for st in running crashed; do
+  echo "$st" > "$rp/state"
+  adsp_start || fail "the ADSP start runs on a $st ADSP"
+  [[ $(< "$rp/state") == "$st" ]] || fail "a $st ADSP is left alone (never restarted)"
+done
+echo offline > "$rp/state"; : > "$a/marker"
+adsp_start || fail "the ADSP start runs with a marker"
+[[ $(< "$rp/state") == offline ]] && grep -q 'did not finish' "$a/out" || fail "a hang marker skips the ADSP"
+rm "$a/marker"; rm -r "$rp"
+adsp_start || fail "no ADSP is not an error"
+grep -q 'no ADSP remoteproc' "$a/out" || fail "no ADSP is reported"
+pass "omamobile-adsp-start starts only an offline ADSP, once, behind a hang marker"
+
+# --- omamobile-bt-addr against a stand-in btmgmt -----------------------------
+b=$tmp/bt; mkdir -p "$b"
+cat > "$b/btmgmt" <<'SH'
+#!/bin/bash
+echo "$*" >> "$BT_LOG"
+case "$*" in
+  *config) cat "$BT_CONFIG" ;;
+esac
+SH
+chmod +x "$b/btmgmt"
+printf '0123456789abcdef0123456789abcdef\n' > "$b/machine-id"
+bt() { BT_LOG=$b/log BT_CONFIG=$b/config OMAMOBILE_BTMGMT=$b/btmgmt OMAMOBILE_MACHINE_ID=$b/machine-id OMAMOBILE_BT_WAIT=2 bin/omamobile-bt-addr "$@" > "$b/out" 2>&1; }
+printf 'hci0:\tUnconfigured controller\n\tsupported options: public-address\n\tmissing options: public-address\n' > "$b/config"
+: > "$b/log"; bt hci0 || fail "the address unit runs"
+set1=$(grep 'public-addr' "$b/log" || true)
+[[ $set1 =~ ^--index\ 0\ public-addr\ ([0-9A-F]{2})(:[0-9A-F]{2}){5}$ ]] || fail "an unconfigured controller gets an address ($set1)"
+(( (16#${BASH_REMATCH[1]} & 3) == 2 )) || fail "the address is locally administered and unicast"
+grep -qE '[0-9A-F]{2}(:[0-9A-F]{2}){5}' "$b/out" && fail "the address is not printed"
+: > "$b/log"; bt hci0; [[ $(grep public-addr "$b/log") == "$set1" ]] || fail "the address is the same at every boot"
+printf 'fedcba9876543210fedcba9876543210\n' > "$b/machine-id"
+: > "$b/log"; bt hci0; [[ $(grep public-addr "$b/log") != "$set1" ]] || fail "another phone gets another address"
+printf 'hci0:\tsupported options: public-address\n\tmissing options: \n' > "$b/config"
+: > "$b/log"; bt hci0 || fail "the address unit runs on a configured controller"
+grep -q public-addr "$b/log" && fail "a configured controller is left alone"
+printf 'hci0:\tUnconfigured controller\n\tmissing options: public-address\n' > "$b/config"
+echo not-an-id > "$b/machine-id"
+: > "$b/log"; bt hci0 || true; grep -q public-addr "$b/log" && fail "no address without a machine id"
+: > "$b/config"
+: > "$b/log"; bt hci0 || fail "a controller that never answers is not an error"
+grep -q public-addr "$b/log" && fail "nothing is set on a controller that never answered"
+bt hcix && fail "refuses a name that isn't a controller"
+pass "omamobile-bt-addr gives only an unconfigured controller a stable, local, unprinted address"
+
+if command -v systemd-analyze > /dev/null; then
+  # Missing binaries in the stand-in root are expected; unit syntax errors are not.
+  out=$(systemd-analyze verify --root="$r" "$r"/usr/lib/systemd/system/omamobile-adsp.service \
+        "$r/usr/lib/systemd/system/omamobile-bt-addr@hci0.service" 2>&1 || true)
+  bad=$(grep -vE 'is not executable|No such file|not found|Failed to prepare filename|Unit .* not found|bluetooth.service|Command .* is not executable' <<< "$out" | grep -E 'Unknown|Invalid|Failed|error' || true)
+  [[ -z $bad ]] || fail "systemd-analyze verify: $bad"
+  pass "systemd-analyze verify finds no unit errors"
+fi

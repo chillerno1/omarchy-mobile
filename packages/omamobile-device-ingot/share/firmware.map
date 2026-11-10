@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: MIT
+# What omamobile-ingot-firmware copies from the Saga's own modem_a
+# partition (a FAT file system holding Qualcomm's image/ tree) into the
+# firmware search path. Data, not code: the tool reads it and refuses a
+# line it can't parse. Nothing named here is in the repository or the
+# package; every file comes from the user's own phone.
+#
+#   source-glob|destination|note
+#
+# source-glob   a path relative to the partition root, matched without
+#               regard to case; * and ? match any characters (also /).
+#               It must match exactly one file: none is "missing", two or
+#               more is "ambiguous", and either is reported and skipped
+#               without stopping the others.
+# destination   the absolute path to install to, directly inside
+#               /usr/lib/firmware/qcom/sm8475/osom/ingot/ or
+#               /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/. Anything
+#               else is refused.
+# note          free text, shown by `plan`.
+#
+# Several lines may name the same destination: they are alternatives, and
+# the first whose source is found wins. A source ending in .mdt is a split
+# image and is copied with its .b00, .b01, ... segments (from the same
+# folder), renamed after the destination (a730_zap.mbn gets a730_zap.b00,
+# which is the name the kernel's loader asks for). A destination named
+# board-2.bin is not a copy: the source (the board data file) is wrapped
+# in ath11k's board container under the name wifi_board_name.
+#
+# The source names are unconfirmed: they are the names Qualcomm images of
+# this generation use, not yet read from a Saga. Run
+# `omamobile-ingot-firmware plan` on the phone, which lists what it finds
+# under image/, and correct the lines here (and drop this note) once the
+# owner has confirmed them.
+
+# The GPU's zap shader (the device tree asks msm for
+# qcom/sm8475/osom/ingot/a730_zap.mbn). Unconfirmed: split or single.
+image/a730_zap.mdt|/usr/lib/firmware/qcom/sm8475/osom/ingot/a730_zap.mbn|GPU zap shader, split image (installed under the .mbn name the DT asks for)
+image/a730_zap.mbn|/usr/lib/firmware/qcom/sm8475/osom/ingot/a730_zap.mbn|GPU zap shader, single image
+
+# The ADSP (battery through qcom_battmgr, audio): the DT asks the
+# remoteproc for qcom/sm8475/osom/ingot/adsp.mdt. A single adsp.mbn loads
+# under that name too (the loader reads the segments from the file itself
+# when they are inside it). Unconfirmed: split or single.
+image/adsp.mdt|/usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.mdt|ADSP firmware, split image
+image/adsp.mbn|/usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.mdt|ADSP firmware, single image
+
+# Wi-Fi: the WCN6855 hw2.1's mobile firmware, as overrides of
+# linux-firmware's laptop files (the kernel reads firmware/updates/ first).
+# Unconfirmed: the folder (image/ itself or a subfolder of it).
+image/amss20.bin|/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/amss.bin|Wi-Fi firmware (the vendor's amss20.bin, as amss.bin)
+image/*/amss20.bin|/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/amss.bin|Wi-Fi firmware, in a subfolder
+image/m3.bin|/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/m3.bin|Wi-Fi M3 firmware
+image/*/m3.bin|/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/m3.bin|Wi-Fi M3 firmware, in a subfolder
+image/regdb.bin|/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/regdb.bin|Wi-Fi regulatory database
+image/*/regdb.bin|/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/regdb.bin|Wi-Fi regulatory database, in a subfolder
+
+# The Wi-Fi board data (calibration for this board's antennas), wrapped in
+# board-2.bin. Once installed it hides linux-firmware's board-2.bin, which
+# has no entry for the Saga, so the name must be the one ath11k looks for.
+# Unconfirmed: the folder.
+image/bdwlang.elf|/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/board-2.bin|Wi-Fi board data, wrapped as board-2.bin
+image/*/bdwlang.elf|/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/board-2.bin|Wi-Fi board data, in a subfolder
+
+# The board name ath11k looks for in board-2.bin. It comes from the chip
+# (PCI ids, QMI chip and board ids) and the device tree's calibration
+# variant, so it can't be known offline: empty here, and the board file
+# is skipped until it is set. `plan` shows how to read it on the phone.
+# Set it in /etc/omamobile/ingot-firmware.conf (wifi_board_name=...),
+# which an update of this package leaves alone and which wins over this
+# line.
+wifi_board_name=

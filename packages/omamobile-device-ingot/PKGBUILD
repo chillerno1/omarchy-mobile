@@ -3,16 +3,20 @@
 pkgname=omamobile-device-ingot
 pkgver=$(cat "${startdir:-.}/version")
 pkgrel=1
-pkgdesc="Omarchy Mobile support for the Solana Mobile Saga (ingot): storage guard and USB networking"
+pkgdesc="Omarchy Mobile support for the Solana Mobile Saga (ingot): storage guard, USB networking, its own firmware, ADSP, Bluetooth and Wi-Fi policy"
 arch=(aarch64)
 url="https://github.com/derekross/omarchy-mobile"
 license=(MIT)
-depends=(bash systemd omamobile-keyring)
+# util-linux: mount, umount, flock and dmesg (omamobile-ingot-firmware);
+# bluez-utils: btmgmt (omamobile-bt-addr).
+depends=(bash coreutils findutils systemd util-linux bluez-utils omamobile-keyring)
 provides=(omamobile-device)
 conflicts=(omamobile-device)
 backup=(etc/pacman.d/omamobile-mirrorlist)
 install=omamobile-device-ingot.install
 makedepends=(gcc)
+# test/all parses the built board file the way ath11k does
+checkdepends=(python)
 
 build() {
   "$startdir/build" "$srcdir/build"
