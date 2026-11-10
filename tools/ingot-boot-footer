@@ -1,0 +1,89 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Give a Solana Mobile Saga boot image the AVB hash footer boot_a needs; on
+# the laptop only, it never connects to or writes a phone.
+#
+# Usage: tools/ingot-boot-footer IN_BOOT_IMG OUT_IMG
+#
+# IN_BOOT_IMG is a header v4 boot.img (tools/build-ingot-probe --arch);
+# OUT_IMG, which must not exist yet, is the same bytes followed by zero
+# padding and the footer, exactly boot_a's size (device/ingot/device.conf
+# BOOT_A_SIZE). When the bootloader boots boot_a from flash it runs AVB over
+# it, and where the slot's vbmeta chains boot a partition with no footer
+# leaves the phone in fastboot; unlocked, it accepts a footer signed with
+# any key, so AOSP's public test key signs it
+# (packages/omamobile-boot-update/avb). The salt is the input's sha256, so
+# the same input and avbtool give the same bytes. avbtool is $AVBTOOL, else
+# avbtool on PATH.
+set -euo pipefail
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+die() { echo "error: $*" >&2; exit 1; }
+case ${1:-} in
+  -h|--help) source "$ROOT/tools/lib/usage.sh"; usage_from_header "$0"; exit 0 ;;
+esac
+(($# == 2)) || die 'usage: tools/ingot-boot-footer IN_BOOT_IMG OUT_IMG'
+in=$1 out=$2
+conf=$ROOT/device/ingot/device.conf
+key=$ROOT/packages/omamobile-boot-update/avb/testkey_rsa4096.pem
+source_file=$ROOT/packages/omamobile-boot-update/avb/SOURCE
+
+# avbtool: a .py file (an AOSP checkout) runs under python3, as
+# bin/omamobile runs it; an installed avbtool runs as it is
+avbtool=${AVBTOOL:-$(command -v avbtool || true)}
+[[ -n $avbtool && -f $avbtool ]] || die 'no avbtool (install it, or set AVBTOOL to avbtool or avbtool.py)'
+avb() { if [[ $avbtool == *.py ]]; then python3 -I "$avbtool" "$@"; else "$avbtool" "$@"; fi; }
+
+# The partition size from the descriptor, so the footer lands at the end of
+# boot_a, where the bootloader looks for it
+size=$(sed -n 's/^BOOT_A_SIZE=\(0x[0-9a-f]*\|[0-9]*\)$/\1/p' "$conf")
+[[ -n $size ]] || die "$conf has no BOOT_A_SIZE (a number)"
+size=$((size))
+((size > 0 && size % 4096 == 0)) || die "BOOT_A_SIZE must be a positive multiple of 4096, not $size"
+
+# The key is the one SOURCE records, so a swapped file can't sign
+want=$(sed -n 's/^  sha256   \([0-9a-f]\{64\}\)$/\1/p' "$source_file")
+[[ -n $want ]] || die "$source_file records no sha256"
+[[ $(sha256sum < "$key" | cut -d' ' -f1) == "$want" ]] || die "$key does not match the sha256 in $source_file"
+
+[[ -f $in ]] || die "$in: no such file"
+[[ ! -e $out && ! -L $out ]] || die "$out already exists; choose a new name"
+# A header v4 boot image: the magic, then the version as a little-endian
+# u32 at offset 40. Anything else is not what boot_a holds.
+python3 -I - "$in" <<'PY' || exit 1
+import struct, sys
+with open(sys.argv[1], 'rb') as f:
+    head = f.read(44)
+if len(head) < 44 or head[:8] != b'ANDROID!':
+    sys.exit(f'error: {sys.argv[1]} is not an Android boot image (no ANDROID! magic)')
+version, = struct.unpack('<I', head[40:44])
+if version != 4:
+    sys.exit(f'error: {sys.argv[1]} is a header v{version} boot image; boot_a takes v4')
+PY
+in_size=$(stat -c %s "$in")
+max=$(avb add_hash_footer --partition_size "$size" --calc_max_image_size) || die 'avbtool could not compute the largest image'
+((in_size <= max)) || die "$in is $in_size bytes; with its footer, boot_a ($size bytes) holds at most $max"
+
+# Work on a copy beside OUT, so a failure leaves neither the input changed
+# nor a half-made OUT
+tmp=$(mktemp "$(dirname -- "$out")/.ingot-boot-footer.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+cp -- "$in" "$tmp"
+chmod 644 "$tmp"
+salt=$(sha256sum < "$in" | cut -d' ' -f1)
+# Rollback index 0 on purpose: the bootloader stores the highest index it
+# has booted, and one above stock's would lock stock's own images out of
+# the phone.
+avb add_hash_footer --image "$tmp" --partition_name boot --partition_size "$size" \
+  --algorithm SHA256_RSA4096 --key "$key" --salt "$salt" --rollback_index 0 \
+  || die 'avbtool could not add the footer'
+
+# What the bootloader will see: the whole partition, a footer it can parse
+# at its end, and the boot image itself unchanged in front
+[[ $(stat -c %s "$tmp") == "$size" ]] || die "the footed image is not $size bytes"
+info=$(avb info_image --image "$tmp") || die 'avbtool cannot read the footer back'
+grep -q '^Footer version:' <<<"$info" || die 'the footed image has no footer'
+grep -q 'Partition Name: *boot$' <<<"$info" || die 'the footer is not for the boot partition'
+cmp -s -n "$in_size" -- "$in" "$tmp" || die 'the footed image does not start with the input'
+# ln refuses an OUT that appeared meanwhile, which a mv would overwrite
+ln -- "$tmp" "$out" || die "could not create $out"
+echo "$out: $size bytes, sha256 $(sha256sum < "$out" | cut -d' ' -f1)"
