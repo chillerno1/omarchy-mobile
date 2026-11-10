@@ -173,6 +173,13 @@ grep -q 'echo stay > "\$stage/etc/omamobile-no-usb-host"' "$build" && grep -q 'o
   || fail "--arch packs the board compatible and the no-USB-host stay"
 pass "the container script refuses SELF_UPDATE without ARCH_BOOT first; --arch packs the board and stay"
 
+# boot.img's command line asks for bootconfig, ahead of any "--", or the
+# kernel leaves ABL's androidboot.* keys (the slot) out of /proc/bootconfig
+cmdline=$(sed -n "s/^    --cmdline '\(.*\)' \\\\$/\1/p" "$build")
+[[ -n $cmdline ]] || fail "boot.img's --cmdline found in $build"
+[[ " ${cmdline%% -- *} " == *' bootconfig '* ]] || fail "boot.img's command line has bootconfig before any -- (got: $cmdline)"
+pass "boot.img's command line asks the kernel to parse ABL's bootconfig"
+
 # build-ingot-probe --self-update without --arch, before Docker
 printf '#!/bin/sh\necho called >> "%s/calls"\nexit 97\n' "$t" > "$t/bin/docker"
 chmod +x "$t/bin/docker"
