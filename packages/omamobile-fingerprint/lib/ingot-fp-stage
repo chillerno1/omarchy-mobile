@@ -760,7 +760,7 @@ inner() {
     # the bridge binds its socket as uid 1000: the directory is its until then
     chown "$SYS_ID:$SYS_ID" "$SOCKDIR"
     spawn bridge system /omamobile/omamobile-fp-bridge-ingot --socket "$CSOCKDIR/bridge.sock" \
-      --state "$BRIDGE_STATE"
+      --state "$BRIDGE_STATE" --data-path /data/vendor_de/0/fpdata
     bridge_socket
     say "stage bridge running: $SOCK (^C or ingot-fp-stage stop stops)"
     wait -n "${PIDS[bridge]}" "${PIDS[qseecomd]}" || true
