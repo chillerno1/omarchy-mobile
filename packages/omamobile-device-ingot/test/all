@@ -162,7 +162,7 @@ pass "the README names every staged file"
 
 # --- omamobile-ingot-firmware against a stand-in partition ------------------
 fw=$PWD/bin/omamobile-ingot-firmware
-"$fw" --help | grep -q 'omamobile-ingot-firmware plan' || fail "--help prints the usage"
+"$fw" --help > "$tmp/help" && grep -q 'omamobile-ingot-firmware plan' "$tmp/help" || fail "--help prints the usage"
 f=$tmp/fw
 mkdir -p "$f/sys/class/block/sda5" "$f/sys/class/block/sda6" "$f/sys/class/block/sda"
 printf 'MAJOR=8\nMINOR=5\nDEVNAME=sda5\nDEVTYPE=partition\nPARTN=5\nPARTNAME=modem_a\n' > "$f/sys/class/block/sda5/uevent"
