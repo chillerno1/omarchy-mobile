@@ -64,7 +64,7 @@ The card is a WCD938x codec and two WSA883x speaker amplifiers on SoundWire, beh
 - At the first clock stop and restart of the amplifiers' bus (`3250000.soundwire`, a few seconds after its last use) both amplifiers fall back to device number 0 at once, the controller's enumeration fails (`SWR bus clsh detected`, interrupt bit 11) and they stay `UNATTACHED` (`/sys/bus/soundwire/devices/sdw:1:*/status`). Streams then run without an error and without sound.
 - The codec's buses survive the restart with parity errors and alerts, and an alert on the playback one (`3210000.soundwire`) ends in a NULL dereference in `wcd_interrupt_callback` (that device has no register map), which kills the bus's IRQ thread.
 
-Held awake, the buses' clocks never stop. That costs idle power, and it does not cover a system suspend, where the clocks stop anyway: after a suspend the speaker is silent until a reboot. Remove the rule once the kernel keeps the devices across a clock stop.
+Held awake, the buses' clocks never stop at run time. That costs idle power. A system suspend stops the clocks all the same; in the suspends tried with the rule in place (`pm_test` runs and two suspend-to-idle cycles) the amplifiers were still `Attached` afterwards, so the failure seems to belong to the runtime path, and why is not understood. Check `/sys/bus/soundwire/devices/sdw:1:*/status` after a suspend before trusting it. Remove the rule once the kernel keeps the devices across a clock stop.
 
 ## After installing this version: remove the hand-installed copies
 

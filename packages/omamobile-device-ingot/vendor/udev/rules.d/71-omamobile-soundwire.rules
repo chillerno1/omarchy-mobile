@@ -11,8 +11,10 @@
 # playback side ends in a NULL dereference in the codec's interrupt
 # callback (the kernel's SoundWire IRQ thread dies).
 #
-# With runtime power management held on, the clocks never stop. This costs
-# idle power and does not cover a system suspend, where the clocks stop
-# anyway. Remove this file once the kernel keeps the devices across a
-# clock stop.
+# With runtime power management held on, the clocks never stop at run time.
+# This costs idle power. A system suspend stops the clocks all the same; in
+# the suspends tried with this rule in place (pm_test runs and two
+# suspend-to-idle cycles) the amplifiers were still attached afterwards, so
+# the failure seems to belong to the runtime path. Why is not understood.
+# Remove this file once the kernel keeps the devices across a clock stop.
 ACTION=="add", SUBSYSTEM=="platform", KERNEL=="3210000.soundwire|3250000.soundwire|33b0000.soundwire", ATTR{power/control}="on"
