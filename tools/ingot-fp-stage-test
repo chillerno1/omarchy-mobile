@@ -1,0 +1,197 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# tools/ingot-fp-stage against a fake phone, in an unprivileged user
+# namespace (unshare -Ur): host /dev, /sys and /run in a temporary tree,
+# "device nodes" as files reading "c MAJ:MIN" (OMAMOBILE_FP_TEST=1 and
+# OMAMOBILE_FP_TEST_ROOT). Nothing on this machine's real /dev is touched.
+#
+#   check                    -> preconditions met; refused without a stub, with
+#                               the vendor's library as the stub, with a stub
+#                               naming a device path, without /dev/qseecom
+#   the overrides            -> ignored without OMAMOBILE_FP_TEST=1
+#   audit                    -> exactly the allowlisted nodes, from the host's
+#                               numbers; the stubs over the vendor's; persist
+#                               in the chroot's /proc/mounts; and refused for
+#                               an extra node, a wrong node, an extra mount,
+#                               the vendor's library over the stub
+#   hal (static fakes of qseecomd and the HAL host; needs gcc -static)
+#                            -> the logdw reader names the sender, the
+#                               listeners are seen, the HAL host starts after
+#                               them, chipid 5f83 gives PASS, stop in order
+#   lint                     -> shellcheck on both scripts, if installed
+set -euo pipefail
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+STAGE=$HERE/ingot-fp-stage
+fail() { echo "not ok - $*" >&2; [[ -f ${out:-/nonexistent} ]] && sed 's/^/    /' "$out" >&2; exit 1; }
+pass() { echo "ok - $*"; }
+
+unshare -Ur true 2>/dev/null || { echo "skip: no unprivileged user namespaces (unshare -Ur)"; exit 0; }
+
+t=$(mktemp -d)
+trap 'rm -rf "$t"' EXIT
+out=$t/out
+
+# --- the fake phone ---
+H=$t/host IMG=$t/image BIN=$t/bin
+mkdir -p "$H/dev/dma_heap" "$H/sys/bus/clockevents/devices/clockevent0" \
+  "$H/sys/bus/clocksource/devices/clocksource0" "$H/sys/devices/platform/fingerprint" "$H/run"
+node() { echo "c $2" > "$H/dev/$1"; }
+node null 1:3; node zero 1:5; node full 1:7; node random 1:8; node urandom 1:9
+node qseecom 236:0; node blfp 10:120; node dma_heap/default_cma_region 249:2
+echo "DEVNAME=arch_sys_timer" > "$H/sys/bus/clockevents/devices/clockevent0/uevent"
+echo "DEVNAME=arch_sys_counter" > "$H/sys/bus/clocksource/devices/clocksource0/uevent"
+echo 5f83 > "$H/sys/devices/platform/fingerprint/chipid"
+echo 1.0 > "$H/sys/devices/platform/fingerprint/version"
+mkdir -p "$IMG/system/bin" "$IMG/system/lib64" "$IMG/apex/com.android.runtime/bin" \
+  "$IMG/vendor/bin" "$IMG/vendor/lib64/hw" "$IMG/vendor/firmware_mnt/image"
+ln -s /apex/com.android.runtime/bin/linker64 "$IMG/system/bin/linker64"
+: > "$IMG/apex/com.android.runtime/bin/linker64"
+printf 'vendor librpmb /dev/block/bootdevice /dev/ufs-bsg\n' > "$IMG/vendor/lib64/librpmb.so"
+printf 'vendor libssd /dev/block/bootdevice/by-name/ssd\n' > "$IMG/vendor/lib64/libssd.so"
+: > "$IMG/vendor/lib64/libQSEEComAPI.so"
+: > "$IMG/vendor/lib64/hw/fingerprint.betterlife.so"
+: > "$IMG/vendor/firmware_mnt/image/btlap64.mdt"
+printf 'ro.arch=fake\n# comment\nro.product.vendor.device=ingot\n' > "$IMG/vendor/build.prop"
+: > "$IMG/vendor/bin/qseecomd"
+mkdir -p "$BIN"
+printf 'stub rpmb: every request fails\n' > "$BIN/librpmb.so"
+printf 'stub ssd: every request fails\n' > "$BIN/libssd.so"
+: > "$BIN/omamobile-fp-halhost"
+STATE=$t/state
+
+st() { # mode args...: the stage, as fake root, on the fake phone
+  local m=$1; shift
+  ${TIMEOUT:+timeout "$TIMEOUT"} unshare -Ur env OMAMOBILE_FP_TEST=1 OMAMOBILE_FP_TEST_ROOT="$H" "$STAGE" "$m" \
+    --image "$IMG" --bin "$BIN" --state "$STATE" "$@"
+}
+
+# --- check ---
+st check > "$out" 2>&1 || fail "check on a good fake phone"
+grep -q 'preconditions met' "$out" || fail "check: no 'preconditions met'"
+grep -q "node /dev/dma_heap/qcom,qseecom-ta <- host $H/dev/dma_heap/default_cma_region (c 249:2)" "$out" ||
+  fail "check: the qcom,qseecom-ta alias"
+[[ ! -e $STATE ]] || fail "check created the state directory"
+pass "check: preconditions met, changes nothing"
+
+mv "$BIN/libssd.so" "$t/libssd.so"
+st check > "$out" 2>&1 && fail "check without libssd.so"
+grep -q "no stub $BIN/libssd.so" "$out" || fail "check: missing stub not named"
+mv "$t/libssd.so" "$BIN/libssd.so"
+pass "check: refused without a stub"
+
+cp "$BIN/librpmb.so" "$t/librpmb.so"
+cp "$IMG/vendor/lib64/librpmb.so" "$BIN/librpmb.so"
+st check > "$out" 2>&1 && fail "check with the vendor's librpmb.so"
+grep -q "is the vendor's librpmb.so" "$out" || fail "check: vendor library not named"
+pass "check: refused with the vendor's library as the stub"
+
+printf 'stub that opens /dev/block/sda\n' > "$BIN/librpmb.so"
+st check > "$out" 2>&1 && fail "check with a stub naming /dev/block"
+grep -q 'contains "/dev/block"' "$out" || fail "check: device path not named"
+cp "$t/librpmb.so" "$BIN/librpmb.so"
+pass "check: refused with a device path in a stub"
+
+mv "$H/dev/qseecom" "$t/qseecom"
+st check > "$out" 2>&1 && fail "check without /dev/qseecom"
+grep -q "no character device $H/dev/qseecom" "$out" || fail "check: missing qseecom not named"
+mv "$t/qseecom" "$H/dev/qseecom"
+pass "check: refused without /dev/qseecom"
+
+env -u OMAMOBILE_FP_TEST OMAMOBILE_FP_TEST_ROOT="$H" "$STAGE" check --image "$IMG" --bin "$BIN" \
+  --state "$STATE" > "$out" 2>&1 || true
+grep -q "$H/dev" "$out" && fail "OMAMOBILE_FP_TEST_ROOT honoured without OMAMOBILE_FP_TEST=1"
+grep -q '/dev/qseecom' "$out" || fail "the real /dev not checked without OMAMOBILE_FP_TEST=1"
+pass "the overrides are ignored without OMAMOBILE_FP_TEST=1"
+
+# --- audit ---
+st audit > "$out" 2>&1 || fail "audit on a good fake phone"
+grep -q 'audit passed' "$out" || fail "audit: no 'audit passed'"
+got=$(sed -n 's/^ingot-fp:   c \([0-9:]*\) [^ ]* [0-9]* \(\/dev\/[^ ]*\) .*/\2 \1/p' "$out" | sort | tr '\n' ' ')
+want="/dev/blfp 10:120 /dev/dma_heap/qcom,qseecom 249:2 /dev/dma_heap/qcom,qseecom-ta 249:2 /dev/full 1:7 /dev/null 1:3 /dev/qseecom 236:0 /dev/random 1:8 /dev/urandom 1:9 /dev/zero 1:5 "
+[[ $got == "$want" ]] || fail "audit: /dev is '$got', want '$want'"
+grep -q 'REFUSED' "$out" && fail "audit: a REFUSED line on a good phone"
+grep -q "/vendor/lib64/librpmb.so = $BIN/librpmb.so" "$out" || fail "audit: stub over librpmb.so"
+grep -q "/vendor/lib64/libssd.so = $BIN/libssd.so" "$out" || fail "audit: stub over libssd.so"
+grep -q '  /mnt/vendor/persist: bind from' "$out" || fail "audit: persist bind"
+[[ -d $STATE/data/vendor/tzstorage && -d $STATE/data/vendor/blfp/pic && -d $STATE/persist/data ]] ||
+  fail "audit: the state directories"
+pass "audit: exactly the allowlist, the stubs, persist from the state directory"
+
+for f in dev-extra dev-wrong mount-extra stub-vendor; do
+  OMAMOBILE_FP_TEST_INJECT=$f st audit > "$out" 2>&1 && fail "audit passed with $f"
+  { grep -q 'REFUSED' "$out" && grep -q 'audit failed: nothing started' "$out"; } || fail "audit with $f: no refusal"
+done
+pass "audit: refused an extra node, a wrong node, an extra mount, the vendor's library"
+
+# --- hal, with static fakes (the chroot has no bionic here) ---
+if printf 'int main(void){return 0;}\n' > "$t/cc.c" && gcc -static -o "$t/cc" "$t/cc.c" 2>/dev/null; then
+  cat > "$t/fake.c" <<'EOF'
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+static void logdw(const char *tag, const char *msg)
+{
+	struct sockaddr_un a = { .sun_family = AF_UNIX, .sun_path = "/dev/socket/logdw" };
+	unsigned char b[256] = { 0 };
+	size_t n = 11;
+	int s = socket(AF_UNIX, SOCK_DGRAM, 0);
+	b[0] = 0; b[1] = 7; b[n++] = 4;
+	strcpy((char *)b + n, tag); n += strlen(tag) + 1;
+	strcpy((char *)b + n, msg); n += strlen(msg) + 1;
+	sendto(s, b, n, 0, (struct sockaddr *)&a, sizeof(a));
+	close(s);
+}
+static volatile sig_atomic_t done;
+static void term(int s) { (void)s; done = 1; }
+int main(int argc, char **argv)
+{
+	signal(SIGTERM, term);
+	if (strstr(argv[0], "qseecomd")) {
+		logdw("QSEECOMD", "listener services: Started (Listener ID = 8192)");
+		logdw("QSEECOMD", "listener services: Started (Listener ID = 12288)");
+		while (!done)
+			pause();
+		printf("qseecomd fake: TERM\n");
+		return 0;
+	}
+	printf("halhost fake: %s %s uid %d\n", argc > 1 ? argv[1] : "", argc > 3 ? argv[3] : "", (int)getuid());
+	FILE *f = fopen("/dev/blfp", "r");
+	char l[64] = "";
+	if (f && fgets(l, sizeof(l), f))
+		printf("halhost fake: /dev/blfp reads %s", l);
+	logdw("BtlFpHal", "chip id 0x5f83");
+	fflush(stdout);
+	sleep(1);
+	return 0;
+}
+EOF
+  gcc -static -O1 -o "$t/fake" "$t/fake.c"
+  cp "$t/fake" "$IMG/vendor/bin/qseecomd"
+  cp "$t/fake" "$BIN/omamobile-fp-halhost"
+  chmod 0755 "$IMG/vendor/bin/qseecomd" "$BIN/omamobile-fp-halhost"
+  TIMEOUT=60 st hal --seconds 1 > "$out" 2>&1 || fail "hal with the fakes"
+  grep -q '^\[qseecomd\] [0-9]*/7 I QSEECOMD: listener services: Started (Listener ID = 8192)' "$out" ||
+    fail "hal: the logdw reader's line for qseecomd"
+  grep -q 'listeners registered: 2 started' "$out" || fail "hal: listeners not seen"
+  grep -q '^\[halhost\] halhost fake: open 1 uid 0' "$out" || fail "hal: the HAL host's arguments"
+  grep -q '^\[halhost\] halhost fake: /dev/blfp reads c 10:120' "$out" || fail "hal: /dev/blfp in the chroot"
+  grep -q '^\[omamobile-fp-ha\] [0-9]*/7 I BtlFpHal: chip id 0x5f83' "$out" || fail "hal: the HAL host's log line"
+  grep -q 'S3 PASS: chipid 5f83' "$out" || fail "hal: no PASS"
+  grep -q '^\[qseecomd\] qseecomd fake: TERM' "$out" || fail "hal: qseecomd not stopped with TERM"
+  [[ $(grep -n 'S3 PASS' "$out" | cut -d: -f1) -lt $(grep -n 'qseecomd fake: TERM' "$out" | cut -d: -f1) ]] ||
+    fail "hal: qseecomd stopped before the report"
+  pass "hal: log reader, listeners, HAL host after them, PASS, ordered stop"
+else
+  echo "skip - hal with fakes: no gcc -static"
+fi
+
+SC=$(command -v shellcheck 2>/dev/null || true)
+if [[ -n $SC ]] && "$SC" --version >/dev/null 2>&1; then
+  "$SC" -x "$STAGE" "$0" || fail "shellcheck"
+  pass "shellcheck"
+else
+  echo "skip - shellcheck not installed"
+fi

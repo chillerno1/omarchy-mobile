@@ -1,0 +1,663 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# ingot-fp-stage: run the Solana Saga's (ingot) vendor fingerprint stack, stage
+# S3, in a minimal chroot ON THE PHONE, as root, in the foreground:
+# qseecomd (the QSEE listener services) with our stub RPMB and SSD listener
+# libraries, then a host program that opens the vendor fingerprint HAL, which
+# loads the btlap64 trusted app and talks to the sensor.
+#
+#   ingot-fp-stage check     --image DIR --bin DIR   preconditions; changes nothing
+#   ingot-fp-stage audit     --image DIR --bin DIR   build the chroot in a private
+#                                    namespace, run every safety check on it,
+#                                    print its /dev and mounts, start nothing
+#   ingot-fp-stage listeners --image DIR --bin DIR   qseecomd, until ^C
+#   ingot-fp-stage hal       --image DIR --bin DIR [--seconds N] [--hal-root]
+#                                    qseecomd, then (once its listeners are
+#                                    registered) omamobile-fp-halhost open
+#                                    [--seconds N], as uid/gid 1000 (system;
+#                                    --hal-root: as root); then the sensor
+#                                    driver's chipid/version and the kernel log.
+#                                    PASS for S3: chipid 5f83
+#   ingot-fp-stage run       --image DIR --bin DIR [--as-system] -- CMD...
+#                                    an Android binary in the same environment:
+#                                    inside a running listeners/hal stage if
+#                                    there is one, else in a fresh chroot
+#   Options: --state DIR (default /var/lib/omamobile-fp-ingot)
+#
+# --image is the tree tools/extract-fingerprint-vendor-ingot made (vendor/,
+# system/, apex/; the vendor's, never shipped). --bin holds our builds:
+# librpmb.so and libssd.so (stub listener libraries: they register the RPMB
+# and SSD listeners, answer every request "failed" and open no device),
+# omamobile-fp-halhost (for hal), and optionally omamobile-fp-shim.so (the
+# preload shim: properties and logging; preloaded only if present).
+#
+# SAFETY (enforced below; check and every start verify and print it):
+#   - The chroot's /dev is a fresh tmpfs holding ONLY these character devices,
+#     made with mknod from the host's own device numbers: null, zero, full,
+#     random, urandom, qseecom, blfp, and dma_heap/qcom,qseecom +
+#     dma_heap/qcom,qseecom-ta (both the host's dma_heap/default_cma_region).
+#     No block device, no bsg/sg node, no /dev/block, no host /dev bind; the
+#     audit refuses any other entry in /dev, and any block or character node
+#     anywhere else in the chroot.
+#   - No partition is mounted or opened: /data, /mnt/vendor/persist and
+#     /persist inside are directories under the state directory on the
+#     phone's own root file system, bind-mounted (so libdrmfs finds the
+#     persist mount in /proc/mounts). The audit refuses any mount in the
+#     chroot outside a fixed list, and any whose file system is not tmpfs,
+#     proc or the one holding --image, --bin or the state directory.
+#   - The stubs take precedence: BIN/librpmb.so and BIN/libssd.so are bind-
+#     mounted read-only over /vendor/lib64/{librpmb,libssd}.so, and before
+#     anything starts the files seen there inside the namespace must have the
+#     stubs' sha256, differ from the vendor's, and contain no RPMB/SSD
+#     device path (/dev/block, ufs-bsg, mmcblk, /dev/sg, by-name/ssd).
+#   - Every Android process runs with mknod, sys_admin, sys_rawio,
+#     sys_module, sys_boot and sys_time out of its capability bounding set:
+#     even as root it cannot make a device node, mount, or set the clock.
+#   - /sys is a tmpfs with copies of the two clock uevent files libqisl
+#     reads; the host's /sys is not visible inside.
+#   Left as is: the chroot's /proc shows the namespace's PID 1 (this
+#   script), whose /proc/1/root is the host's root; a root process inside
+#   could deliberately walk out through it (no vendor code here does).
+#   qseecomd drops to uid 1000 by itself, and uid 1000 is the phone's user:
+#   that user can signal the Android processes while they run.
+#
+# Network: the host's namespace (the sensor driver's netlink socket, protocol
+# 26, exists only in the initial one). Mount and PID namespaces are private:
+# when this script (the namespace's PID 1) exits, every Android process dies
+# with it. ^C/TERM stops the HAL host first, then qseecomd; the kernel then
+# unregisters the listeners and unloads the trusted app as their files close.
+#
+# Logging: without logd, bionic's liblog sends to /dev/socket/logdw; a
+# reader (python3) on that datagram socket prints each line prefixed with
+# the sending process's name. With the shim, liblog's output goes to stderr
+# instead. Everything also lands in $RUN/stage.log.
+#
+# Needs on the phone: bash, util-linux (unshare, nsenter, setpriv, setsid,
+# mount, findmnt, flock, dmesg), coreutils (chroot, sha256sum, stat, mknod,
+# install), findutils, grep, sed, python3 (the log reader; without it, and
+# without the shim, the Android processes' logs are lost), kmod (modprobe,
+# only if the qseecom or betterlife modules are not loaded yet). The modules
+# qcom_qseecom_user and betterlife-fp.
+#
+# Tests: tools/ingot-fp-stage-test. OMAMOBILE_FP_TEST_ROOT (host /dev, /sys
+# and /run under a fake tree; "device nodes" there are regular files
+# reading "c MAJ:MIN", copied instead of mknod) and OMAMOBILE_FP_TEST_INJECT
+# (a fault for the audit to catch) are honoured only with OMAMOBILE_FP_TEST=1.
+set -euo pipefail
+
+say() { printf 'ingot-fp: %s\n' "$*" >&2; }
+die() { say "error: $*"; exit 1; }
+usage() { sed -n '/^#   ingot-fp-stage check/,/^#   Options:/p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+# --- Paths and options -------------------------------------------------------
+
+TROOT=
+[[ ${OMAMOBILE_FP_TEST:-} == 1 && -n ${OMAMOBILE_FP_TEST_ROOT:-} ]] && TROOT=$OMAMOBILE_FP_TEST_ROOT
+HDEV=$TROOT/dev                      # the host's device nodes
+HSYS=$TROOT/sys                      # the host's sysfs
+RUN=$TROOT/run/omamobile-fp-ingot
+ROOT=$RUN/root
+NSPID=$RUN/ns.pid
+LOG=$RUN/stage.log
+SYSFP=$HSYS/devices/platform/fingerprint
+# Android's system user: qseecomd drops to it, the HAL runs as it. A user
+# namespace in the tests maps only root.
+SYS_ID=1000
+[[ -n $TROOT ]] && SYS_ID=$(id -u)
+
+# Host tools, resolved now: the Android processes get an Android PATH.
+hostbin() { PATH=/usr/bin:/bin:/usr/sbin:/sbin command -v "$1" || true; }
+CHROOT_BIN=$(hostbin chroot)
+SETPRIV_BIN=$(hostbin setpriv)
+SETSID_BIN=$(hostbin setsid)
+PYTHON_BIN=$(hostbin python3)
+
+# Out of every Android process's bounding set (see the header).
+DROP_CAPS=-mknod,-sys_admin,-sys_rawio,-sys_module,-sys_boot,-sys_time
+
+# chroot path -> host node (under $HDEV). Nothing else enters /dev.
+declare -A NODES=(
+  [null]=null [zero]=zero [full]=full [random]=random [urandom]=urandom
+  [qseecom]=qseecom [blfp]=blfp
+  [dma_heap/qcom,qseecom]=dma_heap/default_cma_region
+  [dma_heap/qcom,qseecom-ta]=dma_heap/default_cma_region
+)
+# Nodes uid 1000 must open after qseecomd drops privileges (and the HAL).
+SYS_NODES=" qseecom blfp dma_heap/qcom,qseecom dma_heap/qcom,qseecom-ta "
+# Optional on the host: only the hal stage needs the sensor.
+OPT_NODES=" blfp "
+
+# Strings no stub may contain: the vendor's RPMB/SSD device paths.
+FORBIDDEN=(/dev/block ufs-bsg mmcblk /dev/sg /dev/0:0:0 by-name/ssd)
+
+MODE=${1:-}; [[ -n $MODE ]] || usage
+shift
+IMAGE='' BIN='' STATE=/var/lib/omamobile-fp-ingot SECONDS_ARG='' HAL_ROOT=0 AS_SYSTEM=0
+CMD=()
+while (($#)); do
+  case $1 in
+    --image) IMAGE=${2:?}; shift ;;
+    --bin) BIN=${2:?}; shift ;;
+    --state) STATE=${2:?}; shift ;;
+    --seconds) SECONDS_ARG=${2:?}; shift ;;
+    --hal-root) HAL_ROOT=1 ;;
+    --as-system) AS_SYSTEM=1 ;;
+    --) shift; CMD=("$@"); break ;;
+    -h|--help) usage ;;
+    *) die "unknown argument: $1" ;;
+  esac
+  shift
+done
+[[ -n $IMAGE && -n $BIN ]] || die "--image DIR and --bin DIR are required"
+IMAGE=$(realpath -e -- "$IMAGE") || die "no such directory: --image"
+BIN=$(realpath -e -- "$BIN") || die "no such directory: --bin"
+[[ $STATE == /* ]] || die "--state must be an absolute path"
+case $STATE in /dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/run/omamobile-fp-ingot*|/) die "--state $STATE: not there" ;; esac
+[[ -z $SECONDS_ARG || $SECONDS_ARG =~ ^[0-9]+$ ]] || die "--seconds takes a number"
+
+SHIM=$BIN/omamobile-fp-shim.so
+HALHOST=$BIN/omamobile-fp-halhost
+
+# --- Device nodes ------------------------------------------------------------
+
+# "MAJ:MIN" of a character device (a fake one in the tests), or fail.
+node_id() {
+  local t mm
+  if [[ -n $TROOT ]]; then
+    [[ -f $1 && ! -L $1 ]] || return 1
+    read -r t mm < "$1" || return 1
+    [[ $t == c && $mm =~ ^[0-9]+:[0-9]+$ ]] || return 1
+    echo "$mm"
+    return 0
+  fi
+  [[ -c $1 && ! -L $1 ]] || return 1
+  read -r t mm < <(stat -c '%t %T' -- "$1") || return 1
+  echo "$((16#$t)):$((16#$mm))"
+}
+
+# Create the chroot node $1 (relative to its /dev) as the host's.
+make_node() {
+  local name=$1 dst=$ROOT/dev/$1 id mode=0666 own=0
+  id=$(node_id "$HDEV/${NODES[$name]}") || return 1
+  [[ $SYS_NODES == *" $name "* ]] && { mode=0660; own=$SYS_ID; }
+  mkdir -p "$(dirname "$dst")"
+  if [[ -n $TROOT ]]; then
+    printf 'c %s\n' "$id" > "$dst"
+  else
+    mknod -m "$mode" "$dst" c "${id%:*}" "${id#*:}"
+  fi
+  chown "$own:$own" "$dst"
+  chmod "$mode" "$dst"
+}
+
+# --- Checks ------------------------------------------------------------------
+
+sha() { sha256sum -- "$1" | cut -d' ' -f1; }
+
+# A stub fit to be used: ours, not the vendor's, no device path in it.
+stub_ok() { # $1 file name
+  local f=$BIN/$1 v=$IMAGE/vendor/lib64/$1 s ok=1
+  [[ -f $f && ! -L $f ]] || { say "no stub $f (a regular file)"; return 1; }
+  s=$(sha "$f")
+  [[ -f $v && $(sha "$v") == "$s" ]] && { say "$f is the vendor's $1, not our stub"; ok=0; }
+  for s in "${FORBIDDEN[@]}"; do
+    grep -qaF -- "$s" "$f" && { say "$f contains \"$s\": not a stub"; ok=0; }
+  done
+  ((ok)) && say "stub $1: sha256 $(sha "$f" | cut -c1-16), not the vendor's, no device path"
+  ((ok))
+}
+
+check() {
+  local ok=1 n id t
+  [[ $EUID -eq 0 ]] || { say "run as root"; ok=0; }
+  [[ -x $CHROOT_BIN ]] || { say "no chroot(1) (coreutils)"; ok=0; }
+  [[ -x $SETPRIV_BIN && -x $SETSID_BIN ]] || { say "no setpriv/setsid (util-linux)"; ok=0; }
+  for t in unshare nsenter mount findmnt flock sha256sum mknod find; do
+    [[ -n $(hostbin "$t") ]] || { say "no $t on the host"; ok=0; }
+  done
+  [[ -x $PYTHON_BIN ]] || say "no python3: no log reader, the Android processes' logs are lost unless the shim is used"
+  for t in system/bin/linker64 apex/com.android.runtime/bin/linker64 vendor/bin/qseecomd \
+      vendor/lib64/libQSEEComAPI.so vendor/lib64/librpmb.so vendor/lib64/libssd.so; do
+    [[ -e $IMAGE/$t || -L $IMAGE/$t ]] || { say "no $t in $IMAGE (tools/extract-fingerprint-vendor-ingot)"; ok=0; }
+  done
+  [[ -f $IMAGE/vendor/lib64/hw/fingerprint.betterlife.so ]] || say "no fingerprint.betterlife.so in $IMAGE: hal can't run"
+  [[ -f $IMAGE/vendor/firmware_mnt/image/btlap64.mdt ]] || say "no btlap64 trusted app in $IMAGE/vendor/firmware_mnt/image: hal can't load it"
+  t=$(find "$IMAGE" \( -type b -o -type c \) -print -quit 2>/dev/null)
+  [[ -z $t ]] || { say "$IMAGE holds a device node ($t): refusing"; ok=0; }
+  stub_ok librpmb.so || ok=0
+  stub_ok libssd.so || ok=0
+  if [[ -f $HALHOST ]]; then say "HAL host: $HALHOST"; else say "no $HALHOST: hal can't run"; fi
+  if [[ -f $SHIM ]]; then say "shim: $SHIM (preloaded)"
+  else say "no shim in $BIN: not preloaded (properties unset, logs through logdw)"; fi
+  for n in "${!NODES[@]}"; do
+    if id=$(node_id "$HDEV/${NODES[$n]}"); then
+      say "node /dev/$n <- host $HDEV/${NODES[$n]} (c $id)"
+    elif [[ $OPT_NODES == *" $n "* ]]; then
+      say "no $HDEV/${NODES[$n]} (modprobe betterlife-fp): hal can't run"
+    else
+      say "no character device $HDEV/${NODES[$n]}"; ok=0
+    fi
+  done
+  [[ -d $SYSFP ]] || say "no $SYSFP (the betterlife-fp driver)"
+  say "state: $STATE (/data, /mnt/vendor/persist, /persist inside; no partition)"
+  ((ok)) || { say "preconditions NOT met"; return 1; }
+  say "preconditions met"
+}
+
+# The chroot as built, inside the namespace: refuses on any deviation.
+audit() {
+  local ok=1 e t p name id want mi mp fs src majmin
+  say "audit: /dev in the chroot"
+  while IFS= read -r e; do
+    t=${e%% *} p=${e#* }
+    case $t:$p in
+      d:dma_heap|d:socket|d:__omamobile_props__) continue ;;
+      s:socket/logdw|f:__omamobile_props__/*) continue ;;
+    esac
+    name=$p
+    if [[ -n ${NODES[$name]+x} ]] && { [[ $t == c ]] || [[ -n $TROOT && $t == f ]]; }; then
+      id=$(node_id "$ROOT/dev/$name") || { say "  /dev/$name: unreadable node"; ok=0; continue; }
+      want=$(node_id "$HDEV/${NODES[$name]}") || want=none
+      if [[ $id == "$want" ]]; then
+        say "  c $id $(stat -c '%U:%G %a' "$ROOT/dev/$name") /dev/$name (= host ${NODES[$name]})"
+      else
+        say "  /dev/$name is $id, host ${NODES[$name]} is $want: REFUSED"; ok=0
+      fi
+    else
+      say "  /dev/$p (type $t): not in the allowlist: REFUSED"; ok=0
+    fi
+  done < <(find "$ROOT/dev" -mindepth 1 -printf '%y %P\n' | sort)
+  t=$(find "$ROOT" -path "$ROOT/proc" -prune -o -path "$ROOT/dev" -prune -o \( -type b -o -type c \) -print 2>/dev/null)
+  [[ -z $t ]] || { say "device nodes outside /dev: $t: REFUSED"; ok=0; }
+  if [[ -z $TROOT ]]; then
+    t=$(find "$ROOT/dev" -type b -print -quit)
+    [[ -z $t ]] || { say "block device $t: REFUSED"; ok=0; }
+  fi
+
+  say "audit: mounts in the chroot (/proc/self/mountinfo)"
+  local -A allowed_dev=()
+  for p in "$IMAGE" "$BIN" "$STATE"; do
+    majmin=$(findmnt -n -o MAJ:MIN -T "$p" | tr -d " ")
+    [[ -n $majmin ]] && allowed_dev[$majmin]=1
+  done
+  while read -r mi; do
+    majmin=$(cut -d' ' -f3 <<<"$mi")
+    mp=$(cut -d' ' -f5 <<<"$mi")
+    read -r fs src _ <<<"${mi##* - }"
+    [[ $mp == "$ROOT" || $mp == "$ROOT"/* ]] || continue
+    p=${mp#"$ROOT"}; p=${p:-/}
+    case $p in
+      # ours: tmpfs (by the names setup gives them) and the namespace's proc
+      /) want=tmpfs:omamobile-fp-ingot ;;
+      /tmp) want=tmpfs:tmp ;;
+      /dev) want=tmpfs:dev ;;
+      /dev/__omamobile_props__) want=tmpfs:props ;;
+      /sys) want=tmpfs:sys ;;
+      /proc) want=proc:proc ;;
+      # binds: only from the file systems of --image, --bin and --state
+      /system|/vendor|/apex|/vendor/lib64/librpmb.so|/vendor/lib64/libssd.so|/data|/mnt/vendor/persist|/persist|/omamobile/omamobile-fp-halhost|/omamobile/omamobile-fp-shim.so) want=bind ;;
+      *) say "  $p: unexpected mount point: REFUSED"; ok=0; continue ;;
+    esac
+    if [[ $want == bind ]]; then
+      if [[ -n ${allowed_dev[$majmin]:-} ]]; then
+        say "  $p: bind from $src ($fs $majmin, the file system of --image/--bin/--state)"
+      else
+        say "  $p: $fs $src ($majmin) is not the file system of --image, --bin or --state: REFUSED"; ok=0
+      fi
+    elif [[ $fs:$src == "$want" ]]; then
+      say "  $p: $fs"
+    else
+      say "  $p: $fs $src, want ${want/:/ }: REFUSED"; ok=0
+    fi
+  done < /proc/self/mountinfo
+
+  say "audit: the stubs as the chroot sees them"
+  for name in librpmb.so libssd.so; do
+    t=$(sha "$ROOT/vendor/lib64/$name")
+    if [[ $t == "$(sha "$BIN/$name")" ]]; then
+      say "  /vendor/lib64/$name = $BIN/$name (sha256 ${t:0:16})"
+    else
+      say "  /vendor/lib64/$name (sha256 ${t:0:16}) is not the stub: REFUSED"; ok=0
+    fi
+    [[ ! -f $IMAGE/vendor/lib64/$name || $t != "$(sha "$IMAGE/vendor/lib64/$name")" ]] ||
+      { say "  /vendor/lib64/$name is the vendor's: REFUSED"; ok=0; }
+  done
+  [[ -f $ROOT/mnt/vendor/persist/.omamobile-fp-ingot ]] ||
+    { say "  /mnt/vendor/persist is not the state directory's persist: REFUSED"; ok=0; }
+  [[ -f $ROOT/persist/.omamobile-fp-ingot ]] ||
+    { say "  /persist is not the state directory's persist: REFUSED"; ok=0; }
+  # the kernel shows a chrooted process mount points relative to its root:
+  # $ROOT/mnt/vendor/persist here is /mnt/vendor/persist in its /proc/mounts
+  if awk -v m="$ROOT/mnt/vendor/persist" '$2 == m {f = 1} END {exit !f}' /proc/self/mounts; then
+    say "  /mnt/vendor/persist and /persist: the state directory's persist (in the chroot's /proc/mounts)"
+  else
+    say "  /mnt/vendor/persist missing from /proc/mounts (libdrmfs waits for it)"; ok=0
+  fi
+  ((ok)) || die "audit failed: nothing started"
+  say "audit passed"
+}
+
+# --- Building the chroot (inside the private namespace) -------------------------
+
+bind() { # src dst [ro]
+  local src=$1 dst=$2
+  if [[ -d $src ]]; then mkdir -p "$dst"; else mkdir -p "$(dirname "$dst")"; [[ -e $dst ]] || : > "$dst"; fi
+  mount --bind "$src" "$dst"
+  [[ ${3:-} == ro ]] && mount -o remount,bind,ro "$dst"
+  return 0
+}
+
+write_props() {
+  local dir=$1 line k v
+  [[ -f $IMAGE/vendor/build.prop ]] || return 0
+  while IFS= read -r line; do
+    [[ $line =~ ^[[:space:]]*# || $line != *=* ]] && continue
+    k=${line%%=*} v=${line#*=}
+    [[ $k =~ ^[A-Za-z0-9_.:@-]+$ ]] || continue
+    printf '%s' "$v" > "$dir/$k"
+  done < "$IMAGE/vendor/build.prop"
+}
+
+setup_state() {
+  local d
+  install -d -m 0700 "$STATE"
+  for d in data data/vendor data/vendor/tzstorage data/misc data/misc/qsee data/vendor/blfp \
+      data/vendor/blfp/pic persist persist/data; do
+    install -d -m 0770 "$STATE/$d"
+    chown "$SYS_ID:$SYS_ID" "$STATE/$d"
+  done
+  chmod 0771 "$STATE/data" "$STATE/data/vendor" "$STATE/data/misc"
+  # the audit finds this marker through both persist mount points
+  : > "$STATE/persist/.omamobile-fp-ingot"
+}
+
+setup() {
+  local n
+  mkdir -p "$ROOT"
+  mount -t tmpfs -o mode=0755,nosuid omamobile-fp-ingot "$ROOT"
+  for n in system vendor apex; do bind "$IMAGE/$n" "$ROOT/$n" ro; done
+  # the stubs over the vendor's (files that exist in the read-only image)
+  for n in librpmb.so libssd.so; do
+    [[ -f $ROOT/vendor/lib64/$n ]] || die "no /vendor/lib64/$n to cover"
+    mount --bind "$BIN/$n" "$ROOT/vendor/lib64/$n"
+    mount -o remount,bind,ro "$ROOT/vendor/lib64/$n"
+  done
+  mkdir -p "$ROOT/proc" "$ROOT/sys" "$ROOT/dev" "$ROOT/data" "$ROOT/tmp" "$ROOT/mnt/vendor/persist" \
+    "$ROOT/persist" "$ROOT/linkerconfig" "$ROOT/omamobile"
+  ln -s /system/bin "$ROOT/bin"
+  ln -s /system/etc "$ROOT/etc"
+  mount -t tmpfs -o mode=1777,nosuid,nodev tmp "$ROOT/tmp"
+  mount -t proc -o nosuid,nodev,noexec proc "$ROOT/proc"
+  [[ -f $HALHOST ]] && bind "$HALHOST" "$ROOT/omamobile/omamobile-fp-halhost" ro
+  [[ -f $SHIM ]] && bind "$SHIM" "$ROOT/omamobile/omamobile-fp-shim.so" ro
+
+  # /dev: the allowlist, nothing else
+  mount -t tmpfs -o mode=0755,nosuid,noexec dev "$ROOT/dev"
+  for n in "${!NODES[@]}"; do
+    make_node "$n" || [[ $OPT_NODES == *" $n "* ]] || die "can't make /dev/$n"
+  done
+  install -d -m 0755 "$ROOT/dev/socket"
+  mkdir -p "$ROOT/dev/__omamobile_props__"
+  mount -t tmpfs -o mode=0775,nosuid,nodev,noexec props "$ROOT/dev/__omamobile_props__"
+  chown "$SYS_ID:$SYS_ID" "$ROOT/dev/__omamobile_props__"
+  write_props "$ROOT/dev/__omamobile_props__"
+  # the log reader binds its socket before /dev goes read-only
+  start_logd
+  mount -o remount,ro,bind "$ROOT/dev"
+
+  # /sys: only libqisl's two clock uevent files, copied
+  mount -t tmpfs -o mode=0755,nosuid,nodev,noexec sys "$ROOT/sys"
+  for n in bus/clockevents/devices/clockevent0/uevent bus/clocksource/devices/clocksource0/uevent; do
+    mkdir -p "$ROOT/sys/$(dirname "$n")"
+    cat "$HSYS/$n" > "$ROOT/sys/$n" 2>/dev/null || true
+  done
+  mount -o remount,ro,bind "$ROOT/sys"
+
+  setup_state
+  bind "$STATE/data" "$ROOT/data"
+  bind "$STATE/persist" "$ROOT/mnt/vendor/persist"
+  bind "$STATE/persist" "$ROOT/persist"
+  # tools/ingot-fp-stage-test: one fault the audit must refuse
+  [[ -n $TROOT ]] && case ${OMAMOBILE_FP_TEST_INJECT:-} in
+    dev-extra) mount -o remount,rw,bind "$ROOT/dev"; echo 'c 8:0' > "$ROOT/dev/sda" ;;
+    dev-wrong) mount -o remount,rw,bind "$ROOT/dev"; echo 'c 1:5' > "$ROOT/dev/qseecom" ;;
+    mount-extra) mkdir -p "$ROOT/mnt/x"; mount -t tmpfs x "$ROOT/mnt/x" ;;
+    stub-vendor) mount --bind "$IMAGE/vendor/lib64/librpmb.so" "$ROOT/vendor/lib64/librpmb.so" ;;
+  esac
+  return 0
+}
+
+# --- Processes -----------------------------------------------------------------
+
+LOGD_PY='
+import os, signal, socket, struct, sys
+path, proc = sys.argv[1], sys.argv[2]
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+s.bind(path)
+os.chmod(path, 0o666)
+open(path + ".ready", "w").close()
+P = "??VDIWEFS"
+def comm(pid):
+    try:
+        with open("%s/%d/comm" % (proc, pid)) as f:
+            return f.read().strip()
+    except OSError:
+        return "pid %d" % pid
+while True:
+    data, anc, _, _ = s.recvmsg(65536, socket.CMSG_SPACE(12))
+    pid = 0
+    for lvl, typ, d in anc:
+        if lvl == socket.SOL_SOCKET and typ == socket.SCM_CREDENTIALS:
+            pid = struct.unpack("i", d[:4])[0]
+    if len(data) < 12:
+        continue
+    lid, tid = data[0], struct.unpack_from("<H", data, 1)[0]
+    body = data[11:]
+    name = comm(pid)
+    if lid in (2, 5, 6):
+        print("[%s] %d/%d binary log %d (%d bytes)" % (name, pid, tid, lid, len(body)), flush=True)
+        continue
+    prio = P[body[0]] if body[0] < len(P) else "?"
+    tag, _, msg = body[1:].partition(b"\0")
+    msg = msg.rstrip(b"\0").decode("utf-8", "replace")
+    tag = tag.decode("utf-8", "replace")
+    for line in msg.splitlines() or [""]:
+        print("[%s] %d/%d %s %s: %s" % (name, pid, tid, prio, tag, line), flush=True)
+'
+
+declare -A PIDS=()
+
+# A terminal ^C must not kill the log pipes before the processes are stopped.
+logpipe() { trap '' INT; sed -u "s/^/[$1] /" | tee -a "$LOG"; }
+
+start_logd() {
+  [[ -x $PYTHON_BIN ]] || { say "no python3: no log reader"; return 0; }
+  # outside the chroot: it reads the namespace's /proc for process names
+  "$PYTHON_BIN" -I -c "$LOGD_PY" "$ROOT/dev/socket/logdw" "$ROOT/proc" > >(trap '' INT; tee -a "$LOG") 2>&1 &
+  PIDS[logd]=$!
+  local i
+  for ((i = 0; i < 50; i++)); do
+    [[ -e $ROOT/dev/socket/logdw.ready ]] && { rm -f "$ROOT/dev/socket/logdw.ready"; return 0; }
+    sleep 0.1
+  done
+  say "the log reader did not start"
+}
+
+# Android environment for one process; $1 root|system, rest: command.
+android_cmd() {
+  local who=$1; shift
+  local user=(--userspec=0:0 --groups=0)
+  [[ $who == system ]] && user=(--userspec="$SYS_ID:$SYS_ID" --groups="$SYS_ID")
+  # a test's user namespace may not set groups (and maps only root)
+  [[ -n $TROOT ]] && user=()
+  local env=(PATH=/system/bin:/vendor/bin LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib64/hw:/system/lib64
+             ANDROID_ROOT=/system ANDROID_DATA=/data OMAMOBILE_FP_PROPS=/dev/__omamobile_props__
+             OMAMOBILE_FP_LOGLEVEL="${OMAMOBILE_FP_LOGLEVEL:-3}")
+  [[ -f $ROOT/omamobile/omamobile-fp-shim.so ]] && env+=(LD_PRELOAD=/omamobile/omamobile-fp-shim.so)
+  CMDLINE=(env -i "${env[@]}" "$SETSID_BIN" "$SETPRIV_BIN" --bounding-set "$DROP_CAPS" --
+           "$CHROOT_BIN" "${user[@]}" "$ROOT" "$@")
+}
+
+spawn() { # name root|system command...
+  local name=$1; shift
+  say "starting $name: ${*:2}"
+  android_cmd "$@"
+  "${CMDLINE[@]}" > >(logpipe "$name") 2>&1 &
+  PIDS[$name]=$!
+}
+
+alive() {
+  local st
+  st=$(sed 's/^.*) //' "$ROOT/proc/$1/stat" 2>/dev/null) || return 1
+  [[ -n $st && ${st%% *} != Z ]]
+}
+
+stop_one() { # name tenths
+  local p=${PIDS[$1]:-} i
+  [[ -n $p ]] || return 0
+  kill -TERM "$p" 2>/dev/null || true
+  for ((i = 0; i < $2; i++)); do alive "$p" || return 0; sleep 0.1; done
+  say "$1 still running after $(($2 / 10)) s: KILL"
+  kill -KILL "$p" 2>/dev/null || true
+}
+
+DMESG0=0
+kernel_report() {
+  local f v
+  for f in chipid version irq_count; do
+    v=$(cat "$SYSFP/$f" 2>/dev/null) || v="(unreadable)"
+    say "$SYSFP/$f: $v"
+  done
+  say "kernel log since the start (qseecom, blfp, betterlife, fingerprint):"
+  { dmesg 2>/dev/null || true; } | tail -n +"$((DMESG0 + 1))" |
+    grep -iE 'qseecom|qsee|blfp|betterlife|btl|fingerprint|scm|tz' | sed 's/^/  /' >&2 || true
+  v=$(cat "$SYSFP/chipid" 2>/dev/null || true)
+  if [[ ${v,,} == *5f83* ]]; then say "S3 PASS: chipid $v"; else say "S3 FAIL: chipid '${v}' (want 5f83)"; fi
+}
+
+STOPPING=
+stop() {
+  local code=${1:-0}
+  [[ -n $STOPPING ]] && exit "$code"
+  STOPPING=1
+  trap '' TERM INT
+  say "stopping: the HAL host first, then qseecomd"
+  stop_one halhost 50
+  [[ $MODE == hal && -n ${PIDS[halhost]:-} ]] && kernel_report
+  stop_one run 30
+  stop_one qseecomd 50
+  stop_one logd 10
+  rm -f "$NSPID"
+  # as the namespace's PID 1, exiting ends whatever is left
+  exit "$code"
+}
+
+# Listeners registered: the shim's property, else qseecomd's "Started
+# (Listener ID = N)" lines, with no new one for 3 s.
+wait_listeners() {
+  local i n last=-1 same=0 p=$ROOT/dev/__omamobile_props__/vendor.sys.listeners.registered
+  if [[ ! -x $PYTHON_BIN && ! -f $ROOT/omamobile/omamobile-fp-shim.so ]]; then
+    say "no log reader and no shim: can't see the listeners; waiting 15 s"
+    sleep 15
+    alive "${PIDS[qseecomd]}" || die "qseecomd exited"
+    return 0
+  fi
+  for ((i = 0; i < 900; i++)); do
+    alive "${PIDS[qseecomd]}" || die "qseecomd exited before its listeners were registered"
+    [[ -f $p && $(cat "$p") == true ]] && { say "listeners registered (vendor.sys.listeners.registered)"; return 0; }
+    n=$(grep -c 'Started (Listener ID' "$LOG" 2>/dev/null || true)
+    if ((n > 0 && n == last)); then
+      ((++same >= 30)) && { say "listeners registered: $n started, none new for 3 s"; return 0; }
+    else
+      same=0 last=$n
+    fi
+    sleep 0.1
+  done
+  die "qseecomd's listeners not registered in 90 s"
+}
+
+# The namespace's PID 1.
+inner() {
+  [[ $$ == 1 ]] || die "the inner start runs only as a new PID namespace's PID 1"
+  # the host's PID of this shell (a builtin read: /proc/self is this shell)
+  local k v1 _rest hostpid=
+  while read -r k v1 _rest; do [[ $k == NSpid: ]] && hostpid=$v1; done < /proc/self/status
+  echo "$hostpid" > "$NSPID"
+  trap 'stop 0' TERM INT
+  trap 'stop $?' EXIT
+  : > "$LOG"
+  check
+  setup
+  audit
+  [[ $MODE == audit ]] && { STOPPING=1; exit 0; }
+  DMESG0=$({ dmesg 2>/dev/null || true; } | wc -l)
+  if [[ $MODE == run ]]; then
+    local who=root; ((AS_SYSTEM)) && who=system
+    spawn run "$who" "${CMD[@]}"
+    wait "${PIDS[run]}" || true
+    stop 0
+  fi
+  spawn qseecomd root /vendor/bin/qseecomd
+  if [[ $MODE == hal ]]; then
+    wait_listeners
+    [[ -c $ROOT/dev/blfp || ( -n $TROOT && -f $ROOT/dev/blfp ) ]] || die "no /dev/blfp in the chroot"
+    local who=system; ((HAL_ROOT)) && who=root
+    spawn halhost "$who" /omamobile/omamobile-fp-halhost open ${SECONDS_ARG:+--seconds "$SECONDS_ARG"}
+    say "stage hal running (^C stops)"
+    wait -n "${PIDS[halhost]}" "${PIDS[qseecomd]}" || true
+    [[ -n $STOPPING ]] || say "$(alive "${PIDS[qseecomd]}" && echo "the HAL host" || echo qseecomd) exited"
+    stop 0
+  fi
+  say "stage listeners running (^C stops)"
+  wait -n "${PIDS[qseecomd]}" || true
+  [[ -n $STOPPING ]] || say "qseecomd exited"
+  stop 1
+}
+
+# Into a running stage's namespaces (run, when one is up).
+run_attached() {
+  local p who=root
+  p=$(cat "$NSPID" 2>/dev/null) || return 1
+  [[ $p =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null || return 1
+  ((AS_SYSTEM)) && who=system
+  android_cmd "$who" "${CMD[@]}"
+  say "running in the stage's namespace (PID $p)"
+  exec nsenter --target "$p" --mount --pid "${CMDLINE[@]}"
+}
+
+outer() {
+  check
+  install -d -m 0700 "$RUN"
+  exec 9> "$RUN/lock"
+  flock -n 9 || die "another listeners/hal stage is running (run attaches to it)"
+  if [[ -z $TROOT ]]; then
+    [[ -c /dev/qseecom ]] || modprobe qcom_qseecom_user || true
+    [[ $MODE != hal || -c /dev/blfp ]] || modprobe betterlife-fp || true
+    command -v udevadm >/dev/null && udevadm settle -t 5 || true
+  fi
+  local fwd=()
+  unshare --help 2>/dev/null | grep -q -- '--forward-signals' && fwd=(--forward-signals)
+  local args=(--image "$IMAGE" --bin "$BIN" --state "$STATE")
+  [[ -n $SECONDS_ARG ]] && args+=(--seconds "$SECONDS_ARG")
+  ((HAL_ROOT)) && args+=(--hal-root)
+  ((AS_SYSTEM)) && args+=(--as-system)
+  ((${#CMD[@]})) && args+=(-- "${CMD[@]}")
+  exec unshare --mount --propagation private --pid --fork --kill-child "${fwd[@]}" \
+    env OMAMOBILE_FP_INGOT_INNER=1 "$0" "$MODE" "${args[@]}"
+}
+
+case $MODE in
+  check) check ;;
+  audit|listeners|hal|run)
+    [[ $MODE != run ]] || ((${#CMD[@]})) || die "usage: ingot-fp-stage run --image DIR --bin DIR -- CMD..."
+    [[ $MODE != hal || -f $HALHOST ]] || die "no $HALHOST"
+    if [[ -n ${OMAMOBILE_FP_INGOT_INNER:-} ]]; then
+      inner
+    else
+      [[ $MODE == run ]] && run_attached
+      outer
+    fi ;;
+  *) usage ;;
+esac
