@@ -326,6 +326,17 @@ OMAMOBILE_INGOT_FW_SOURCE=$f/src2 ingot_fw install --replace || true
 cmp -s "$f/src2/image/adsp.mbn" "$q/adsp.mdt" || fail "a single adsp.mbn installs as adsp.mdt"
 pass "a single image installs under the DT's name"
 
+# A hand-installed image keeps its whole set: no new segments beside it.
+fr2=$f/root2; mkdir -p "$fr2/usr/share/omamobile/ingot" "$fr2/usr/lib/firmware/qcom/sm8475/osom/ingot"
+cp share/firmware.map "$fr2/usr/share/omamobile/ingot/"
+echo hand > "$fr2/usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.mdt"
+if OMAMOBILE_INGOT_FW_ROOT=$fr2 ingot_fw install; then fail "install reports a kept set"; fi
+grep -q 'keep      /usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.b00 (part of /usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.mdt' "$f/out" \
+  || fail "a segment of a kept image is kept"
+[[ ! -e $fr2/usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.b00 && -e $fr2/usr/lib/firmware/qcom/sm8475/osom/ingot/a730_zap.mbn ]] \
+  || fail "the kept set gets no segments, the other sets are installed"
+pass "a split image is kept or installed as a whole"
+
 # Refusals: the partition, the map, the options.
 mv "$f/sys/class/block/sda5/uevent" "$f/uevent.saved"
 refuses "no modem_a" "exactly one partition named modem_a, found 0" plan

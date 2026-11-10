@@ -227,8 +227,9 @@ save_record() {
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 
 # ------------------------------------------------------------------ plan
-# Each item: "kind|dest|file" where kind is copy or board and file is the
-# file to install (in the source, or the built board file).
+# Each item: "kind|dest|file|set": kind is copy or board, file is the file
+# to install (in the source, or the built board file), and set is the
+# destination of the image a segment belongs to (its own for the others).
 items=()
 work=''
 problems=0
@@ -271,14 +272,14 @@ plan_entries() {
       fi
       build_board "$src/$f" "$board_name" "$work/board-2.bin"
       say "  found     $f -> $d (board data for '$board_name')"
-      items+=("board|$d|$work/board-2.bin")
+      items+=("board|$d|$work/board-2.bin|$d")
       continue
     fi
     if [[ ${f,,} == *.mdt || ${f,,} == *.mbn ]] && ! is_elf "$src/$f"; then
       say "  found     $f, but it is not an ELF image: $d skipped"
       problems=$((problems + 1)); continue
     fi
-    items+=("copy|$d|$src/$f")
+    items+=("copy|$d|$src/$f|$d")
     if [[ ${f,,} == *.mdt ]]; then
       segments "$f"
       n=0
@@ -286,7 +287,7 @@ plan_entries() {
         local nn=${s##*.}; nn=${nn,,}
         local sd=${d%.*}.$nn
         valid_dest "$sd" || die "segment destination $sd is not allowed"
-        items+=("copy|$sd|$src/$s")
+        items+=("copy|$sd|$src/$s|$d")
         n=$((n + 1))
       done
       say "  found     $f (+ $n segments) -> $d  ($note_used)"
@@ -319,34 +320,47 @@ install_file() { # FILE DEST
 }
 
 act() { # MODE: plan, dry-run or install
-  local mode=$1 it dest file new what changed=0 kept=0
-  say "Actions:"
+  local mode=$1 it dest file set new what changed=0 kept=0 i
+  local -a whats=() news=()
+  local -A held=()
+  # A split image is one set: if any part of it is kept, all of it is,
+  # so an image never meets another image's segments.
   for it in "${items[@]}"; do
-    IFS='|' read -r _ dest file <<< "$it"
+    IFS='|' read -r _ dest file set <<< "$it"
     new=$(sha "$file")
     what=$(decide "$dest" "$new")
+    news+=("$new"); whats+=("$what")
+    [[ $what == hand && $replace == 0 ]] && held[$set]=1
+  done
+  say "Actions:"
+  for i in "${!items[@]}"; do
+    IFS='|' read -r _ dest file set <<< "${items[$i]}"
+    new=${news[$i]} what=${whats[$i]}
+    if [[ -n ${held[$set]:-} && $what != same ]]; then
+      if [[ $what == hand ]]; then
+        say "  keep      $dest (differs and is not in the record: copied by hand? --replace overwrites it)"
+      else
+        say "  keep      $dest (part of $set, which is kept)"
+      fi
+      kept=$((kept + 1)); continue
+    fi
     case $what in
       same)   say "  same      $dest" ;;
       new)    say "  new       $dest" ;;
       update) say "  update    $dest (installed by this tool before)" ;;
-      hand)
-        if ((replace)); then say "  replace   $dest (differs, not in the record: --replace)"
-        else say "  keep      $dest (differs and is not in the record: copied by hand? --replace overwrites it)"; kept=$((kept + 1)); fi ;;
+      hand)   say "  replace   $dest (differs, not in the record: --replace)" ;;
     esac
     [[ $mode == install ]] || continue
-    if [[ $what == new || $what == update || ( $what == hand && $replace == 1 ) ]]; then
-      install_file "$file" "$dest"
-      [[ $(sha "$root$dest") == "$new" ]] || die "$dest does not read back as written"
-      rec[$dest]=$new; changed=$((changed + 1))
-    elif [[ $what == same ]]; then
-      rec[$dest]=$new
-    fi
+    if [[ $what == same ]]; then rec[$dest]=$new; continue; fi
+    install_file "$file" "$dest"
+    [[ $(sha "$root$dest") == "$new" ]] || die "$dest does not read back as written"
+    rec[$dest]=$new; changed=$((changed + 1))
   done
   ((${#items[@]})) || say "  nothing to install"
   if [[ $mode == install ]]; then
     save_record
     say "Installed $changed file(s); record: $record"
-    ((changed)) && say "Reboot, or 'systemctl start omamobile-adsp' for the ADSP, to use them."
+    if ((changed)); then say "Reboot, or 'systemctl start omamobile-adsp' for the ADSP, to use them."; fi
   fi
   ((kept == 0))
 }
