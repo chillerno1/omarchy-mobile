@@ -146,6 +146,13 @@ for f in "sock-extra:holds 'f planted'" "sock-wrong:is not the host's" "sock-twi
 done
 pass "audit: the socket directory, once and empty; refused a planted file, another directory, a second bind"
 
+mkdir -p "$H/run/omamobile-fp/sock" && echo $$ > "$H/run/omamobile-fp/ns.pid" && : > "$H/run/omamobile-fp/sock/bridge.sock"
+st audit > "$out" 2>&1 && fail "audit with the Pixel runner's stack up"
+grep -q "omamobile-fp-chroot's stack runs (PID $$)" "$out" || fail "audit: the Pixel runner's stack not named"
+[[ -e $H/run/omamobile-fp/sock/bridge.sock ]] || fail "audit: took the Pixel runner's socket"
+rm -rf "$H/run/omamobile-fp"
+pass "audit, bridge: refused while the Pixel runner's stack owns the socket directory"
+
 # --- hal, with static fakes (the chroot has no bionic here) ---
 if printf 'int main(void){return 0;}\n' > "$t/cc.c" && gcc -static -o "$t/cc" "$t/cc.c" 2>/dev/null; then
   cat > "$t/fake.c" <<'EOF'
