@@ -10,7 +10,10 @@
 # whole-disk node is removed either way. A LUN named in UFS_RW_LUNS (a
 # test descriptor's sde, enchilada's layout) is guarded as sda is; without
 # that list, or with a bad one or a closed allowlist, it stays read-only at
-# the disk level.
+# the disk level. An image whose /etc/omamobile-slot says "a" (the Saga,
+# whose stock system is on slot B) has slot A's names instead of slot B's,
+# and only on the board its /etc/omamobile-compatible names; without that
+# board, or with any other slot, every partition stays read-only.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
@@ -92,7 +95,9 @@ grep -q '^ufs_rw_load$' "$t/guard.sh" || fail "the init loads the allowlist befo
 grep -q '^ufs_ro_pass() {$' "$t/guard.sh" || fail "ufs_ro_pass found in initramfs/init"
 B=$t/b
 sed -e "s|> /dev/kmsg|>> /dev/kmsg|" -e "s|/sys/block/|$B/sys/block/|g" -e "s|/dev/|$B/dev/|g" -e "s|/run/|$B/run/|g" \
-    -e "s|/etc/omamobile-|$B/etc/omamobile-|g" -e 's/\[ -b /[ -e /' "$t/guard.sh" > "$t/guard-test.sh"
+    -e "s|/etc/omamobile-|$B/etc/omamobile-|g" -e "s|/proc/device-tree/compatible|$B/compatible|g" \
+    -e 's/\[ -b /[ -e /' "$t/guard.sh" > "$t/guard-test.sh"
+grep -q "$B/compatible" "$t/guard-test.sh" || fail "the slot A check reads the board's compatible"
 mkdir -p "$t/bin"
 cat > "$t/bin/blockdev" <<EOF
 #!/bin/sh
@@ -102,7 +107,7 @@ for f in $B/sys/block/\$n/ro $B/sys/block/*/\$n/ro; do [ -f "\$f" ] && echo 1 > 
 exit 0
 EOF
 chmod +x "$t/bin/blockdev"
-parts="boot_a boot_b init_boot_b vendor_boot_b vendor_kernel_boot_b dtbo_b userdata persist efs modem_b vbmeta_b devinfo"
+parts="boot_a boot_b init_boot_b vendor_boot_b vendor_kernel_boot_b dtbo_b userdata persist efs modem_b vbmeta_b devinfo vendor_boot_a dtbo_a"
 fake_disks() {
   rm -rf "$B" && mkdir -p "$B/dev" "$B/etc" "$B/sys/block/sda" "$B/sys/block/sdb/sdb1"
   echo 0 > "$B/sys/block/sda/ro"; : > "$B/dev/sda"
@@ -236,3 +241,48 @@ pass "a malformed LUN list leaves every LUN but sda read-only"
 fake_disks
 printf 'boot_b userdata persist\n' > "$B/etc/omamobile-ufs-rw"; printf 'sde\n' > "$B/etc/omamobile-ufs-rw-luns"
 closed "a closed allowlist with a LUN list" "allowlist names persist"
+
+# --- The slot: /etc/omamobile-slot (the Saga owns slot A) ---
+saga_rw="boot_a vendor_boot_a dtbo_a userdata"
+fake_disks
+printf '%s\n' "$cheetah_rw" > "$B/etc/omamobile-ufs-rw"; printf 'b\n' > "$B/etc/omamobile-slot"
+guard
+[[ $(writable) == "$cheetah_rw" ]] || fail "slot b said outright: cheetah's six partitions, as without the file (got: $(writable))"
+disk_checks "slot b"
+! grep -q 'owns slot' "$B/dev/kmsg" || fail "slot b logs nothing new"
+pass "a slot file saying b changes nothing"
+
+saga() { # slot file content, compatible ('' for none), allowlist; LUN list sde
+  fake_disks
+  printf '%s\n' "$3" > "$B/etc/omamobile-ufs-rw"; printf 'sde\n' > "$B/etc/omamobile-ufs-rw-luns"
+  printf '%s\n' "$1" > "$B/etc/omamobile-slot"
+  printf 'osom,ingot\0qcom,sm8475\0' > "$B/compatible"
+  [[ -z $2 ]] || printf '%s\n' "$2" > "$B/etc/omamobile-compatible"
+}
+saga a osom,ingot "$saga_rw"
+guard
+[[ $(writable) == "$saga_rw" ]] || fail "slot a: slot A's images and userdata on sda (got: $(writable))"
+[[ $(writable sde) == boot_a ]] || fail "slot a: boot_a alone on sde, never boot_b (got: $(writable sde))"
+grep -q 'this image owns slot a' "$B/dev/kmsg" || fail "slot a: the slot is logged"
+disk_checks "slot a" sde
+[[ -z $(unguarded) ]] || fail "slot a: nothing outside the allowlist is writable (got: $(unguarded))"
+pass "slot a on its own board: boot_a, vendor_boot_a, dtbo_a and userdata writable, sde guarded as sda"
+
+slot_closed() { # what, expected kmsg text, saga arguments
+  local what=$1 msg=$2; shift 2
+  saga "$@"
+  guard
+  [[ -z $(writable) && -z $(writable sde) ]] || fail "$what: every partition read-only (writable: $(writable) / $(writable sde))"
+  grep -q -- "$msg" "$B/dev/kmsg" || { cat "$B/dev/kmsg"; fail "$what: says so on kmsg ($msg)"; }
+  disk_checks "$what"
+  pass "$what: every partition read-only"
+}
+slot_closed "slot a naming a slot B image" "allowlist names boot_b" a osom,ingot "boot_a boot_b userdata"
+slot_closed "slot a naming dtbo_b" "allowlist names dtbo_b" a osom,ingot "boot_a dtbo_b userdata"
+slot_closed "slot a without a board compatible" "has no board compatible" a '' "$saga_rw"
+slot_closed "slot a for another board" "slot a image is for google,gs201-cheetah, board is osom,ingot" a google,gs201-cheetah "$saga_rw"
+slot_closed "a slot named c" "malformed slot" c osom,ingot "$saga_rw"
+slot_closed "a slot of 'a b'" "malformed slot" 'a b' osom,ingot "$saga_rw"
+slot_closed "a slot of '*'" "malformed slot" '*' osom,ingot "$saga_rw"
+slot_closed "an empty slot file" "malformed slot" '' osom,ingot "$saga_rw"
+slot_closed "a slot b image naming slot A's images" "allowlist names boot_a" b osom,ingot "$saga_rw"

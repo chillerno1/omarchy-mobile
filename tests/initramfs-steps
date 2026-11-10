@@ -5,7 +5,9 @@
 # switch (USB_SWITCH). bin/omamobile packs each only from its descriptor key,
 # and initramfs/init runs the board-specific ones only when the board's
 # first compatible is the image's COMPATIBLE, so a raven image can't touch
-# another phone's I2C, and cheetah's image packs nothing new.
+# another phone's I2C, and cheetah's image packs nothing new. The
+# no-USB-host self-recovery crashes the kernel unless the image's
+# /etc/omamobile-no-usb-host says "stay" (the Saga), when it stays up.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
@@ -136,3 +138,42 @@ grep -q 'say: INITRAMFS_MODULES: sec-acpm is built in' "$t/log" || fail "a built
 pack "$t/packed2" "$m" max77759 nvmem-max77759 > "$t/log" 2>&1 && fail "a missing module stops the build"
 grep -q "die: INITRAMFS_MODULES: no nvmem-max77759.ko" "$t/log" || fail "a missing module is named"
 pass "INITRAMFS_MODULES: a built-in module is left out, a missing one stops the build"
+
+# --- Boot time: no USB host ---
+# The self-recovery subshell as the init has it, run in the foreground
+# with its paths pointed into $t/nousb; sleep, dmesg and sync are stubs.
+N=$t/nousb
+mkdir -p "$N/bin" "$N/udc/x" "$N/etc"
+awk '/^# Self-recovery for bring-up/ {on = 1} on; on && /^\) &$/ {exit}' "$init" > "$N/sub.sh"
+tail -n 1 "$N/sub.sh" | grep -qx ') &' || fail "the self-recovery subshell found in $init"
+sed -e 's|^) &$|)|' -e "s|/sys/class/udc/|$N/udc/|" -e "s|/etc/omamobile-|$N/etc/omamobile-|g" \
+    -e "s|/proc/sysrq-trigger|$N/sysrq|" -e "s|/dev/kmsg|$N/kmsg|" -e "s|/run/omamobile-resizing|$N/resizing|" \
+    "$N/sub.sh" > "$N/sub-test.sh"
+grep -q "$N/sysrq" "$N/sub-test.sh" || fail "the subshell's crash is redirected"
+printf '#!/bin/sh\nexit 0\n' > "$N/bin/sleep"
+printf '#!/bin/sh\necho "dwc3: fake log line"\n' > "$N/bin/dmesg"
+printf '#!/bin/sh\nexit 0\n' > "$N/bin/sync"
+chmod +x "$N/bin/"*
+echo suspended > "$N/udc/x/state"
+nousb() { # content of the no-USB-host file, or - for none
+  rm -f "$N/sysrq" "$N/screen" "$N/kmsg" "$N/etc/omamobile-no-usb-host"
+  [[ $1 == - ]] || printf '%s\n' "$1" > "$N/etc/omamobile-no-usb-host"
+  PATH="$N/bin:$PATH" SCREEN="$N/screen" sh "$N/sub-test.sh"
+}
+nousb stay
+[[ ! -e $N/sysrq ]] || fail "stay: no crash"
+grep -q 'USB never configured' "$N/screen" || fail "stay: the reason is on screen"
+grep -q 'stays in the initramfs' "$N/screen" && grep -q 'ssh root@172.16.42.1' "$N/screen" \
+  || { cat "$N/screen"; fail "stay: the screen says the phone stays and how to recover"; }
+! grep -q crashing "$N/screen" || fail "stay: no crash announced"
+grep -q 'staying in the initramfs' "$N/kmsg" || fail "stay: logged on kmsg"
+for c in - '' STAY 'stay now'; do
+  nousb "$c"
+  [[ $(cat "$N/sysrq" 2>/dev/null) == c ]] || fail "no-USB-host file '$c': the kernel is crashed as before"
+  grep -q 'crashing in 20 s so ABL falls back to slot A' "$N/screen" || fail "no-USB-host file '$c': the crash is announced"
+  ! grep -q 'stays in the initramfs' "$N/screen" || fail "no-USB-host file '$c': no stay message"
+done
+echo configured > "$N/udc/x/state"
+nousb -
+[[ ! -e $N/sysrq && ! -e $N/screen ]] || fail "a configured gadget: nothing happens"
+pass "no USB host: a crash as before, unless the image says stay, which stays up and says how to recover"
