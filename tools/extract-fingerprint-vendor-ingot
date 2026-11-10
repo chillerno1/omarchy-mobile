@@ -1,0 +1,343 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# extract-fingerprint-vendor-ingot: build the fingerprint chroot's Android
+# files for the Solana Mobile Saga (ingot) out of the user's own LineageOS
+# A/B OTA zip, on the user's own machine.
+#
+# The Saga's fingerprint sensor (Betterlife BF83112) is matched by a QSEE
+# trusted application, btlap64, which the vendor fingerprint HAL loads
+# through /dev/qseecom; qseecomd serves QSEE's listener requests (RPMB,
+# storage, time). Those binaries are the vendor's and not ours to
+# redistribute, so Omarchy Mobile never ships them: this tool pulls exactly
+# what the chroot needs from an image the user already has, and nothing
+# else. tools/extract-fingerprint-vendor does the same for the Pixels from
+# a Google factory image.
+#
+# What it takes:
+#   vendor:  the fingerprint 2.1 HAL service, fingerprint.betterlife.so and
+#            libBtlFpHal.so (which it dlopens), qseecomd and the listener
+#            libraries qseecomd dlopens, build.prop, and the shared
+#            libraries all of those need (their DT_NEEDED closure, vendor
+#            copies first)
+#   system:  the libraries the above need from /system (closure again)
+#   runtime: the bionic linker and libc/libm/libdl from com.android.runtime
+#   modem:   the trusted application, btlap64.mdt and btlap64.bNN, from the
+#            modem partition's image/ directory, installed where the HAL
+#            looks for it: /vendor/firmware_mnt/image
+#
+# The output is the chroot's read-only image tree:
+#   OUT/root/{system,vendor,apex/com.android.runtime}
+#   OUT/MANIFEST         one line per file: sha256, mode, path
+#   OUT/SOURCE           the vendor build fingerprint it came from
+# Nothing here touches the phone.
+#
+# Needs: python3, debugfs (e2fsprogs), readelf (binutils) or llvm-readelf,
+# unzip, sha256sum.
+set -euo pipefail
+
+DEVICE="ingot"
+LIB=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/lib" && pwd)
+
+# Entry points, relative to the vendor partition's root.
+VENDOR_BINS=(
+  bin/hw/android.hardware.biometrics.fingerprint@2.1-service
+  bin/qseecomd
+)
+# Loaded with dlopen, so no closure walk finds them: the HAL module
+# (libhardware opens it from lib64/hw), the library it loads, and the
+# listener services qseecomd loads. A listener this build lacks is skipped
+# and named; qseecomd logs the failed dlopen and goes on.
+VENDOR_HAL_LIBS=(lib64/hw/fingerprint.betterlife.so lib64/libBtlFpHal.so)
+LISTENER_LIBS=(libdrmfs.so librpmb.so libssd.so libdrmtime.so libops.so
+               libqisl.so libsecureui.so libspl.so libGPreqcancel.so)
+VENDOR_FILES=(build.prop)
+TA=btlap64
+TA_DIR=vendor/firmware_mnt/image
+RUNTIME_APEX="system/apex/com.android.runtime.apex"
+RUNTIME_FILES=(bin/linker64 lib64/bionic/libc.so lib64/bionic/libm.so
+               lib64/bionic/libdl.so lib64/bionic/libdl_android.so)
+
+usage() {
+  cat <<USAGE
+Usage: extract-fingerprint-vendor-ingot [-o OUTDIR] [-w WORKDIR] [-f] SOURCE
+
+  SOURCE   the Saga's LineageOS A/B OTA zip (lineage-*-ingot-signed.zip),
+           or a directory holding vendor.img, system.img and modem.img
+           already taken out of one
+  -o DIR   output directory (default: ./out/fingerprint-vendor-ingot)
+  -w DIR   scratch directory for the partition images and the staged
+           libraries, about 3 GB (default: a temp dir in \$TMPDIR)
+  -f       skip the device checks
+USAGE
+}
+
+say() { printf '==> %s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null || die "$1 not found ($2)"; }
+
+OUT="./out/fingerprint-vendor-ingot" WORK="" FORCE=""
+while getopts "o:w:fh" opt; do
+  case $opt in
+    o) OUT=$OPTARG ;;
+    w) WORK=$OPTARG ;;
+    f) FORCE=1 ;;
+    h) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -eq 1 ]] || { usage >&2; exit 2; }
+SRC=$(readlink -f "$1")
+[[ -e "$SRC" ]] || die "no such file: $1"
+
+need python3 "install python"
+need unzip "install unzip"
+need debugfs "install e2fsprogs"
+need sha256sum "install coreutils"
+if command -v readelf >/dev/null; then READELF=readelf
+elif command -v llvm-readelf >/dev/null; then READELF=llvm-readelf
+else die "readelf not found (install binutils or llvm)"; fi
+# The images are untrusted input: Python reads them isolated (-I).
+py() { python3 -I "$@"; }
+
+if [[ -n "$WORK" ]]; then
+  mkdir -p "$WORK"
+  WORK=$(mktemp -d "$WORK/xfp.XXXXXX")
+else
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/xfp.XXXXXX")
+fi
+trap 'rm -rf "$WORK"' EXIT
+
+magic_at() { od -An -tx4 -j "$2" -N4 "$1" | tr -d ' \n'; }
+is_ext4() { [[ "$(od -An -tx2 -j 1080 -N2 "$1" | tr -d ' ')" == ef53 ]]; }
+is_erofs() { [[ "$(magic_at "$1" 1024)" == e0f5e1e2 ]]; }
+
+# vendor.img, system.img and modem.img into $IMG (the source directory
+# itself when SOURCE is one: debugfs and fat16.py only read).
+if [[ -d "$SRC" ]]; then
+  IMG=$SRC
+  for part in vendor system modem; do
+    [[ -f "$IMG/$part.img" ]] || die "no $part.img in $SRC"
+  done
+else
+  [[ "$(magic_at "$SRC" 0)" == 04034b50 ]] || die "$(basename "$SRC") is not a zip"
+  unzip -Z1 "$SRC" | grep -qx payload.bin ||
+    die "$(basename "$SRC") has no payload.bin: not an A/B OTA"
+  if [[ -z $FORCE ]]; then
+    dev=$(unzip -p "$SRC" META-INF/com/android/metadata 2>/dev/null | sed -n 's/^pre-device=//p' | head -1)
+    [[ "$dev" == "$DEVICE" ]] ||
+      die "this OTA is for '${dev:-unknown}', not $DEVICE (META-INF/com/android/metadata); use -f to override"
+  fi
+  IMG=$WORK/img
+  mkdir -p "$IMG"
+  say "Unpacking vendor, system and modem from payload.bin"
+  py "$LIB/ota-payload.py" "$SRC" extract "$IMG" vendor system modem >/dev/null
+fi
+for part in vendor system; do
+  if is_erofs "$IMG/$part.img"; then
+    die "$part.img is EROFS; this tool reads ext4 only (fsck.erofs --extract support is not written yet)"
+  fi
+  is_ext4 "$IMG/$part.img" || die "$part.img is not ext4 (a sparse image? run simg2img first)"
+done
+
+# rdump one path ($2, no leading /) from ext4 image $1 into directory $3.
+# Symlinks are kept as symlinks.
+rdump() {
+  mkdir -p "$3"
+  debugfs -R "rdump /$2 $3" "$1" 2>&1 |
+    grep -v -e '^debugfs ' -e 'Operation not permitted while changing ownership' >&2 || true
+}
+dump() { # $1 image, $2 path (no leading /), $3 output file; keeps the mode
+  mkdir -p "$(dirname "$3")"
+  debugfs -R "dump -p /$2 $3" "$1" 2>/dev/null
+}
+
+# The vendor partition says which device it was built for.
+mkdir -p "$WORK/v"
+dump "$IMG/vendor.img" build.prop "$WORK/v/build.prop"
+[[ -s "$WORK/v/build.prop" ]] || die "vendor.img has no build.prop"
+dev=$(sed -n 's/^ro.product.vendor.device=//p' "$WORK/v/build.prop" | head -1)
+[[ "$dev" == "$DEVICE" || -n "$FORCE" ]] ||
+  die "vendor partition is for '${dev:-unknown}', not $DEVICE; use -f to override"
+fp=$(sed -n 's/^ro.vendor.build.fingerprint=//p' "$WORK/v/build.prop" | head -1)
+say "Vendor partition: $fp"
+
+# Stage the entry points and whole lib directories into $WORK/{v,s,r},
+# then copy only the closure into the output.
+say "Reading the vendor partition"
+for b in "${VENDOR_BINS[@]}"; do dump "$IMG/vendor.img" "$b" "$WORK/v/$b"; done
+rdump "$IMG/vendor.img" lib64 "$WORK/v"
+say "Reading the system partition"
+mkdir -p "$WORK/s/system"
+rdump "$IMG/system.img" system/lib64 "$WORK/s/system"
+dump "$IMG/system.img" "$RUNTIME_APEX" "$WORK/s/$RUNTIME_APEX"
+if [[ ! -s "$WORK/s/$RUNTIME_APEX" ]]; then
+  dump "$IMG/system.img" "${RUNTIME_APEX%.apex}.capex" "$WORK/s/runtime.capex"
+  [[ -s "$WORK/s/runtime.capex" ]] &&
+    die "this build ships com.android.runtime compressed (.capex); not supported yet"
+  die "no /$RUNTIME_APEX in system.img"
+fi
+
+say "Reading com.android.runtime"
+unzip -p "$WORK/s/$RUNTIME_APEX" apex_payload.img > "$WORK/runtime.img"
+is_erofs "$WORK/runtime.img" && die "com.android.runtime's payload is EROFS; this tool reads ext4 only"
+is_ext4 "$WORK/runtime.img" || die "com.android.runtime payload is not ext4"
+mkdir -p "$WORK/r"
+for d in bin lib64; do rdump "$WORK/runtime.img" "$d" "$WORK/r"; done
+
+# Where a library lives inside the chroot, searching like the chroot's
+# LD_LIBRARY_PATH does: /vendor first; bionic itself always comes from the
+# runtime APEX.
+declare -A PICKED=()
+lib_path() { # $1 soname -> "<stage dir>|<chroot path>"
+  local n=$1 c
+  case $n in
+    libc.so|libm.so|libdl.so|libdl_android.so)
+      echo "$WORK/r/lib64/bionic/$n|apex/com.android.runtime/lib64/bionic/$n"; return ;;
+  esac
+  for c in v:lib64 v:lib64/hw s:system/lib64; do
+    local tree=${c%%:*} dir=${c#*:} prefix
+    [[ $tree == v ]] && prefix=vendor/ || prefix=
+    if [[ -e "$WORK/$tree/$dir/$n" ]]; then
+      echo "$WORK/$tree/$dir/$n|$prefix$dir/$n"; return
+    fi
+  done
+}
+
+# Follow a staged symlink the way it resolves inside the chroot.
+stage_target() {
+  local f=$1 t
+  while [[ -L $f ]]; do
+    t=$(readlink "$f")
+    case $t in
+      /apex/com.android.runtime/*) f="$WORK/r/${t#/apex/com.android.runtime/}" ;;
+      /system/*) f="$WORK/s$t" ;;
+      /vendor/*) f="$WORK/v/${t#/vendor/}" ;;
+      /*) die "$f points outside the chroot: $t" ;;
+      *) f="$(dirname "$f")/$t" ;;
+    esac
+  done
+  echo "$f"
+}
+
+needed() { "$READELF" -d "$1" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'; }
+
+missing=()
+walk() { # $1 file on disk
+  local n hit src
+  while read -r n; do
+    [[ -n $n ]] || continue
+    [[ -n "${PICKED[$n]:-}" ]] && continue
+    hit=$(lib_path "$n")
+    if [[ -z $hit ]]; then missing+=("$n"); PICKED[$n]=missing; continue; fi
+    PICKED[$n]=${hit#*|}
+    src=${hit%%|*}
+    walk "$(stage_target "$src")"
+  done < <(needed "$1")
+}
+
+for b in "${VENDOR_BINS[@]}"; do
+  [[ -f "$WORK/v/$b" ]] || die "/vendor/$b is missing from this image"
+  walk "$WORK/v/$b"
+done
+roots=()
+for l in "${VENDOR_HAL_LIBS[@]}"; do
+  [[ -f "$WORK/v/$l" ]] || die "/vendor/$l is missing from this image"
+  roots+=("$l")
+done
+# Only the listeners qseecomd names (its strings), from /vendor/lib64.
+absent=()
+for l in "${LISTENER_LIBS[@]}"; do
+  grep -aqF "$l" "$WORK/v/bin/qseecomd" || die "qseecomd does not name $l: a different qseecomd?"
+  if [[ -f "$WORK/v/lib64/$l" ]]; then roots+=("lib64/$l"); else absent+=("$l"); fi
+done
+for l in "${roots[@]}"; do
+  PICKED[${l##*/}]=vendor/$l
+  walk "$WORK/v/$l"
+done
+((${#missing[@]} == 0)) || die "unresolved libraries: ${missing[*]}"
+((${#absent[@]} == 0)) || warn "qseecomd's listener libraries not in this build: ${absent[*]}"
+
+# The trusted application: NAME.mdt and one NAME.bNN per ELF program header.
+say "Reading $TA from the modem partition"
+mkdir -p "$WORK/ta"
+tafiles=$(py "$LIB/fat16.py" "$IMG/modem.img" ls image |
+  awk -v ta="$TA" '$1 == "-" && tolower($3) ~ ("^" ta "\\.(mdt|b[0-9][0-9])$") {print $3}')
+grep -qix "$TA.mdt" <<<"$tafiles" || die "no image/$TA.mdt in modem.img"
+for f in $tafiles; do
+  lc=${f,,}
+  py "$LIB/fat16.py" "$IMG/modem.img" get "image/$f" "$WORK/ta/$lc"
+done
+[[ "$(head -c4 "$WORK/ta/$TA.mdt" | od -An -tx1 | tr -d ' ')" == 7f454c46 ]] ||
+  die "$TA.mdt is not an ELF file"
+case $(od -An -tu1 -j4 -N1 "$WORK/ta/$TA.mdt" | tr -d ' ') in
+  1) phoff=44 ;;
+  2) phoff=56 ;;
+  *) die "$TA.mdt: unknown ELF class" ;;
+esac
+phnum=$(od -An -tu2 -j$phoff -N2 --endian=little "$WORK/ta/$TA.mdt" | tr -d ' ')
+nseg=$(find "$WORK/ta" -name "$TA.b[0-9][0-9]" | wc -l)
+((nseg == phnum)) || die "$TA.mdt has $phnum program headers but modem.img holds $nseg $TA.bNN files"
+for ((i = 0; i < phnum; i++)); do
+  [[ -f $(printf '%s/ta/%s.b%02d' "$WORK" "$TA" "$i") ]] || die "$(printf '%s.b%02d' "$TA" "$i") is missing from modem.img"
+done
+
+# Copy into the output tree. A library picked through a symlink into the
+# runtime APEX (system/lib64/libc.so -> /apex/...) keeps the symlink.
+root="$OUT/root"
+rm -rf "$root"; mkdir -p "$root"
+put() { # $1 source on disk, $2 path in chroot
+  mkdir -p "$root/$(dirname "$2")"
+  if [[ -L "$1" ]]; then cp -P "$1" "$root/$2"; else cp "$1" "$root/$2"; fi
+}
+for b in "${VENDOR_BINS[@]}" "${VENDOR_FILES[@]}"; do put "$WORK/v/$b" "vendor/$b"; done
+for f in "${RUNTIME_FILES[@]}"; do put "$WORK/r/$f" "apex/com.android.runtime/$f"; done
+mkdir -p "$root/system/bin" "$root/system/lib64"
+ln -sfn /apex/com.android.runtime/bin/linker64 "$root/system/bin/linker64"
+for key in "${!PICKED[@]}"; do
+  dst=${PICKED[$key]}
+  [[ $dst == apex/* || -e "$root/$dst" || -L "$root/$dst" ]] && continue
+  case $dst in
+    vendor/*) put "$WORK/v/${dst#vendor/}" "$dst" ;;
+    *)        put "$WORK/s/$dst" "$dst" ;;
+  esac
+done
+# /system/lib64 also needs the bionic symlinks for system libraries.
+for n in libc.so libm.so libdl.so libdl_android.so; do
+  ln -sfn "/apex/com.android.runtime/lib64/bionic/$n" "$root/system/lib64/$n"
+done
+mkdir -p "$root/$TA_DIR"
+cp "$WORK/ta/$TA".* "$root/$TA_DIR/"
+chmod -R u+w,go-w "$root"
+
+# Every executable's interpreter (PT_INTERP) must exist inside the chroot.
+interp() { "$READELF" -lW "$1" 2>/dev/null | sed -n 's/.*\[Requesting program interpreter: \(.*\)\]/\1/p'; }
+while read -r f; do
+  i=$(interp "$f")
+  [[ -z $i ]] && continue
+  [[ -e "$root$i" || -L "$root$i" ]] || die "${f#"$root"/} needs the interpreter $i, missing from the chroot"
+done < <(find "$root/vendor/bin" -type f 2>/dev/null)
+
+# Every symlink must resolve inside the chroot.
+while read -r l; do
+  t=$(readlink "$l")
+  [[ $t == /* ]] && t="$root$t" || t="$(dirname "$l")/$t"
+  [[ -e "$t" ]] || die "dangling symlink in the chroot: ${l#"$root"/} -> $(readlink "$l")"
+done < <(find "$root" -type l)
+
+# Sanity checks: the HAL is the Betterlife one and loads $TA over QSEECOM.
+grep -aqF "$TA" "$root/vendor/lib64/libBtlFpHal.so" ||
+  die "libBtlFpHal.so does not name $TA"
+grep -aqF /dev/qseecom "$root/vendor/lib64/libQSEEComAPI.so" ||
+  die "libQSEEComAPI.so does not open /dev/qseecom"
+
+(cd "$root" && find . -type f -printf '%m %P\n' | sort -k2 |
+  while read -r mode path; do
+    printf '%s %s %s\n' "$(sha256sum "$path" | cut -d' ' -f1)" "$mode" "$path"
+  done) > "$OUT/MANIFEST"
+echo "$fp" > "$OUT/SOURCE"
+
+say "$(wc -l < "$OUT/MANIFEST") files, $(du -sh "$root" | cut -f1), in $root"
+say "Source: $fp"
+echo "These are the vendor's proprietary binaries from your own OTA image. Do not redistribute them."
