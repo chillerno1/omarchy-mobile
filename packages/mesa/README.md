@@ -2,7 +2,8 @@
 # mesa (Omarchy Mobile build)
 
 Arch Linux's Mesa 26.2.4 package, rebuilt for the Pixel 7 Pro and the
-Pixel 6 and 6 Pro, with additional Pixel 9a Mali-G715 support. Mali-G710
+Pixel 6 and 6 Pro, with additional Pixel 9a Mali-G715 support, and with
+freedreno for Qualcomm phones (Adreno 730 in the Solana Mobile Saga). Mali-G710
 (gs201) and Mali-G78 (gs101, with upstream's G68 next to it) are added to
 Panfrost's model table. Without an entry, Mesa
 rejects the GPU (for the G710 even when Panthor is loaded): the Gallium
@@ -19,6 +20,7 @@ driver bails out on an unknown model, and PanVK returns
 | `0005-*` | Upstream G715 model entry, variant 4; the model entry alone is insufficient |
 | `0006-*` | Upstream CSF NOP payload/type prerequisite |
 | `0007-*` through `0010-*` | Upstream architecture 11 XML, shared build, Gallium and PanVK support |
+| `0011-gallivm-Query-host-CPU-features-on-aarch64-too.patch` | Upstream's llvmpipe fix for aarch64 cores whose SVE is switched off (below) |
 | `UPSTREAM.md` | Merge request text for upstream Mesa |
 | `.SRCINFO` | `makepkg --printsrcinfo` output |
 
@@ -26,19 +28,55 @@ driver bails out on an unknown model, and PanVK returns
 
 - The patches above.
 - `arch=(aarch64)`.
-- Only drivers this phone can use:
-  - Gallium `panfrost` (which brings `kmsro`), `llvmpipe`, `softpipe` and `zink`.
-  - Vulkan `panfrost` (PanVK).
+- Only drivers these phones can use:
+  - Gallium `freedreno` (Adreno, `msm_dri.so`), `panfrost` (which brings
+    `kmsro`), `llvmpipe`, `softpipe` and `zink`.
+  - Vulkan `freedreno` (Turnip) and `panfrost` (PanVK).
   - The `device-select` and `anti-lag` layers.
-- Only three split packages: `mesa`, `vulkan-panfrost` and
-  `vulkan-mesa-implicit-layers` (which `vulkan-panfrost` depends on).
-- `pkgrel=1.4`. makepkg only accepts `integer[.integer]`, so the Omarchy Mobile
-  marker is in Mesa's version string instead: `26.2.4-arch1.1.4.omamobile4`.
+- Only four split packages: `mesa`, `vulkan-freedreno`, `vulkan-panfrost`
+  and `vulkan-mesa-implicit-layers` (which both Vulkan drivers depend on).
+  freedreno and Turnip need no build dependency the Panfrost build didn't
+  already have (libdrm, glslang 12.2 or later, libxml2); `vulkan-freedreno`
+  has the same runtime dependencies as `vulkan-panfrost`.
+- `pkgrel=1.5`. makepkg only accepts `integer[.integer]`, so the Omarchy Mobile
+  marker is in Mesa's version string instead: `26.2.4-arch1.1.5.omamobile5`.
   That string shows up in `GL_VERSION` and in the `libgallium-*.so` file name.
 
 The other ALARM split packages (`vulkan-swrast`, `opencl-mesa` and so on)
 don't depend on `mesa`'s exact version. They can stay installed at
 `1:26.2.4-1`.
+
+## llvmpipe on cores without SVE (patch 0011)
+
+On SM8475 (Cortex-X2, A710 and A510) the firmware leaves SVE switched
+off: the kernel's `Features` line has no `sve`, `sve2` or `bf16`. Mesa
+26.2.4 asked LLVM for the host's features only on 32-bit Arm, so on
+aarch64 LLVM took the feature set from the CPU name alone; `cortex-x2`
+implies SVE2, and llvmpipe's JIT code died with SIGILL on its first SVE
+instruction (`index z3.s, #0, #1`).
+
+Patch 0011 is upstream's fix (65b4a553, picked to 26.2 as 0e230a5f and
+released in 26.2.5): gallivm passes `llvm::sys::getHostCPUFeatures()` to
+the JIT on aarch64 too. LLVM 23 builds that list from the kernel's
+`Features` line and sets `-sve` when the kernel doesn't report SVE, which
+also turns off SVE2 and everything else that implies SVE. The other
+features the CPU name brings and this kernel doesn't report (BF16, MTE,
+SSBS) have no instructions LLVM emits for llvmpipe's IR: it has no
+`bfloat` type and no tagged memory.
+
+With LLVM 23.1 `llc`, `-mcpu=cortex-x2` (and `cortex-a710`,
+`cortex-a510`) turns a `<4 x i32>` step vector into `index z1.s, #0, #1`;
+with the feature list the patched Mesa passes on this phone
+(`+neon,+fp-armv8,+crc,+lse,+sha3,+sm4,+aes,+sha2,-sve,-rand`) it stays
+NEON. After installing this build, drop any bind-mounted `/proc/cpuinfo`
+workaround, so that LLVM reads the real `Features` line.
+
+The fix covers only what this package builds. ALARM's `vulkan-swrast`
+(lavapipe) and `opencl-mesa` carry their own copy of gallivm, built
+without it, and still crash the same way on these cores until ALARM
+ships Mesa 26.2.5 or later.
+
+Drop the patch when rebasing onto Mesa 26.2.5 or later.
 
 ## Status
 
@@ -99,9 +137,10 @@ sudo pacman -S --needed base-devel
 gpg --recv-keys 57551DE15B968F6341C248F68D8E31AFC32428A6   # Eric Engestrom, signed 26.2.4
 cd packages/mesa
 makepkg -s                       # pulls the makedepends listed in the PKGBUILD
-sudo pacman -U mesa-1:26.2.4-1.4-aarch64.pkg.tar.zst \
-  vulkan-panfrost-1:26.2.4-1.4-aarch64.pkg.tar.zst \
-  vulkan-mesa-implicit-layers-1:26.2.4-1.4-aarch64.pkg.tar.zst
+sudo pacman -U mesa-1:26.2.4-1.5-aarch64.pkg.tar.zst \
+  vulkan-freedreno-1:26.2.4-1.5-aarch64.pkg.tar.zst \
+  vulkan-panfrost-1:26.2.4-1.5-aarch64.pkg.tar.zst \
+  vulkan-mesa-implicit-layers-1:26.2.4-1.5-aarch64.pkg.tar.zst
 ```
 
 Until Panthor exposes `/dev/dri/renderD128`, nothing changes visibly:
@@ -111,7 +150,7 @@ To stop `pacman -Syu` from replacing the build with ALARM's `mesa`, add this
 line to `/etc/pacman.conf`:
 
 ```
-IgnorePkg = mesa vulkan-panfrost vulkan-mesa-implicit-layers
+IgnorePkg = mesa vulkan-freedreno vulkan-panfrost vulkan-mesa-implicit-layers
 ```
 
 Alternatively, publish the build in Omarchy Mobile's own repo listed ahead of

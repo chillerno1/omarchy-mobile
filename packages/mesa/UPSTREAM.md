@@ -65,3 +65,17 @@ The patch is `0001-panfrost-add-Mali-G710-to-the-model-table.patch` in this
 directory, written against 26.2.4. Against `main` (checked 2026-10-11, where
 G68/G715/G615 have been added) it applies with fuzz 2, so rebase it onto
 `main` and push a clean commit rather than sending this file as is.
+
+---
+
+## Already upstream: llvmpipe on aarch64 without SVE
+
+`0011-gallivm-Query-host-CPU-features-on-aarch64-too.patch` needs no merge
+request. It is upstream's [65b4a553](https://gitlab.freedesktop.org/mesa/mesa/-/commit/65b4a553b3f54f62f0732c7c249a8da56d3b27fa)
+([!45130](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45130),
+closes [work item 13314](https://gitlab.freedesktop.org/mesa/mesa/-/work_items/13314)),
+picked to the 26.2 branch as [0e230a5f](https://gitlab.freedesktop.org/mesa/mesa/-/commit/0e230a5ffcf2b05598ace6662374b351533cf523)
+([!45215](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45215)) and
+released in Mesa 26.2.5. The file is that stable pick unchanged, without its
+`.pick_status.json` hunk; it applies to 26.2.4 with no offset. Drop it when
+rebasing onto 26.2.5 or later.

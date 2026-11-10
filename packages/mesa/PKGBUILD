@@ -2,7 +2,7 @@
 #
 # Omarchy Mobile build of Mesa for the Pixel 7 Pro (Mali-G710 on Panthor)
 # and the Pixel 6 and 6 Pro (Mali-G78 on Panfrost), plus Pixel 9a
-# (Mali-G715 on Panthor).
+# (Mali-G715 on Panthor) and Qualcomm phones (Adreno on msm, freedreno).
 #
 # Derived from Arch Linux's mesa PKGBUILD, tag 1-26.2.4-1
 # (https://gitlab.archlinux.org/archlinux/packaging/packages/mesa, 0BSD),
@@ -17,15 +17,21 @@
 #    backported (drop it once Mesa ships it in a release).
 #  - 0004-panfrost-add-Mali-G78-to-the-model-table.patch: the Pixel 6's
 #    Mali-G78, next to the G68 (drop it once Mesa ships the G78 entry).
-#  - aarch64 only, and only the drivers this phone can use: Gallium
-#    panfrost (with kmsro), llvmpipe, softpipe and zink; Vulkan panfrost
-#    (PanVK). Splits: mesa, vulkan-panfrost, vulkan-mesa-implicit-layers
-#    (vulkan-panfrost depends on it). No rusticl, NVK, docs or valgrind,
-#    so no Rust crates and a much shorter native build.
+#  - aarch64 only, and only the drivers these phones can use: Gallium
+#    freedreno (Adreno, msm_dri.so), panfrost (with kmsro), llvmpipe,
+#    softpipe and zink; Vulkan freedreno (Turnip) and panfrost (PanVK).
+#    Splits: mesa, vulkan-freedreno, vulkan-panfrost,
+#    vulkan-mesa-implicit-layers (both Vulkan drivers depend on it). No
+#    rusticl, NVK, docs or valgrind, so no Rust crates and a much shorter
+#    native build.
 #  - 0005-0010: upstream G715 model and complete v11 support backports.
 #    See README.md for pinned sources and validation limits.
-#  - pkgrel 1.4: makepkg only allows integer[.integer], so the Omarchy Mobile
-#    marker lives in the VERSION string (".omamobile4"), which shows up in
+#  - 0011-gallivm-Query-host-CPU-features-on-aarch64-too.patch: upstream's
+#    65b4a553 (in 26.2.5 as 0e230a5f). Without it llvmpipe JITs SVE on
+#    cores whose firmware leaves SVE off (Cortex-X2/A710/A510 in SM8475)
+#    and dies with SIGILL. Drop it when rebasing onto 26.2.5 or later.
+#  - pkgrel 1.5: makepkg only allows integer[.integer], so the Omarchy Mobile
+#    marker lives in the VERSION string (".omamobile5"), which shows up in
 #    GL_VERSION and the libgallium file name.
 #
 # Maintainers of the original: Laurent Carlier, Felix Yan, Jan Alexander
@@ -34,15 +40,16 @@
 pkgbase=mesa
 pkgname=(
   mesa
+  vulkan-freedreno
   vulkan-panfrost
   vulkan-mesa-implicit-layers
 )
 pkgver=26.2.4
 _pkgver=${pkgver/[a-z]/-&}
-pkgrel=1.4
-_omamobile=omamobile4
+pkgrel=1.5
+_omamobile=omamobile5
 epoch=1
-pkgdesc="Open-source OpenGL drivers (Omarchy Mobile: Mali-G710, Mali-G78, Mali-G715)"
+pkgdesc="Open-source OpenGL drivers (Omarchy Mobile: Mali-G710, Mali-G78, Mali-G715, Adreno)"
 url="https://www.mesa3d.org/"
 arch=(aarch64)
 license=("MIT AND BSD-3-Clause AND SGI-B-2.0")
@@ -106,6 +113,7 @@ source=(
   0008-panfrost-backport-shared-v11-build-support.patch
   0009-panfrost-backport-v11-Gallium-support.patch
   0010-panvk-backport-v11-support.patch
+  0011-gallivm-Query-host-CPU-features-on-aarch64-too.patch
 )
 validpgpkeys=(
   946D09B5E4C9845E63075FF1D961C596A7203456 # Andres Gomez <tanty@igalia.com>
@@ -126,7 +134,8 @@ b2sums=('28506a9366e3c031acbb52924e43b0ec098f44a3ac3bb839ec2a86fa0faf83652347704
         '0d76906c76f1fd6864818363eccad23ff00309418e9e593b24b060a7833acc9e8ff3ea311dcbfe6270f2c2dc91e66a3cea7ba1b88cb4e81335ecf65bfc1981a2'
         '2be67e1b950a2522c7fbad118b9bb3f826d9f525bd8602d642e217631ad22110e8d6cfb061fe6a4c5ea9ef790f1e1accab352ab3ac6a38842eb3a56c4d780f23'
         'ee055d0e2dcf73fee4c32d9411b82444389624e6234451ee5250b1daa19c7fef9524de4cac32fd94e862f139ecfe9085d05f3de453bca163ead5e3900a17524e'
-        'bbd0305a91034c0b3c2d5967453e40c8f7e5c54ad25b11640844b3b035a3bb4e2703b7d216cb4b8338e5181c04758aaad5d44bf87058ffe1ad03412f2cca225f')
+        'bbd0305a91034c0b3c2d5967453e40c8f7e5c54ad25b11640844b3b035a3bb4e2703b7d216cb4b8338e5181c04758aaad5d44bf87058ffe1ad03412f2cca225f'
+        'e50db4d80eddf1fc1d21ee583aae57ee0580cbb61de554712202fa9b4630ac6951ebe4bb000b7e50d995ce8c2a62710dea81738a23cff44e87f7e05e1d1c5599')
 sha256sums=('bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9'
             'SKIP'
             '1a6ac513fb44579f6ca72a2c92bb7fd86743a4a9dc01f452ac1ab93073100ce1'
@@ -138,7 +147,8 @@ sha256sums=('bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9'
             '4625e91fafc069e53f84f7fd1462b6ba20252adea7d9359f68e7a8f2e7e4e4e6'
             'b1da04f12fb7b0d1ebe884481176f43fed7cbebd2d74d33ddfc6f1841900506a'
             'ff7328fa6c2f8b0bf011d0d1a754bcdd044aa8278fe0951a19af5ac48c05c3ec'
-            'ed4f0d4e3b7dfee57234af6b85ba8c0c8c1f571cc55b84b832dd314610ac3c91')
+            'ed4f0d4e3b7dfee57234af6b85ba8c0c8c1f571cc55b84b832dd314610ac3c91'
+            '43e62d1d70e7dcd6a38d76a788bd55b399f4e0575b67824edc1856f4f5aefda7')
 
 prepare() {
   cd mesa-$_pkgver
@@ -165,7 +175,7 @@ build() {
     --optimization 2
     -D android-libbacktrace=disabled
     -D b_ndebug=true
-    -D gallium-drivers=panfrost,llvmpipe,softpipe,zink
+    -D gallium-drivers=freedreno,panfrost,llvmpipe,softpipe,zink
     -D gallium-extra-hud=true
     -D gallium-mediafoundation=disabled
     -D gallium-rusticl=false
@@ -177,7 +187,7 @@ build() {
     -D video-codecs=all
     # VA-API needs a desktop gallium driver (r600, radeonsi, nouveau, virgl)
     -D gallium-va=disabled
-    -D vulkan-drivers=panfrost
+    -D vulkan-drivers=freedreno,panfrost
     -D vulkan-layers=device-select,anti-lag
     -D vulkan-loader-rpath=
     -D vulkan-manifest-per-architecture=false
@@ -242,6 +252,9 @@ package_mesa() {
 
     cd "$pkgdir"
 
+    _pick vkfdreno $libdir/libvulkan_freedreno.so
+    _pick vkfdreno usr/share/vulkan/icd.d/freedreno_icd.json
+
     _pick vkpfrost $libdir/libvulkan_panfrost.so
     _pick vkpfrost usr/share/vulkan/icd.d/panfrost_icd.json
 
@@ -252,6 +265,35 @@ package_mesa() {
     # indirect rendering
     ln -sr $libdir/libGLX_{mesa,indirect}.so.0
   )
+
+  install -Dm644 mesa-$_pkgver/docs/license.rst -t "$pkgdir/usr/share/licenses/$pkgname"
+}
+
+package_vulkan-freedreno() {
+  pkgdesc="Open-source Vulkan driver for Adreno GPUs (Turnip)"
+  depends=(
+    expat
+    glibc
+    libdisplay-info
+    libdrm
+    libgcc
+    libstdc++
+    libx11
+    libxcb
+    libxshmfence
+    spirv-tools
+    systemd-libs
+    vulkan-icd-loader
+    vulkan-mesa-implicit-layers
+    wayland
+    xcb-util-keysyms
+    zlib
+    zstd
+  )
+  optdepends=("vulkan-mesa-layers: additional vulkan layers")
+  provides=(vulkan-driver)
+
+  mv vkfdreno/* "$pkgdir"
 
   install -Dm644 mesa-$_pkgver/docs/license.rst -t "$pkgdir/usr/share/licenses/$pkgname"
 }

@@ -1,0 +1,45 @@
+From 0e230a5ffcf2b05598ace6662374b351533cf523 Mon Sep 17 00:00:00 2001
+From: Lucie Hartmann <lucie@mntre.com>
+Date: Fri, 9 Oct 2026 18:14:44 +0200
+Subject: [PATCH] gallivm: Query host CPU features on aarch64 too
+
+Commit bc6bfc861fd ("gallivm: guess CPU features also on ARM") only
+handled 32-bit Arm. On aarch64, LLVM picked features from the CPU name
+alone. This fixes llvmpipe on Cortex-X3 without SVE, i.e. SM8550/QCS8550.
+
+Cc: mesa-stable
+Fixes: bc6bfc861fd ("gallivm: guess CPU features also on ARM")
+Closes: https://gitlab.freedesktop.org/mesa/mesa/-/work_items/13314
+Signed-off-by: Lucie Hartmann <lucie@mntre.com>
+(cherry picked from commit 65b4a553b3f54f62f0732c7c249a8da56d3b27fa)
+
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45215>
+---
+ src/gallium/auxiliary/gallivm/lp_bld_misc.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/auxiliary/gallivm/lp_bld_misc.cpp b/src/gallium/auxiliary/gallivm/lp_bld_misc.cpp
+index be8bb6e7223b..d787b9b22c82 100644
+--- a/src/gallium/auxiliary/gallivm/lp_bld_misc.cpp
++++ b/src/gallium/auxiliary/gallivm/lp_bld_misc.cpp
+@@ -317,7 +317,7 @@ void
+ lp_build_fill_mattrs(std::vector<std::string> &MAttrs)
+ {
+ 
+-#if DETECT_ARCH_ARM
++#if DETECT_ARCH_ARM || DETECT_ARCH_AARCH64
+    /* llvm-3.3+ implements sys::getHostCPUFeatures for Arm,
+     * which allows us to enable/disable code generation based
+     * on the results of cpuid on these architectures.
+@@ -378,7 +378,7 @@ lp_build_fill_mattrs(std::vector<std::string> &MAttrs)
+    MAttrs.push_back(util_get_cpu_caps()->has_avx512vl ? "+avx512vl"  : "-avx512vl");
+    MAttrs.push_back(util_get_cpu_caps()->has_avx512vbmi ? "+avx512vbmi"  : "-avx512vbmi");
+ #endif
+-#if DETECT_ARCH_ARM
++#if DETECT_ARCH_ARM || DETECT_ARCH_AARCH64
+    if (!util_get_cpu_caps()->has_neon) {
+       MAttrs.push_back("-neon");
+       MAttrs.push_back("-crypto");
+-- 
+GitLab
+
