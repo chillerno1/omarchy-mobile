@@ -35,6 +35,16 @@
 #                               fakes, in order, each PASS; one FAIL that
 #                               prints the stack's log; the stubs' requests
 #                               counted once (not their liblog copies)
+#   ingot-fp-s4-test nofinger, morning (no terminal: setsid, stdin /dev/null,
+#                               output into a pipe)
+#                            -> nofinger: every part PASS, fprintd SKIP, the
+#                               stack stopped (or left running); morning:
+#                               the ">>> FINGER:" lines, every part PASS with
+#                               fake fprintd tools, the stack left running
+#                               and the pipe closed; a LIST that never ends
+#                               and a failing enrolment: the stack restarted,
+#                               FAIL, the parts that need enrolment SKIP, the
+#                               rest still run, exit 1
 #   lint                     -> shellcheck on both scripts, if installed
 set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -184,8 +194,10 @@ static volatile sig_atomic_t done;
 static void term(int s) { (void)s; done = 1; }
 /* the line protocol, canned: READY 0 0 0; ENROLL enrols id 7 in three
  * touches (a file in the HAL's template directory, so it survives a
- * restart); AUTH alternates MATCH 7 (if enrolled) and NOMATCH; LIST and
- * DELETE read and remove the files; STATUS: OK */
+ * restart; ERROR 1 after one touch while the state has "fail-enroll");
+ * LIST never ends while it has "hang-list"; AUTH alternates MATCH 7 (if
+ * enrolled) and NOMATCH; LIST and DELETE read and remove the files;
+ * STATUS: OK */
 #define FPDATA "/data/vendor_de/0/fpdata"
 static int auths;
 static void answer(FILE *fp, const char *line)
@@ -195,6 +207,8 @@ static void answer(FILE *fp, const char *line)
 
 	if (!strncmp(line, "STATUS", 6)) {
 		fputs("OK\n", fp);
+	} else if (!strncmp(line, "ENROLL", 6) && !access("/data/vendor/omamobile-fp/fail-enroll", F_OK)) {
+		fputs("FINGER NEEDED\nACQUIRED 1 0\nPROGRESS 7 2\nERROR 1\n", fp);
 	} else if (!strncmp(line, "ENROLL", 6)) {
 		fputs("FINGER NEEDED\nACQUIRED 1 0\nPROGRESS 7 2\nACQUIRED 1 0\nPROGRESS 7 1\n"
 		      "ACQUIRED 1 0\nPROGRESS 7 0\n", fp);
@@ -208,6 +222,8 @@ static void answer(FILE *fp, const char *line)
 	} else if (!strncmp(line, "AUTH", 4)) {
 		fputs("FINGER NEEDED\nACQUIRED 1 0\n", fp);
 		fputs(++auths % 2 && !access(FPDATA "/7", F_OK) ? "MATCH 7\n" : "NOMATCH\n", fp);
+	} else if (!strncmp(line, "LIST", 4) && !access("/data/vendor/omamobile-fp/hang-list", F_OK)) {
+		/* a HAL that ends no enumerate: no answer */
 	} else if (!strncmp(line, "LIST", 4)) {
 		fputs(access(FPDATA "/7", F_OK) ? "LIST\n" : "LIST 7\n", fp);
 	} else if (sscanf(line, "DELETE %d", &id) == 1) {
@@ -401,6 +417,81 @@ EOF
     fail "s4 verify without a stack: no FAIL with the stack's log"
   (($(find "$S4LOGS" -name '*.log' | wc -l) == 9)) || fail "s4: a log per step run"
   pass "ingot-fp-s4-test: irq, bridge, enrol, verify, storage, persist, delete, stop against the fakes; a failure shows the stack's log"
+
+  # --- the aggregates, as over "ssh phone cmd": no terminal, stdin /dev/null,
+  # output into a pipe that must close although the stack runs on ---
+  mkdir -p "$H/sys/module/qcom_qseecom_user" "$H/sys/module/betterlife_fp"
+  agg() { # out args...: no controlling terminal, stdin /dev/null, stdout a pipe
+    local o=$1; shift
+    OMAMOBILE_FP_TEST=1 OMAMOBILE_FP_TEST_ROOT="$H" INGOT_FP_STAGE_WRAP="unshare -Ur" INGOT_FP_IMAGE="$IMG" \
+      INGOT_FP_BIN="$BIN" INGOT_FP_STATE="$STATE" INGOT_FP_LOGS="$S4LOGS" INGOT_FP_SECONDS=2 INGOT_FP_GAP=1 \
+      timeout 300 setsid -w "$HERE/ingot-fp-s4-test" "$@" < /dev/null 2>&1 | cat > "$o"
+  }
+  row() { grep -cE "^  $2 +$3 " "$1" > /dev/null || fail "s4 $4: the summary's $2 is not $3"; }
+  out=$t/s4.nofinger.out
+  agg "$out" nofinger || fail "s4 nofinger"
+  grep -q '^S4 nofinger: PASS' "$out" || fail "s4 nofinger: no PASS"
+  for r in preflight hal bridge storage restart stop; do row "$out" "$r" PASS nofinger; done
+  row "$out" fprintd SKIP nofinger
+  grep -q 'S3 PASS: chipid 5f83' "$out" || fail "s4 nofinger: the hal stage's PASS"
+  grep -q 'no enrolled id saved' "$out" || fail "s4 nofinger: the restart without an enrolled id"
+  grep -c '>>> FINGER:' "$out" > /dev/null && fail "s4 nofinger: a finger prompt"
+  grep -c '/dev/tty' "$out" > /dev/null && fail "s4 nofinger: tried the terminal"
+  [[ ! -e $H/run/omamobile-fp/sock ]] || fail "s4 nofinger: the stack is left running"
+  pass "ingot-fp-s4-test nofinger without a terminal: every part PASS, fprintd SKIP, no finger prompt, the stack stopped"
+
+  # fprintd, faked: our "libfprint", the drop-in, and the commands
+  FB=$t/fakebin
+  mkdir -p "$FB" "$H/usr/lib/systemd/system/fprintd.service.d"
+  echo 'fake omamobile_udfps' > "$H/usr/lib/libfprint-2.so.2.0.0"
+  echo 'Environment=FP_OMAMOBILE_UDFPS=/run/omamobile-fp/sock/bridge.sock' > "$H/usr/lib/systemd/system/fprintd.service.d/omamobile-udfps.conf"
+  # shellcheck disable=SC2016  # the fakes' own $1
+  printf '#!/bin/sh\n[ "$1" = show ] && echo "Environment=FP_OMAMOBILE_UDFPS=/run/omamobile-fp/sock/bridge.sock"\nexit 0\n' > "$FB/systemctl"
+  # shellcheck disable=SC2016
+  printf '#!/bin/sh\necho "found 1 devices"\necho "User $1 has no fingers enrolled for Under-display fingerprint sensor (Omarchy Mobile)."\n' > "$FB/fprintd-list"
+  printf '#!/bin/sh\necho "Enroll result: enroll-stage-passed"\necho "Enroll result: enroll-completed"\n' > "$FB/fprintd-enroll"
+  printf '#!/bin/sh\necho "Verify result: verify-match (done)"\n' > "$FB/fprintd-verify"
+  chmod 0755 "$FB"/*
+  out=$t/s4.morning.out
+  PATH=$FB:$PATH agg "$out" morning --user "$(id -un)" || fail "s4 morning"
+  grep -q '^S4 morning: PASS' "$out" || fail "s4 morning: no PASS"
+  for r in bridge enrol verify-match verify-nomatch storage persist fprintd; do row "$out" "$r" PASS morning; done
+  grep -q '^>>> FINGER: TOUCH NOW with ONE finger.*until ENROLLED' "$out" || fail "s4 morning: the enrol prompt"
+  grep -q '^>>> FINGER: SWITCH to a DIFFERENT finger' "$out" || fail "s4 morning: the switch prompt"
+  grep -q '^>>> FINGER: after the restart: touch with the ENROLLED finger' "$out" || fail "s4 morning: the persist prompt"
+  [[ $(grep -c '^<- MATCH 7\|^    <- MATCH 7' "$out") == 2 ]] || fail "s4 morning: two MATCHes (verify, persist)"
+  grep -q '^    <- NOMATCH' "$out" || fail "s4 morning: the NOMATCH"
+  grep -q 'ingot-fp-s4-test lock --image' "$out" || fail "s4 morning: the lock step's command"
+  grep -c '/dev/tty' "$out" > /dev/null && fail "s4 morning: tried the terminal"
+  [[ -S $H/run/omamobile-fp/sock/bridge.sock ]] || fail "s4 morning: the stack is not left running"
+  pass "ingot-fp-s4-test morning without a terminal: the finger prompts, every part PASS, the stack left running, the pipe closed"
+
+  out=$t/s4.nofinger2.out
+  PATH=$FB:$PATH agg "$out" nofinger --leave-running || fail "s4 nofinger --leave-running"
+  grep -q 'LIST still has the enrolled id 7' "$out" || fail "s4 nofinger: LIST after the restart"
+  row "$out" fprintd PASS nofinger
+  row "$out" leave-running PASS nofinger
+  [[ -S $H/run/omamobile-fp/sock/bridge.sock ]] || fail "s4 nofinger --leave-running: the stack is stopped"
+  pass "ingot-fp-s4-test nofinger --leave-running: the enrolled id survives the restart, fprintd-list, the stack left running"
+
+  : > "$STATE/data/vendor/omamobile-fp/fail-enroll"
+  : > "$STATE/data/vendor/omamobile-fp/hang-list"
+  out=$t/s4.morning-fail.out
+  PATH=$FB:$PATH agg "$out" morning --user "$(id -un)" && fail "s4 morning with a failing enrolment passed"
+  rm -f "$STATE/data/vendor/omamobile-fp/fail-enroll" "$STATE/data/vendor/omamobile-fp/hang-list"
+  grep -q '^S4 morning: FAIL (bridge enrol)' "$out" || fail "s4 morning: FAIL names bridge and enrol only"
+  row "$out" bridge FAIL morning
+  row "$out" enrol FAIL morning
+  grep -q 'LIST did not succeed: restarting the stack once' "$out" || fail "s4 morning: no restart after LIST hung"
+  grep -q 'restarting the stack so the next one finds it idle' "$out" || fail "s4 morning: the bridge left busy"
+  for r in verify-match verify-nomatch persist; do row "$out" "$r" SKIP morning; done
+  for r in storage fprintd; do row "$out" "$r" PASS morning; done
+  grep -q 'attempt 2 of 2' "$out" || fail "s4 morning: no second attempt"
+  grep -q 'ENROLL ended without ENROLLED: ERROR 1' "$out" || fail "s4 morning: the enrolment's end"
+  grep -q -- '--- the stack: last 25 lines' "$out" || fail "s4 morning: no stack log at the failure"
+  env OMAMOBILE_FP_TEST=1 OMAMOBILE_FP_TEST_ROOT="$H" "$STAGE" stop > /dev/null 2>&1
+  [[ ! -e $H/run/omamobile-fp/sock ]] || fail "s4 aggregates: the stack did not stop"
+  pass "ingot-fp-s4-test morning, LIST hangs and enrolment fails: the stack restarted, FAIL with the log, the parts after it SKIP or still run, exit 1"
 else
   echo "skip - hal with fakes: no gcc -static"
 fi
