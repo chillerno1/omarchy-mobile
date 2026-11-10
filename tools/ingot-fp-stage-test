@@ -33,7 +33,8 @@
 #                               directory
 #   tools/ingot-fp-s4-test   -> its steps (but fprintd and lock) against the
 #                               fakes, in order, each PASS; one FAIL that
-#                               prints the stack's log
+#                               prints the stack's log; the stubs' requests
+#                               counted once (not their liblog copies)
 #   lint                     -> shellcheck on both scripts, if installed
 set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -274,6 +275,9 @@ int main(int argc, char **argv)
 		/* as the RPMB stub logs a request on its stderr */
 		printf("omamobile-rpmb-stub[%d]: listener 0x2000 request 1: command 0x101, failing it; 00000101\n",
 		       (int)getpid());
+		/* its liblog copy, as the shim prints it: not a second request */
+		printf("I omamobile-rpmb-stub[%d]: listener 0x2000 request 1: command 0x101, failing it; 00000101\n",
+		       (int)getpid());
 		fflush(stdout);
 		while (!done)
 			pause();
@@ -350,7 +354,7 @@ EOF
   [[ $(grep -n 'bridge fake: TERM' "$out" | cut -d: -f1) -lt $(grep -n 'qseecomd fake: TERM' "$out" | cut -d: -f1) ]] ||
     fail "bridge: qseecomd stopped before the bridge"
   [[ ! -e $SD ]] || fail "bridge: socket directory left after stop"
-  env OMAMOBILE_FP_TEST=1 OMAMOBILE_FP_TEST_ROOT="$H" "$STAGE" stop 2>&1 | grep -q 'no stage running' ||
+  env OMAMOBILE_FP_TEST=1 OMAMOBILE_FP_TEST_ROOT="$H" "$STAGE" stop 2>&1 | grep -c 'no stage running' > /dev/null ||
     fail "stop with nothing running"
   pass "bridge: stop takes the bridge down before qseecomd, removes the socket directory"
 
@@ -359,7 +363,7 @@ EOF
   s4() {
     OMAMOBILE_FP_TEST=1 OMAMOBILE_FP_TEST_ROOT="$H" INGOT_FP_STAGE_WRAP="unshare -Ur" INGOT_FP_IMAGE="$IMG" \
       INGOT_FP_BIN="$BIN" INGOT_FP_STATE="$STATE" INGOT_FP_LOGS="$S4LOGS" INGOT_FP_YES=1 INGOT_FP_SECONDS=2 \
-      timeout 180 "$HERE/ingot-fp-s4-test" "$@"
+      INGOT_FP_GAP=1 timeout 180 "$HERE/ingot-fp-s4-test" "$@"
   }
   s4ok() { # step [args]: PASS, else fail with its output
     out=$t/s4.$1.out

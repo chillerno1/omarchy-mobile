@@ -30,12 +30,14 @@
 #   --user NAME  [INGOT_FP_USER]   fprintd and lock: default uid 1000's name
 #   --yes        [INGOT_FP_YES=1]  never wait for Enter (and answer the lock
 #                                  step's questions "unanswered")
-#   INGOT_FP_SECONDS (irq, default 30), INGOT_FP_FINGER (fprintd, default
-#   right-index-finger)
+#   INGOT_FP_SECONDS (irq, default 30), INGOT_FP_GAP (verify, with --yes or
+#   without a terminal: seconds to switch fingers, default 8),
+#   INGOT_FP_FINGER (fprintd, default right-index-finger)
 #
-# The runner is /usr/lib/omamobile-fp-ingot/ingot-fp-stage (omamobile-fingerprint)
-# or else ingot-fp-stage next to this script; omamobile-fp-ctl is
-# /usr/lib/omamobile-fp/omamobile-fp-ctl or else next to this script.
+# The runner is ingot-fp-stage next to this script (a staged bundle tests its
+# own copy), else /usr/lib/omamobile-fp-ingot/ingot-fp-stage
+# (omamobile-fingerprint); omamobile-fp-ctl likewise: next to this script,
+# else /usr/lib/omamobile-fp/omamobile-fp-ctl.
 #
 # Nothing here assumes the bridge works: every failure prints the tail of
 # the stack's log (the runner's stage.log, the background runner's output,
@@ -62,8 +64,9 @@ LOGS=${INGOT_FP_LOGS:-/var/log/omamobile-fp-ingot-s4}
 USERNAME=${INGOT_FP_USER:-}
 YES=${INGOT_FP_YES:-0}
 SECS=${INGOT_FP_SECONDS:-30}
+GAP=${INGOT_FP_GAP:-8}
 FINGER=${INGOT_FP_FINGER:-right-index-finger}
-ID_ARG=
+ID_ARG=''
 while (($#)); do
   case $1 in
     --image) IMAGE=${2:?}; shift ;;
@@ -78,11 +81,11 @@ while (($#)); do
   shift
 done
 
-STAGE=$LIB/ingot-fp-stage
-[[ -x $STAGE ]] || STAGE=$HERE/ingot-fp-stage
-CTL=/usr/lib/omamobile-fp/omamobile-fp-ctl
-[[ -f $CTL ]] || CTL=$HERE/omamobile-fp-ctl
+STAGE=$HERE/ingot-fp-stage
+[[ -x $STAGE ]] || STAGE=$LIB/ingot-fp-stage
+CTL=$HERE/omamobile-fp-ctl
 [[ -f $CTL ]] || CTL=$HERE/../packages/omamobile-fingerprint/lib/omamobile-fp-ctl
+[[ -f $CTL ]] || CTL=/usr/lib/omamobile-fp/omamobile-fp-ctl
 # the runner's paths (tools/ingot-fp-stage)
 RUN=$TROOT/run/omamobile-fp-ingot
 STAGELOG=$RUN/stage.log
@@ -91,29 +94,49 @@ SOCK=$TROOT/run/omamobile-fp/sock/bridge.sock
 SYSFP=$TROOT/sys/devices/platform/fingerprint
 UNIT=omamobile-fp-ingot.service
 
-usage() { sed -n '/^#   ingot-fp-s4-test irq/,/^#   right-index-finger)/p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '/^#   ingot-fp-s4-test irq/,/^#   .*right-index-finger)$/p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[[ $SECS =~ ^[0-9]+$ && $GAP =~ ^[0-9]+$ ]] || { echo "INGOT_FP_SECONDS and INGOT_FP_GAP take a number" >&2; exit 2; }
 
 # --- Output ------------------------------------------------------------------
 
-step() { printf '\n=== S4 %s: %s ===\n' "$STEP" "$*"; }
+ts() { date +%H:%M:%S; }
+step() { printf '\n=== S4 %s: %s [%s] ===\n' "$STEP" "$*" "$(ts)"; }
 info() { printf '    %s\n' "$*"; }
 does() { printf '  * %s\n' "$*"; }
-finger() { printf '\n  >>> FINGER: %s\n\n' "$*"; }
+# The one line the person relaying over SSH reads out: it starts the line.
+finger() { printf '\n>>> FINGER: %s  [%s]\n\n' "$*" "$(ts)"; }
+no_touch() { printf '  finger: none (do not touch the sensor in this step)\n'; }
 criteria() { printf '  PASS if: %s\n' "$*"; }
+# A terminal to read answers from (none over "ssh phone cmd", or with setsid).
+have_tty() { { : < /dev/tty; } 2>/dev/null; }
 pause() {
   ((YES)) && return 0
+  have_tty || { info "(no terminal: not waiting for Enter)"; return 0; }
   read -r -p "  >>> $* [Enter] " _ < /dev/tty || true
+}
+# A finger prompt with a countdown (GAP seconds, or $2), one number a second.
+countdown() { # text [seconds]
+  local i n=${2:-$GAP}
+  finger "$1 (in $n s)"
+  printf '    '
+  for ((i = n; i > 0; i--)); do printf '%d ' "$i"; sleep 1; done
+  printf 'now [%s]\n' "$(ts)"
+}
+# Time to switch fingers: Enter at a terminal, else a countdown.
+switch_finger() { # text-for-Enter text-for-countdown
+  if ((!YES)) && have_tty; then pause "$1"; else countdown "$2"; fi
 }
 ask() { # question -> 0 yes, 1 no, 2 unanswered
   local a
   if ((YES)); then printf '  ? %s: unanswered (--yes)\n' "$1"; return 2; fi
+  have_tty || { printf '  ? %s: unanswered (no terminal)\n' "$1"; return 2; }
   while :; do
     read -r -p "  ? $1 [y/n] " a < /dev/tty || return 2
     case $a in y|Y|yes) echo "    answer: yes"; return 0 ;; n|N|no) echo "    answer: no"; return 1 ;; esac
   done
 }
 
-FAILS=()
+FAILS=() F0=0
 fail() { FAILS+=("$*"); printf '  FAIL: %s\n' "$*"; }
 ok() { printf '  ok: %s\n' "$*"; }
 
@@ -157,14 +180,23 @@ stack_pid() {
 }
 running() { stack_pid > /dev/null; }
 
-ctl() { python3 "$CTL" --socket "$SOCK" "$@"; }
+ctl() { python3 -u "$CTL" --socket "$SOCK" "$@"; }
+# Line-buffered output from a C program writing into a pipe (fprintd-*).
+LB=()
+command -v stdbuf > /dev/null && LB=(stdbuf -oL -eL)
 
 # CTL output into $1 (and the terminal); its exit code
 ctl_to() {
   local out=$1 rc; shift
   does "omamobile-fp-ctl $*"
-  ctl "$@" 2>&1 | tee "$out" | sed 's/^/    /'
+  ctl "$@" 2>&1 | tee "$out" | sed -u 's/^/    /'
   rc=${PIPESTATUS[0]}
+  # LIST/DELETE end only when the HAL says so: a HAL that never ends an
+  # enumerate leaves the bridge busy (every later command: ERROR 1)
+  if grep -c '^timeout: sending CANCEL' "$out" > /dev/null && [[ ${3:-} == LIST || ${3:-} == DELETE ]]; then
+    info "NOTE: the bridge did not finish $3: it may now refuse every command (ERROR 1)"
+    info "      until the stack is restarted (ingot-fp-s4-test stop, then bridge)"
+  fi
   return "$rc"
 }
 
@@ -174,6 +206,7 @@ start_stack() {
   local i p
   if running; then
     info "the stack runs already (PID $(stack_pid))"
+    [[ -S $SOCK ]] || { fail "a stage runs but serves no socket $SOCK (a hal or listeners stage? ingot-fp-s4-test stop)"; return 1; }
   else
     [[ -d $IMAGE ]] || { fail "no vendor tree $IMAGE (--image)"; return 1; }
     [[ -d $BIN ]] || { fail "no bin directory $BIN (--bin)"; return 1; }
@@ -215,7 +248,7 @@ need_id() {
 }
 
 listed() { # file id -> the LIST line has the id
-  grep -E "^<- LIST( |$)" "$1" | tail -1 | tr ' ' '\n' | grep -qx -- "$2"
+  grep -E "^<- LIST( |$)" "$1" | tail -1 | tr ' ' '\n' | grep -cx -- "$2" > /dev/null
 }
 
 # Everything the runner logged across this test's starts.
@@ -226,6 +259,18 @@ all_logs() {
   done
   ((any)) || cat "$STAGELOG" 2>/dev/null
   return 0
+}
+
+# The stack's log lines since MARK (a line count of stage.log) that look like
+# trouble: the HAL's E/F lines, errors, refusals, exits, RPMB.
+log_mark() { if [[ -f $STAGELOG ]]; then wc -l < "$STAGELOG"; else echo 0; fi; }
+log_trouble() { # mark
+  local t
+  t=$(tail -n +"$(($1 + 1))" "$STAGELOG" 2>/dev/null |
+    grep -iE '^\[[^]]+\] ([0-9]+/[0-9]+ )?[EF] |error|fail|sercure|not match|refused|exited|rpmb|lockout|timeout' | tail -n 25)
+  [[ -n $t ]] || return 0
+  info "the stack's log since this step began, lines that look like trouble (last 25):"
+  printf '      %s\n' "${t//$'\n'/$'\n'      }"
 }
 
 # --- Steps -------------------------------------------------------------------
@@ -284,7 +329,7 @@ s_bridge() {
   info "and serves fprintd's socket. Leave it running for the next steps."
   info "(In a second terminal instead: $STAGE bridge $(stage_args))"
   criteria "the socket appears, STATUS answers READY ... and OK, LIST answers LIST"
-  finger "none"
+  no_touch
   start_stack || return
   if ctl_to "$f" --timeout 10 STATUS; then ok "STATUS"; else fail "STATUS"; fi
   grep -q '^<- READY' "$f" || fail "no READY line"
@@ -293,14 +338,15 @@ s_bridge() {
 }
 
 s_enrol() {
-  local f=$LOGS/enrol.ctl id n first
+  local f=$LOGS/enrol.ctl id n first mark
   step "enrol one finger through the bridge (no fprintd)"
   info "ENROLL through omamobile-fp-ctl. The HAL asks for one good touch after"
   info "another; each accepted one is a PROGRESS line counting down."
   criteria "ENROLLED <id>, and LIST then shows that id"
   running || { fail "no stack running: run the bridge step first"; return; }
-  finger "touch the sensor with ONE finger, lift, touch again, moving it a little each time, until ENROLLED (up to 5 minutes)"
-  if ctl_to "$f" --timeout 300 ENROLL; then ok "ENROLL"; else fail "ENROLL did not end in ENROLLED"; fi
+  finger "touch the sensor with ONE finger, lift, touch again, moving it a little each time, until ENROLLED (the bridge gives the HAL a 60 s enrolment timeout)"
+  mark=$(log_mark)
+  if ctl_to "$f" --timeout 300 ENROLL; then ok "ENROLL"; else fail "ENROLL did not end in ENROLLED"; log_trouble "$mark"; fi
   id=$(sed -n 's/^<- ENROLLED \(-\{0,1\}[0-9]*\)$/\1/p' "$f" | tail -1)
   n=$(grep -c '^<- PROGRESS ' "$f")
   first=$(sed -n 's/^<- PROGRESS [^ ]* \([0-9]*\)$/\1/p' "$f" | head -1)
@@ -325,7 +371,7 @@ s_verify() {
   finger "touch with the ENROLLED finger"
   ctl_to "$f.1" --timeout 60 AUTH
   if grep -qx "<- MATCH $id" "$f.1"; then ok "MATCH $id"; else fail "the enrolled finger: no MATCH $id"; fi
-  pause "next: a DIFFERENT finger. Press Enter, then touch"
+  switch_finger "next: a DIFFERENT finger. Press Enter, then touch" "SWITCH to a DIFFERENT finger (not the enrolled one)"
   finger "touch with a DIFFERENT finger (not enrolled)"
   ctl_to "$f.2" --timeout 60 AUTH
   if grep -qx '<- NOMATCH' "$f.2"; then ok "NOMATCH"; else fail "another finger: no NOMATCH"; fi
@@ -340,7 +386,7 @@ s_storage() {
   info "stubs' logged RPMB and SSD requests, the runner's audit, and the stack's"
   info "open device files."
   criteria "the audit passed at every start with no REFUSED line, and no process of the stack has a block device (or any device outside the allowlist) open"
-  finger "none"
+  no_touch
   if [[ -d $STATE ]]; then
     does "the state directory $STATE ($(du -sh "$STATE" 2>/dev/null | cut -f1)):"
     find "$STATE" -mindepth 1 -printf '%M %u:%g %10s %TY-%Tm-%Td %TH:%TM %P\n' 2>/dev/null | sort -k6 | sed 's/^/      /'
@@ -350,8 +396,8 @@ s_storage() {
   logs=$(all_logs)
   does "the stubs' requests (from the runner's output of this test's starts):"
   # the stub's own stderr line (its liblog copy would count twice)
-  rpmb=$(grep -E 'omamobile-rpmb-stub\[[0-9]+\]: listener 0x[0-9a-f]+ request [0-9]+: command 0x[0-9a-f]+' <<<"$logs" || true)
-  ssd=$(grep -E 'omamobile-ssd-stub\[[0-9]+\]: listener 0x[0-9a-f]+ request [0-9]+: command 0x[0-9a-f]+' <<<"$logs" || true)
+  rpmb=$(grep -E '\] omamobile-rpmb-stub\[[0-9]+\]: listener 0x[0-9a-f]+ request [0-9]+: command 0x[0-9a-f]+' <<<"$logs" || true)
+  ssd=$(grep -E '\] omamobile-ssd-stub\[[0-9]+\]: listener 0x[0-9a-f]+ request [0-9]+: command 0x[0-9a-f]+' <<<"$logs" || true)
   for t in rpmb ssd; do
     if [[ $t == rpmb ]]; then c=$rpmb; else c=$ssd; fi
     if [[ -z $c ]]; then
@@ -375,13 +421,17 @@ s_storage() {
     for t in null zero full random urandom qseecom blfp dma_heap/default_cma_region; do
       [[ -c /dev/$t ]] && allowed[$(stat -c '%t:%T' "/dev/$t")]=$t
     done
+    # every descendant of the namespace's PID 1, from one pass over /proc
+    # (builtins only: a sed per process per level took a minute)
+    local -A kids=()
+    for p in /proc/[0-9]*/stat; do
+      { read -r t < "$p"; } 2>/dev/null || continue
+      t=${t##*) }; t=${t#* }; t=${t%% *}                     # after "(comm) ": state ppid ...
+      p=${p#/proc/}; kids[$t]+=" ${p%/stat}"
+    done
     pids=("$(stack_pid)")
-    for ((c = 0; c < ${#pids[@]}; c++)); do   # every descendant of the namespace's PID 1
-      for p in /proc/[0-9]*/stat; do
-        t=$(sed 's/^.*) //' "$p" 2>/dev/null) || continue   # after "(comm) "
-        t=${t#* }; t=${t%% *}                                 # state ppid ...
-        [[ $t == "${pids[c]}" ]] && pids+=("$(basename "$(dirname "$p")")")
-      done
+    for ((c = 0; c < ${#pids[@]}; c++)); do
+      for p in ${kids[${pids[c]}]:-}; do pids+=("$p"); done
     done
     for p in "${pids[@]}"; do
       for fd in /proc/"$p"/fd/*; do
@@ -436,8 +486,44 @@ need_user() {
   return 1
 }
 
+# Our libfprint (the omamobile_udfps driver)
+fprintd_lib() { find "$TROOT/usr/lib" -maxdepth 1 -name 'libfprint-2.so.2*' -type f 2>/dev/null | head -1; }
+# libfprint, fprintd's environment, a restart, fprintd-list: no finger.
+fprintd_list() {
+  local u=$1 lib env f=$LOGS/fprintd
+  info "libfprint: $(pacman -Q libfprint 2>&1)   fprintd: $(pacman -Q fprintd 2>&1)"
+  lib=$(fprintd_lib)
+  if [[ -n $lib ]] && grep -caF omamobile_udfps "$lib" > /dev/null; then ok "$lib has omamobile_udfps"; else fail "libfprint without omamobile_udfps (install packages/libfprint)"; fi
+  env=$(systemctl show fprintd -p Environment 2>/dev/null)
+  if [[ $env == *"FP_OMAMOBILE_UDFPS=/run/omamobile-fp/sock/bridge.sock"* ]]; then ok "fprintd's environment names the socket"
+  else fail "fprintd's environment lacks FP_OMAMOBILE_UDFPS (the drop-in; systemctl daemon-reload): $env"; fi
+  ((${#FAILS[@]} > F0)) && return 1
+  does "systemctl restart fprintd (it finds the device at its start)"
+  systemctl restart fprintd.service 2>&1 | sed -u 's/^/    /'
+  does "fprintd-list $u"
+  LC_ALL=C timeout 60 fprintd-list "$u" 2>&1 | tee "$f.list" | sed -u 's/^/    /'
+  if grep -c 'Omarchy Mobile' "$f.list" > /dev/null; then ok "fprintd sees the device"; else fail "fprintd lists no Omarchy Mobile device"; return 1; fi
+}
+
+# fprintd-enroll, then fprintd-verify, with the given finger prompts.
+fprintd_enrol_verify() { # user enrol-prompt verify-prompt
+  local u=$1 rc f=$LOGS/fprintd
+  finger "$2"
+  does "fprintd-enroll -f $FINGER $u (at most 300 s)"
+  LC_ALL=C timeout 300 "${LB[@]}" fprintd-enroll -f "$FINGER" "$u" 2>&1 | tee "$f.enroll" | sed -u 's/^/    /'
+  info "stages passed: $(grep -c 'enroll-stage-passed' "$f.enroll")"
+  if grep -c 'enroll-completed' "$f.enroll" > /dev/null; then ok "enroll-completed"; : > "$LOGS/fprintd-enrolled"; else fail "fprintd-enroll did not complete"; fi
+  finger "$3"
+  does "fprintd-verify -f $FINGER $u (at most 90 s)"
+  LC_ALL=C timeout 90 "${LB[@]}" fprintd-verify -f "$FINGER" "$u" 2>&1 | tee "$f.verify" | sed -u 's/^/    /'
+  rc=0; grep -c 'verify-match' "$f.verify" > /dev/null || rc=1
+  if ((rc == 0)); then ok "verify-match"; else fail "fprintd-verify: no verify-match"; fi
+  does "fprintd-list $u"
+  LC_ALL=C timeout 60 fprintd-list "$u" 2>&1 | sed -u 's/^/    /'
+}
+
 s_fprintd() {
-  local u lib env rc f=$LOGS/fprintd
+  local u
   step "fprintd: list, enrol, verify for your user"
   info "Needs on the phone: our libfprint (packages/libfprint, 1.94.100-1.8 or"
   info "later: the omamobile_udfps driver), fprintd, and omamobile-fingerprint's"
@@ -447,30 +533,9 @@ s_fprintd() {
   need_user || return
   u=$USERNAME
   running || { fail "no stack running: run the bridge step first"; return; }
-  info "libfprint: $(pacman -Q libfprint 2>&1)   fprintd: $(pacman -Q fprintd 2>&1)"
-  lib=$(find /usr/lib -maxdepth 1 -name 'libfprint-2.so.2*' -type f 2>/dev/null | head -1)
-  if [[ -n $lib ]] && grep -qa omamobile_udfps "$lib"; then ok "$lib has omamobile_udfps"; else fail "libfprint without omamobile_udfps (install packages/libfprint)"; fi
-  env=$(systemctl show fprintd -p Environment 2>/dev/null)
-  if [[ $env == *"FP_OMAMOBILE_UDFPS=/run/omamobile-fp/sock/bridge.sock"* ]]; then ok "fprintd's environment names the socket"
-  else fail "fprintd's environment lacks FP_OMAMOBILE_UDFPS (the drop-in; systemctl daemon-reload): $env"; fi
-  ((${#FAILS[@]})) && return
-  does "systemctl restart fprintd (it finds the device at its start)"
-  systemctl restart fprintd.service 2>&1 | sed 's/^/    /'
-  does "fprintd-list $u"
-  LC_ALL=C fprintd-list "$u" 2>&1 | tee "$f.list" | sed 's/^/    /'
-  if grep -q 'Omarchy Mobile' "$f.list"; then ok "fprintd sees the device"; else fail "fprintd lists no Omarchy Mobile device"; fi
-  finger "fprintd-enroll: touch the sensor again and again until enroll-completed"
-  does "fprintd-enroll -f $FINGER $u"
-  LC_ALL=C fprintd-enroll -f "$FINGER" "$u" 2>&1 | tee "$f.enroll" | sed 's/^/    /'
-  info "stages passed: $(grep -c 'enroll-stage-passed' "$f.enroll")"
-  if grep -q 'enroll-completed' "$f.enroll"; then ok "enroll-completed"; : > "$LOGS/fprintd-enrolled"; else fail "fprintd-enroll did not complete"; fi
-  finger "fprintd-verify: touch with the finger you just enrolled"
-  does "fprintd-verify -f $FINGER $u"
-  LC_ALL=C fprintd-verify -f "$FINGER" "$u" 2>&1 | tee "$f.verify" | sed 's/^/    /'
-  rc=0; grep -q 'verify-match' "$f.verify" || rc=1
-  if ((rc == 0)); then ok "verify-match"; else fail "fprintd-verify: no verify-match"; fi
-  does "fprintd-list $u"
-  LC_ALL=C fprintd-list "$u" 2>&1 | sed 's/^/    /'
+  fprintd_list "$u" || return
+  fprintd_enrol_verify "$u" "fprintd-enroll: touch the sensor again and again until enroll-completed" \
+    "fprintd-verify: touch with the finger you just enrolled"
 }
 
 s_lock() {
@@ -487,10 +552,10 @@ s_lock() {
   else
     fail "no /etc/pam.d/omarchy-lock-fingerprint with pam_fprintd (omamobile-fingerprint ships it)"
   fi
-  if LC_ALL=C fprintd-list "$u" 2>&1 | grep -qE '^ +- #[0-9]+: '; then ok "fprintd lists a finger for $u"
+  if LC_ALL=C fprintd-list "$u" 2>&1 | grep -cE '^ +- #[0-9]+: ' > /dev/null; then ok "fprintd lists a finger for $u"
   else fail "fprintd lists no finger for $u: run the fprintd step first"; fi
   running || fail "no stack running: run the bridge step first"
-  ((${#FAILS[@]})) && return
+  ((${#FAILS[@]} > F0)) && return
   r=$(wc -l < "$STAGELOG" 2>/dev/null || echo 0)
   info "1. Lock the phone (the power button, or omarchy-system-lock in the session)."
   info "2. Wake the screen. Touch the sensor on the back with the enrolled finger."
@@ -518,7 +583,7 @@ s_delete() {
   info "DELETE the finger enrolled through the bridge, and fprintd's (if the fprintd"
   info "step enrolled one)."
   criteria "DELETED <id>, then LIST without it; fprintd-list shows no finger"
-  finger "none"
+  no_touch
   running || { fail "no stack running: run the bridge step first"; return; }
   id=${ID_ARG:-$(cat "$LOGS/enrolled-id" 2>/dev/null)}
   if [[ $id =~ ^-?[0-9]+$ ]]; then
@@ -533,7 +598,7 @@ s_delete() {
     u=$USERNAME
     does "fprintd-delete $u"
     fprintd-delete "$u" 2>&1 | sed 's/^/    /'
-    if LC_ALL=C fprintd-list "$u" 2>&1 | grep -qE '^ +- #[0-9]+: '; then fail "fprintd still lists a finger for $u"
+    if LC_ALL=C fprintd-list "$u" 2>&1 | grep -cE '^ +- #[0-9]+: ' > /dev/null; then fail "fprintd still lists a finger for $u"
     else ok "fprintd lists no finger for $u"; rm -f "$LOGS/fprintd-enrolled"; fi
   fi
 }
@@ -551,11 +616,14 @@ case $STEP in
   *) usage ;;
 esac
 [[ -n $TROOT || $EUID -eq 0 ]] || { echo "run as root (on the phone)" >&2; exit 1; }
-[[ -f $CTL ]] || { echo "no omamobile-fp-ctl (looked in /usr/lib/omamobile-fp and $HERE)" >&2; exit 1; }
-[[ -x $STAGE ]] || { echo "no ingot-fp-stage (looked in $LIB and $HERE)" >&2; exit 1; }
+[[ -f $CTL ]] || { echo "no omamobile-fp-ctl (looked in $HERE and /usr/lib/omamobile-fp)" >&2; exit 1; }
+[[ -x $STAGE ]] || { echo "no ingot-fp-stage (looked in $HERE and $LIB)" >&2; exit 1; }
 install -d -m 0700 "$LOGS" || exit 1
 STEPLOG=$LOGS/$STEP-$(date +%Y%m%d-%H%M%S).log
-exec > >(tee -a "$STEPLOG") 2>&1
+# tee keeps writing the log if the SSH connection (its stdout) goes away
+TEE=(tee -a)
+tee --output-error=warn-nopipe -a /dev/null < /dev/null > /dev/null 2>&1 && TEE=(tee --output-error=warn-nopipe -a)
+exec > >("${TEE[@]}" "$STEPLOG") 2>&1
 printf 'ingot-fp-s4-test %s, %s; runner %s, image %s, bin %s, state %s\n' \
   "$STEP" "$(date -Is)" "$STAGE" "$IMAGE" "$BIN" "$STATE"
 "s_$STEP"
