@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chillerno1 <gh.chiller@pm.me>
+Date: Tue, 10 Nov 2026 18:47:44 +1100
+Subject: [PATCH] libcamera: Add the Sony IMX766 and IMX563 sensors
+
+The IMX766 (50 Mpixel Quad Bayer, 1.0 um) and the IMX563 (12 Mpixel,
+1.4 um) are the main and ultrawide rear cameras of the Solana Saga,
+captured like its front IMX481 through the Qualcomm CAMSS RDI path and
+the simple pipeline handler with the software ISP. Without a helper the
+simple IPA would take the gain code for the gain, and the default code 0
+for a 0x gain.
+
+Add a camera sensor helper for each. The black level is assumed, not
+measured: 64 at 10 bits, the usual value for Sony sensors of this
+family, to be measured on a dark raw frame from each camera. The
+IMX766's global analogue gain register is on a 14-bit scale, gain
+16384 / (16384 - code), codes 0 to 16128 (1x to 64x) in the driver; the
+IMX563's is the SMIA++ 1024 / (1024 - code), codes 0 to 896 (1x to 8x),
+as on the IMX477.
+
+Add the sensor properties: 1.0 um and 1.4 um unit cells, the CCS test
+pattern numbering both drivers use, and two-frame delays for exposure,
+gain and blanking, as for the IMX481: the drivers write the integration
+time, gain and frame length registers without grouped parameter hold.
+The delays are not measured yet.
+
+Add tuning files with the uncalibrated defaults, the assumed black
+level, and no colour matrix or autofocus (both are fixed focus for now;
+the IMX766's lens actuator has no driver).
+---
+ src/ipa/libipa/camera_sensor_helper.cpp       | 42 +++++++++++++++++++
+ src/ipa/simple/data/imx563.yaml               | 25 +++++++++++
+ src/ipa/simple/data/imx766.yaml               | 25 +++++++++++
+ src/ipa/simple/data/meson.build               |  2 +
+ .../sensor/camera_sensor_properties.cpp       | 32 ++++++++++++++
+ 5 files changed, 126 insertions(+)
+ create mode 100644 src/ipa/simple/data/imx563.yaml
+ create mode 100644 src/ipa/simple/data/imx766.yaml
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -676,6 +676,27 @@
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx477", CameraSensorHelperImx477)
+ 
++class CameraSensorHelperImx563 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperImx563()
++	{
++		/*
++		 * Assumed 64 at 10 bits, the usual value for Sony sensors of
++		 * this family; not measured yet, to be checked on a dark raw
++		 * frame from the Solana Saga's ultrawide camera.
++		 */
++		blackLevel_ = 4096;
++		/*
++		 * The SMIA++ global analogue gain register: gain is
++		 * 1024 / (1024 - code), as on the IMX477. The driver offers
++		 * codes 0 to 896, 1x to 8x.
++		 */
++		gain_ = AnalogueGainLinear{ 0, 1024, -1, 1024 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx563", CameraSensorHelperImx563)
++
+ class CameraSensorHelperImx678 : public CameraSensorHelper
+ {
+ public:
+@@ -699,6 +720,27 @@
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx708", CameraSensorHelperImx708)
+ 
++class CameraSensorHelperImx766 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperImx766()
++	{
++		/*
++		 * Assumed 64 at 10 bits, the usual value for Sony sensors of
++		 * this family; not measured yet, to be checked on a dark raw
++		 * frame from the Solana Saga's main camera.
++		 */
++		blackLevel_ = 4096;
++		/*
++		 * The global analogue gain register on a 14-bit scale: gain
++		 * is 16384 / (16384 - code). The driver offers codes 0 to
++		 * 16128, 1x to 64x.
++		 */
++		gain_ = AnalogueGainLinear{ 0, 16384, -1, 16384 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx766", CameraSensorHelperImx766)
++
+ class CameraSensorHelperOv01a10 : public CameraSensorHelper
+ {
+ public:
+diff --git a/src/ipa/simple/data/imx563.yaml b/src/ipa/simple/data/imx563.yaml
+new file mode 100644
+--- /dev/null
++++ b/src/ipa/simple/data/imx563.yaml
+@@ -0,0 +1,25 @@
++# SPDX-License-Identifier: CC0-1.0
++#
++# Sony IMX563 (the Solana Saga's ultrawide camera), not calibrated yet:
++# the uncalibrated defaults with the black level, 64 at 10 bits, the same
++# value as the sensor's helper: assumed, not measured yet (to be checked on
++# a dark raw frame). No colour matrix until one is fitted on daylight
++# shots. Fixed focus: no Af.
++%YAML 1.1
++---
++version: 1
++algorithms:
++  - BlackLevel:
++      blackLevel: 4096
++  - Awb:
++  # Defaults for applications that do not set the controls.
++  - Adjust:
++      contrast: 1.2
++      saturation: 1.1
++  # Luma and chroma noise reduction and sharpening, scaled with the gain
++  - Detail:
++      sharpen: 0.6
++      denoise: 0.015
++      chromaDenoise: 0.03
++  - Agc:
++...
+diff --git a/src/ipa/simple/data/imx766.yaml b/src/ipa/simple/data/imx766.yaml
+new file mode 100644
+--- /dev/null
++++ b/src/ipa/simple/data/imx766.yaml
+@@ -0,0 +1,25 @@
++# SPDX-License-Identifier: CC0-1.0
++#
++# Sony IMX766 (the Solana Saga's main camera), not calibrated yet:
++# the uncalibrated defaults with the black level, 64 at 10 bits, the same
++# value as the sensor's helper: assumed, not measured yet (to be checked on
++# a dark raw frame). No colour matrix until one is fitted on daylight
++# shots. No Af: the lens actuator has no driver yet.
++%YAML 1.1
++---
++version: 1
++algorithms:
++  - BlackLevel:
++      blackLevel: 4096
++  - Awb:
++  # Defaults for applications that do not set the controls.
++  - Adjust:
++      contrast: 1.2
++      saturation: 1.1
++  # Luma and chroma noise reduction and sharpening, scaled with the gain
++  - Detail:
++      sharpen: 0.6
++      denoise: 0.015
++      chromaDenoise: 0.03
++  - Agc:
++...
+diff --git a/src/ipa/simple/data/meson.build b/src/ipa/simple/data/meson.build
+--- a/src/ipa/simple/data/meson.build
++++ b/src/ipa/simple/data/meson.build
+@@ -3,6 +3,8 @@
+ conf_files = files([
+     'imx386.yaml',
+     'imx481.yaml',
++    'imx563.yaml',
++    'imx766.yaml',
+     's5k3j1.yaml',
+     's5kgm5.yaml',
+     's5kgn1.yaml',
+diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -341,6 +341,22 @@
+ 				.hblankDelay = 3
+ 			},
+ 		} },
++		{ "imx563", {
++			.unitCellSize = { 1400, 1400 },
++			.testPatternModes = {
++				{ controls::draft::TestPatternModeOff, 0 },
++				{ controls::draft::TestPatternModeSolidColor, 1 },
++				{ controls::draft::TestPatternModeColorBars, 2 },
++				{ controls::draft::TestPatternModeColorBarsFadeToGray, 3 },
++				{ controls::draft::TestPatternModePn9, 4 },
++			},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
+ 		{ "imx678", {
+ 			.unitCellSize = { 2000, 2000 },
+ 			.testPatternModes = {},
+@@ -367,6 +383,22 @@
+ 				.hblankDelay = 3
+ 			},
+ 		} },
++		{ "imx766", {
++			.unitCellSize = { 1000, 1000 },
++			.testPatternModes = {
++				{ controls::draft::TestPatternModeOff, 0 },
++				{ controls::draft::TestPatternModeSolidColor, 1 },
++				{ controls::draft::TestPatternModeColorBars, 2 },
++				{ controls::draft::TestPatternModeColorBarsFadeToGray, 3 },
++				{ controls::draft::TestPatternModePn9, 4 },
++			},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
+ 		{ "ov2685", {
+ 			.unitCellSize = { 1750, 1750 },
+ 			.testPatternModes = {
+-- 
+2.51.0

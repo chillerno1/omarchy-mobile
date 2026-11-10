@@ -73,6 +73,7 @@ in the table. See `device/cheetah/CAMERA-PLAN.md`, section 5.2.
 | `0056-libcamera-Add-the-Samsung-S5KGN8-sensor.patch` | The S5KGN8 (the Pixel 9a's main camera) sensor helper, with the black level measured on the phone (64 at 10 bits) and the code / 32 gain, its properties, and an uncalibrated tuning file without a colour matrix or autofocus |
 | `0057-ipa-simple-Autofocus-on-the-Pixel-9a-s-main-camera.patch` | Contrast autofocus on the S5KGN8, through the module's LC898129 lens driver, with the Pixel 7 Pro main camera's scan steps |
 | `0058-libcamera-Add-the-Sony-IMX481-sensor.patch` | The IMX481 (the Solana Saga's front camera) sensor helper, with the black level measured on the phone (64 at 10 bits) and the SMIA++ gain 1024 / (1024 - code) (codes 0-960, 1x-16x), its properties (1.0 um cell, CCS test patterns, two-frame delays) and an uncalibrated tuning file. Without the helper the IPA took gain code 0 for a 0x gain, and the AGC held the sensor at its shortest exposure: a black picture |
+| `0059-libcamera-Add-the-Sony-IMX766-and-IMX563-sensors.patch` | The IMX766 and IMX563 (the Solana Saga's main and ultrawide rear cameras) sensor helpers, with an assumed black level (64 at 10 bits, to be measured on a dark raw frame) and the gains 16384 / (16384 - code) (codes 0-16128, 1x-64x) and 1024 / (1024 - code) (codes 0-896, 1x-8x), their properties (1.0 um and 1.4 um cells, CCS test patterns, two-frame delays, not measured) and uncalibrated tuning files without a colour matrix or autofocus |
 | `libcamera-fix-python3.14-macro-redefinition.patch` | Arch's patch, unchanged (sha512 `8b54cbdf…`) |
 | `.SRCINFO` | `makepkg --printsrcinfo` output |
 
@@ -270,3 +271,10 @@ PKGBUILD order to `v0.7.2` (0058 with no fuzz), checksums verified. On the
 phone (built as 4.23 on the pre-0057 tree) the IMX481 opens with no sensor
 warnings, and the AGC drives exposure and gain over a 60-frame stream at
 2320x1748.
+
+0.7.2-4.25 adds 0059 (2026-11-10): the Solana Saga's rear cameras, main
+(IMX766) and ultrawide (IMX563), get helpers, properties and tuning files.
+All 59 patches apply in PKGBUILD order to `v0.7.2` (0059 with no fuzz or
+offset), checksums verified, and a native x86_64 build (pipelines=simple,
+ipas=simple) compiles; the helpers give 2x at codes 8192 and 512. Not yet
+tested on the phone: the black levels and delays are assumed.
