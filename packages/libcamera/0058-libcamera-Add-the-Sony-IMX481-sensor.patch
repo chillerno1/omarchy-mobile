@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: chillerno1 <gh.chiller@pm.me>
+Date: Tue, 10 Nov 2026 16:33:25 +1100
+Subject: [PATCH] libcamera: Add the Sony IMX481 sensor
+
+The IMX481 is the front camera of the Solana Saga, captured through the
+Qualcomm CAMSS RDI path and the simple pipeline handler with the
+software ISP. Without a helper the simple IPA took the gain code for the
+gain: the driver's default code 0 became a 0x gain, the AGC's exposure
+model collapsed and the sensor stayed at its shortest exposure with no
+gain, a black picture.
+
+Add a camera sensor helper with the black level measured on the phone
+(64 at 10 bits on a dark raw frame) and the SMIA++ global analogue gain,
+1024 / (1024 - code), as on the IMX477; the driver offers codes 0 to 960,
+1x to 16x. Add the sensor properties: a 1.0 um unit cell (4656 x 3496
+at 1.0 um is the 5.822 mm diagonal published for the part), the CCS test
+pattern numbering the driver uses, and two-frame delays for exposure,
+gain and blanking: the driver writes the CCS integration time, gain and
+frame length registers without grouped parameter hold, and the sensor
+latches them at the next frame start, as on the IMX477 and IMX708. Add a
+tuning file with the uncalibrated defaults, the black level, and no
+colour matrix or autofocus.
+---
+ src/ipa/libipa/camera_sensor_helper.cpp       | 17 +++++++++++++
+ src/ipa/simple/data/imx481.yaml               | 24 +++++++++++++++++++
+ src/ipa/simple/data/meson.build               |  1 +
+ .../sensor/camera_sensor_properties.cpp       | 16 +++++++++++++
+ 4 files changed, 58 insertions(+)
+ create mode 100644 src/ipa/simple/data/imx481.yaml
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -634,6 +634,23 @@
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx386", CameraSensorHelperImx386)
+ 
++class CameraSensorHelperImx481 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperImx481()
++	{
++		/* 64 at 10 bits, measured on the Solana Saga's front camera. */
++		blackLevel_ = 4096;
++		/*
++		 * The SMIA++ global analogue gain register: gain is
++		 * 1024 / (1024 - code), as on the IMX477. The driver offers
++		 * codes 0 to 960, 1x to 16x.
++		 */
++		gain_ = AnalogueGainLinear{ 0, 1024, -1, 1024 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx481", CameraSensorHelperImx481)
++
+ class CameraSensorHelperImx415 : public CameraSensorHelper
+ {
+ public:
+diff --git a/src/ipa/simple/data/imx481.yaml b/src/ipa/simple/data/imx481.yaml
+new file mode 100644
+--- /dev/null
++++ b/src/ipa/simple/data/imx481.yaml
+@@ -0,0 +1,24 @@
++# SPDX-License-Identifier: CC0-1.0
++#
++# Sony IMX481 (the Solana Saga's front camera), not calibrated yet: the
++# uncalibrated defaults with the black level, 64 at 10 bits (measured on a
++# dark raw frame), the same value as the sensor's helper. No colour matrix
++# until one is fitted on daylight shots. Fixed focus: no Af.
++%YAML 1.1
++---
++version: 1
++algorithms:
++  - BlackLevel:
++      blackLevel: 4096
++  - Awb:
++  # Defaults for applications that do not set the controls.
++  - Adjust:
++      contrast: 1.2
++      saturation: 1.1
++  # Luma and chroma noise reduction and sharpening, scaled with the gain
++  - Detail:
++      sharpen: 0.6
++      denoise: 0.015
++      chromaDenoise: 0.03
++  - Agc:
++...
+diff --git a/src/ipa/simple/data/meson.build b/src/ipa/simple/data/meson.build
+--- a/src/ipa/simple/data/meson.build
++++ b/src/ipa/simple/data/meson.build
+@@ -2,6 +2,7 @@
+ 
+ conf_files = files([
+     'imx386.yaml',
++    'imx481.yaml',
+     's5k3j1.yaml',
+     's5kgm5.yaml',
+     's5kgn1.yaml',
+diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -307,6 +307,22 @@
+ 				.hblankDelay = 3
+ 			},
+ 		} },
++		{ "imx481", {
++			.unitCellSize = { 1000, 1000 },
++			.testPatternModes = {
++				{ controls::draft::TestPatternModeOff, 0 },
++				{ controls::draft::TestPatternModeSolidColor, 1 },
++				{ controls::draft::TestPatternModeColorBars, 2 },
++				{ controls::draft::TestPatternModeColorBarsFadeToGray, 3 },
++				{ controls::draft::TestPatternModePn9, 4 },
++			},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
+ 		{ "imx519", {
+ 			.unitCellSize = { 1220, 1220 },
+ 			.testPatternModes = {
+-- 
+2.51.0
