@@ -12,6 +12,15 @@
 # CHROOT is tools/extract-fingerprint-vendor-ingot's output root: everything
 # links against its libc, libdl and liblog, the stubs against its
 # libQSEEComAPI.so, so they match the phone exactly.
+#
+# In the chroot (as root; qseecomd drops to uid/gid 1000 itself), with the
+# stubs' directory first, e.g. /omamobile/lib64:
+#   LD_LIBRARY_PATH=/omamobile/lib64:/vendor/lib64:/system/lib64
+#   LD_PRELOAD=/omamobile/lib64/omamobile-fp-shim.so   (liblog to stderr,
+#                                                      properties as files)
+# qseecomd waits up to 60 s for /dev/qseecom, then serves; the HAL host
+# needs /dev/blfp and /dev/qseecom (and the dma-buf heaps
+# /dev/dma_heap/qcom,qseecom and qcom,qseecom-ta) once qseecomd runs.
 
 API      ?= 35
 OUT      ?= out
