@@ -1,0 +1,5 @@
+# The staged kernel build and boot images (./stage KERNEL_OUT IMAGES_DIR):
+# made on the laptop, never committed. boot_a.img carries the developer's
+# SSH public key and an unpublished kernel.
+prebuilt/
+prebuilt.new/

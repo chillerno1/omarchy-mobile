@@ -1,0 +1,115 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copy the Solana Mobile Saga's bring-up kernel and its boot images into
+# this package's prebuilt/ directory, on the laptop, so the PKGBUILD only
+# packs files and never compiles.
+#
+#   [KERNEL_DIR=<kernel tree>] packages/linux-omamobile-ingot/stage KERNEL_OUT IMAGES_DIR [PREBUILT]
+#   packages/linux-omamobile-ingot/stage --verify [PREBUILT]
+#
+# KERNEL_OUT is the Saga's kernel build after `bin/omamobile kernel` and
+# `bin/omamobile modules`:
+#   include/config/kernel.release            the release (a development one is fine)
+#   arch/arm64/boot/Image.gz                 the kernel boot_a.img must carry
+#   arch/arm64/boot/dts/qcom/sm8475-osom-ingot.dtb
+#   modules-<release>.tar.zst                the stripped modules, <release>/... inside
+# IMAGES_DIR is what `tools/build-ingot-probe --standalone` writes from
+# that build: boot_a.img (header v4 with an AVB footer, padded to boot_a's
+# 0x6000000 bytes), vendor_boot.img, dtbo.img, RELEASE and SHA256SUMS.
+#
+# Refused: a -dirty release; a modules tarball that is missing, of another
+# release or without modules.order; no board DTB; an image set that fails
+# its sums or the structure omamobile-ingot-boot checks on the phone
+# (../omamobile-ingot-boot/lib/ingot-images.sh); a RELEASE that is not the
+# kernel's; a boot_a.img whose kernel is not KERNEL_OUT's Image.gz (the
+# modules must match the kernel that boots). KERNEL_DIR, when given, must be
+# at the release's commit; its `git rev-list --count HEAD` is the count for
+# pkgver (lib/pkgver), else the release's own -<n>- count.
+#
+# This package is never published: the images carry the developer's SSH
+# public key in the initramfs and an unpublished kernel. tools/build-packages
+# builds it only when named and only with --local, and tools/repo-publish
+# refuses an index that lists it.
+#
+# --verify re-checks a staged prebuilt/ (its checksums, the release, the
+# image structure); tools/build-packages runs it before packing.
+set -euo pipefail
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+die() { printf 'stage: %s\n' "$*" >&2; exit 1; }
+LIB=${INGOT_IMAGES_LIB:-$here/../omamobile-ingot-boot/lib/ingot-images.sh}
+[[ -f $LIB ]] || die "no $LIB (omamobile-ingot-boot's image checks)"
+# shellcheck source=../omamobile-ingot-boot/lib/ingot-images.sh
+source "$LIB"
+DTB=sm8475-osom-ingot.dtb
+
+# check_set DIR RELEASE: the image set, as the phone will check it
+check_set() {
+  local d=$1 rel=$2 msg got
+  msg=$(ib_check_sums "$d") || die "$msg"
+  got=$(ib_release "$d") || die "$got"
+  [[ $got == "$rel" ]] || die "$d/RELEASE says $got, but the kernel is $rel"
+  msg=$(ib_check_boot "$d/boot_a.img" "$IB_BOOT_A_BYTES") || die "$msg"
+  msg=$(ib_check_vendor_boot "$d/vendor_boot.img" "$IB_VENDOR_BOOT_A_BYTES") || die "$msg"
+  msg=$(ib_check_dtbo "$d/dtbo.img" "$IB_DTBO_A_BYTES") || die "$msg"
+}
+
+if [[ ${1:-} == --verify ]]; then
+  pre=${2:-$here/prebuilt}
+  [[ -f $pre/kernel.release && -f $pre/SHA256SUMS ]] || die "no staged kernel in $pre"
+  (cd "$pre" && sha256sum --quiet --strict -c SHA256SUMS) || die "$pre fails its checksums"
+  rel=$(cat "$pre/kernel.release")
+  "$here/lib/pkgver" "$rel" "$(cat "$pre/kernel.commits" 2>/dev/null || true)" >/dev/null || exit 1
+  check_set "$pre/boot" "$rel"
+  echo "verified: $rel and its Saga boot images in $pre (local builds only, never published)"
+  exit 0
+fi
+
+out=${1:?usage: stage KERNEL_OUT IMAGES_DIR [PREBUILT], or stage --verify [PREBUILT]}
+images=${2:?usage: stage KERNEL_OUT IMAGES_DIR [PREBUILT]}
+dest=${3:-$here/prebuilt}
+[[ -f $out/include/config/kernel.release ]] || die "no kernel build in $out (include/config/kernel.release)"
+rel=$(cat "$out/include/config/kernel.release")
+# The release's form, and -dirty, before anything else
+"$here/lib/pkgver" "$rel" 0 >/dev/null || exit 1
+commit='' count=''
+if [[ -n ${KERNEL_DIR:-} ]]; then
+  git -C "$KERNEL_DIR" rev-parse HEAD >/dev/null 2>&1 || die "KERNEL_DIR=$KERNEL_DIR is not a git checkout"
+  commit=$(git -C "$KERNEL_DIR" rev-parse HEAD)
+  [[ $rel =~ -g([0-9a-f]+)$ && $commit == "${BASH_REMATCH[1]}"* ]] \
+    || die "$KERNEL_DIR is at ${commit:0:12}, but $out was built from ${rel##*-g}"
+  count=$(git -C "$KERNEL_DIR" rev-list --count HEAD)
+fi
+pkgver=$("$here/lib/pkgver" "$rel" "$count") || die "no commit count for pkgver: set KERNEL_DIR to the kernel tree $rel was built from"
+
+image=$out/arch/arm64/boot/Image.gz
+modules=$out/modules-$rel.tar.zst
+dtb=$out/arch/arm64/boot/dts/qcom/$DTB
+[[ -s $image ]] || die "no $image (bin/omamobile kernel)"
+[[ -s $modules ]] || die "no $modules (KERNEL_OUT=$out bin/omamobile modules)"
+top=$(tar --zstd -tf "$modules" | sed 's|^\./||; s|/.*||' | sort -u)
+[[ $top == "$rel" ]] || die "$modules holds '$top', not $rel only (a stale tarball? KERNEL_OUT=$out bin/omamobile modules)"
+tar --zstd -tf "$modules" | grep -cE "^(\./)?$rel/modules\.order$" >/dev/null || die "$modules has no modules.order (KERNEL_OUT=$out bin/omamobile modules)"
+[[ -s $dtb ]] || die "no $dtb"
+[[ -d $images ]] || die "no image directory $images (tools/build-ingot-probe --standalone)"
+check_set "$images" "$rel"
+# The kernel boot_a.img carries must be this build's, or the modules are
+# another kernel's
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+msg=$(ib_kernel_of "$images/boot_a.img" "$tmp/kernel") || die "$msg"
+cmp -s "$tmp/kernel" "$image" || die "the kernel in $images/boot_a.img is not $image: build the images from this KERNEL_OUT"
+
+rm -rf "$dest.new"
+mkdir -p "$dest.new/boot"
+cp "$modules" "$dest.new/modules.tar.zst"
+cp "$dtb" "$dest.new/$DTB"
+for f in $IB_IMAGES RELEASE SHA256SUMS; do cp "$images/$f" "$dest.new/boot/$f"; done
+printf '%s\n' "$rel" > "$dest.new/kernel.release"
+[[ -z $count ]] || printf '%s\n' "$count" > "$dest.new/kernel.commits"
+{ [[ -z $commit ]] || echo "commit $commit"
+  echo "commits ${count:-from the release}"
+  echo "release $rel"; } > "$dest.new/SOURCE"
+(cd "$dest.new" && find . -type f ! -path ./SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort | xargs sha256sum) > "$dest.new/SHA256SUMS"
+rm -rf "$dest"
+mv "$dest.new" "$dest"
+echo "staged $rel (pkgver $pkgver): $(tar --zstd -tf "$modules" | grep -c '\.ko') modules, $DTB and the Saga's boot images in $dest (local builds only, never published)"
