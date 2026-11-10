@@ -125,6 +125,14 @@ and prints the flags and a verdict:
 | A not active or unbootable | the next boot goes to B (DANGER, 3) or stops in fastboot (2) | 2 or 3 |
 | disk node missing or unreadable, no GPT, a bad CRC | says so, no guess | 1 |
 
+The disk node matters: the initramfs storage guard deletes the whole-disk
+node of a LUN on which it leaves partitions writable. An image that leaves
+`boot_a vendor_boot_a dtbo_a` writable on LUN 4 may therefore have no
+`/dev/sde`, and then `slots` says the node is missing and exits 1; it never
+recreates the node. Read the flags from fastboot (`fastboot getvar all`)
+instead. With today's images the guard only marks that disk read-only, and
+reading it works.
+
 `omamobile-ingot-slot-check.service` (enabled) runs `slots --service` once
 per boot: the verdict in the journal (`journalctl -t omamobile-ingot-slots`),
 at warning level when tries are low or in the danger state, and in

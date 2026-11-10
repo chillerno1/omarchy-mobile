@@ -476,10 +476,13 @@ read_slots() {
   node=$DEV/$disk
   bs=$(cat "$SYS/class/block/$disk/queue/logical_block_size" 2>/dev/null || true)
   [[ $bs == @(512|4096) ]] || die "cannot read the logical block size of $disk ($SYS/class/block/$disk/queue/logical_block_size)"
+  # The storage guard removes the whole-disk node of a LUN that holds
+  # writable partitions; it is never recreated here
+  local missing="the whole-disk node $node is missing (the storage guard removes it on a LUN with writable partitions): cannot read the slot flags; read them with 'fastboot getvar all' from a computer"
   if real_root; then
-    [[ -b $node ]] || die "the whole-disk node $node is missing: cannot read the slot flags"
+    [[ -b $node ]] || die "$missing"
   else
-    [[ -f $node ]] || die "the whole-disk node $node is missing: cannot read the slot flags"
+    [[ -f $node ]] || die "$missing"
   fi
   [[ -r $node ]] || die "cannot read $node (run as root): cannot read the slot flags"
   python3 -I - "$node" "$bs" "$disk" <<'PY'
