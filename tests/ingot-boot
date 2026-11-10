@@ -121,6 +121,7 @@ printf '#!/bin/sh\necho called >> "%s/calls"\nexit 97\n' "$t" > "$t/bin/apk"
 chmod +x "$t/bin/apk"
 if PATH="$t/bin:$PATH" SELF_UPDATE=1 ARCH_BOOT=0 sh "$build" > "$t/log" 2>&1; then fail "SELF_UPDATE without ARCH_BOOT is refused"; fi
 grep -q 'SELF_UPDATE needs ARCH_BOOT' "$t/log" && [[ ! -e $t/calls ]] || { cat "$t/log"; fail "refused before apk runs"; }
+# shellcheck disable=SC2016 # the script's own text, $stage unexpanded
 grep -q 'echo stay > "\$stage/etc/omamobile-no-usb-host"' "$build" && grep -q 'omamobile-compatible' "$build" \
   || fail "--arch packs the board compatible and the no-USB-host stay"
 pass "the container script refuses SELF_UPDATE without ARCH_BOOT first; --arch packs the board and stay"

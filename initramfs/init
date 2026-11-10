@@ -112,10 +112,9 @@ ufs_rw_load() {
         return 0 ;;
     esac
   fi
-  # $slot is a or b here, so the patterns below hold no glob characters
   for p in "$@"; do
     case "$p" in
-      boot_$slot|init_boot_$slot|vendor_boot_$slot|vendor_kernel_boot_$slot|dtbo_$slot|userdata) ;;
+      boot_"$slot"|init_boot_"$slot"|vendor_boot_"$slot"|vendor_kernel_boot_"$slot"|dtbo_"$slot"|userdata) ;;
       *)
         ufs_ro_log "allowlist names $p, which is never writable: every partition read-only"
         return 0 ;;

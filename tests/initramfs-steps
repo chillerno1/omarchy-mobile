@@ -145,7 +145,7 @@ pass "INITRAMFS_MODULES: a built-in module is left out, a missing one stops the 
 N=$t/nousb
 mkdir -p "$N/bin" "$N/udc/x" "$N/etc"
 awk '/^# Self-recovery for bring-up/ {on = 1} on; on && /^\) &$/ {exit}' "$init" > "$N/sub.sh"
-tail -n 1 "$N/sub.sh" | grep -qx ') &' || fail "the self-recovery subshell found in $init"
+[[ $(tail -n 1 "$N/sub.sh") == ') &' ]] || fail "the self-recovery subshell found in $init"
 sed -e 's|^) &$|)|' -e "s|/sys/class/udc/|$N/udc/|" -e "s|/etc/omamobile-|$N/etc/omamobile-|g" \
     -e "s|/proc/sysrq-trigger|$N/sysrq|" -e "s|/dev/kmsg|$N/kmsg|" -e "s|/run/omamobile-resizing|$N/resizing|" \
     "$N/sub.sh" > "$N/sub-test.sh"
