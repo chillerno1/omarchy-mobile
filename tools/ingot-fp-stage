@@ -604,7 +604,7 @@ inner() {
     wait_listeners
     [[ -c $ROOT/dev/blfp || ( -n $TROOT && -f $ROOT/dev/blfp ) ]] || die "no /dev/blfp in the chroot"
     local who=system; ((HAL_ROOT)) && who=root
-    spawn halhost "$who" /omamobile/omamobile-fp-halhost open ${SECONDS_ARG:+--seconds "$SECONDS_ARG"}
+    spawn halhost "$who" /omamobile/omamobile-fp-halhost ${SECONDS_ARG:+--seconds "$SECONDS_ARG"} open
     say "stage hal running (^C stops)"
     wait -n "${PIDS[halhost]}" "${PIDS[qseecomd]}" || true
     [[ -n $STOPPING ]] || say "$(alive "${PIDS[qseecomd]}" && echo "the HAL host" || echo qseecomd) exited"
