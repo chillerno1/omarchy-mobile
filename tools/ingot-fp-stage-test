@@ -18,6 +18,19 @@
 #                            -> the logdw reader names the sender, the
 #                               listeners are seen, the HAL host starts after
 #                               them, chipid 5f83 gives PASS, stop in order
+#   audit, socket directory  -> the host's socket directory bound once, empty;
+#                               refused for a file planted in it, another
+#                               directory in its place, a second bind of it
+#   bridge (a static fake bridge)
+#                            -> started after the listeners, with --socket
+#                               and --state; its socket on the host at
+#                               run/omamobile-fp/sock, root's 0600 in a
+#                               root-only 0700 directory; a client outside the
+#                               namespace gets READY 0 0 0 and answers
+#                               (omamobile-fp-ctl STATUS, LIST); the state
+#                               directories; ingot-fp-stage stop stops the
+#                               bridge before qseecomd and removes the socket
+#                               directory
 #   lint                     -> shellcheck on both scripts, if installed
 set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -123,11 +136,22 @@ for f in dev-extra dev-wrong mount-extra stub-vendor; do
 done
 pass "audit: refused an extra node, a wrong node, an extra mount, the vendor's library"
 
+st audit > "$out" 2>&1 || fail "audit (socket directory)"
+grep -q "  /dev/socket/omamobile-fp: bind of the host's $H/run/omamobile-fp/sock" "$out" || fail "audit: socket directory bind"
+grep -q "  $H/run/omamobile-fp/sock: empty" "$out" || fail "audit: socket directory empty"
+for f in "sock-extra:holds 'f planted'" "sock-wrong:is not the host's" "sock-twice:/tmp/s: unexpected mount point"; do
+  OMAMOBILE_FP_TEST_INJECT=${f%%:*} st audit > "$out" 2>&1 && fail "audit passed with ${f%%:*}"
+  { grep -q "${f#*:}.*REFUSED" "$out" && grep -q 'audit failed: nothing started' "$out"; } ||
+    fail "audit with ${f%%:*}: no refusal for '${f#*:}'"
+done
+pass "audit: the socket directory, once and empty; refused a planted file, another directory, a second bind"
+
 # --- hal, with static fakes (the chroot has no bionic here) ---
 if printf 'int main(void){return 0;}\n' > "$t/cc.c" && gcc -static -o "$t/cc" "$t/cc.c" 2>/dev/null; then
   cat > "$t/fake.c" <<'EOF'
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -146,6 +170,58 @@ static void logdw(const char *tag, const char *msg)
 }
 static volatile sig_atomic_t done;
 static void term(int s) { (void)s; done = 1; }
+/* the line protocol, canned: READY 0 0 0, STATUS -> OK, LIST -> LIST 7 */
+static int bridge(int argc, char **argv)
+{
+	const char *path = "", *state = "";
+	struct sockaddr_un a = { .sun_family = AF_UNIX };
+	struct sigaction sa = { .sa_handler = term };	/* no SA_RESTART */
+	char line[128], f[256];
+	int s, c, i;
+	FILE *fp;
+
+	sigaction(SIGTERM, &sa, NULL);
+	for (i = 1; i + 1 < argc; i++) {
+		if (!strcmp(argv[i], "--socket"))
+			path = argv[++i];
+		else if (!strcmp(argv[i], "--state"))
+			state = argv[++i];
+	}
+	printf("bridge fake: --socket %s --state %s uid %d\n", path, state, (int)getuid());
+	snprintf(f, sizeof(f), "%s/secret", state);
+	fp = fopen(f, "w");
+	printf("bridge fake: %s %s\n", f, fp ? "written" : "NOT writable");
+	if (fp)
+		fclose(fp);
+	strncpy(a.sun_path, path, sizeof(a.sun_path) - 1);
+	s = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (bind(s, (struct sockaddr *)&a, sizeof(a)) || chmod(path, 0600) || listen(s, 2)) {
+		perror("bridge fake: listen");
+		return 1;
+	}
+	printf("bridge fake: ready on %s\n", path);
+	fflush(stdout);
+	while (!done) {
+		c = accept(s, NULL, NULL);
+		if (c < 0)
+			continue;
+		fp = fdopen(c, "r+");
+		fputs("READY 0 0 0\n", fp);
+		fflush(fp);
+		while (!done && fgets(line, sizeof(line), fp)) {
+			if (!strncmp(line, "STATUS", 6))
+				fputs("OK\n", fp);
+			else if (!strncmp(line, "LIST", 4))
+				fputs("LIST 7\n", fp);
+			else
+				fputs("ERROR 2\n", fp);
+			fflush(fp);
+		}
+		fclose(fp);
+	}
+	printf("bridge fake: TERM\n");
+	return 0;
+}
 int main(int argc, char **argv)
 {
 	signal(SIGTERM, term);
@@ -157,7 +233,10 @@ int main(int argc, char **argv)
 		printf("qseecomd fake: TERM\n");
 		return 0;
 	}
-	printf("halhost fake: %s %s uid %d\n", argc > 1 ? argv[1] : "", argc > 3 ? argv[3] : "", (int)getuid());
+	if (strstr(argv[0], "bridge"))
+		return bridge(argc, argv);
+	printf("halhost fake: %s %s %s uid %d\n", argc > 1 ? argv[1] : "", argc > 2 ? argv[2] : "",
+	       argc > 3 ? argv[3] : "", (int)getuid());
 	FILE *f = fopen("/dev/blfp", "r");
 	char l[64] = "";
 	if (f && fgets(l, sizeof(l), f))
@@ -176,7 +255,7 @@ EOF
   grep -q '^\[qseecomd\] [0-9]*/7 I QSEECOMD: listener services: Started (Listener ID = 8192)' "$out" ||
     fail "hal: the logdw reader's line for qseecomd"
   grep -q 'listeners registered: 2 started' "$out" || fail "hal: listeners not seen"
-  grep -q '^\[halhost\] halhost fake: open 1 uid 0' "$out" || fail "hal: the HAL host's arguments"
+  grep -q '^\[halhost\] halhost fake: --seconds 1 open uid 0' "$out" || fail "hal: the HAL host's arguments"
   grep -q '^\[halhost\] halhost fake: /dev/blfp reads c 10:120' "$out" || fail "hal: /dev/blfp in the chroot"
   grep -q '^\[omamobile-fp-ha\] [0-9]*/7 I BtlFpHal: chip id 0x5f83' "$out" || fail "hal: the HAL host's log line"
   grep -q 'S3 PASS: chipid 5f83' "$out" || fail "hal: no PASS"
@@ -184,6 +263,48 @@ EOF
   [[ $(grep -n 'S3 PASS' "$out" | cut -d: -f1) -lt $(grep -n 'qseecomd fake: TERM' "$out" | cut -d: -f1) ]] ||
     fail "hal: qseecomd stopped before the report"
   pass "hal: log reader, listeners, HAL host after them, PASS, ordered stop"
+
+  # --- bridge, with a fake bridge ---
+  cp "$t/fake" "$BIN/omamobile-fp-bridge-ingot"
+  chmod 0755 "$BIN/omamobile-fp-bridge-ingot"
+  SD=$H/run/omamobile-fp/sock
+  out=$t/bridge.out
+  TIMEOUT=60 st bridge > "$out" 2>&1 &
+  bpid=$!
+  for ((i = 0; i < 300; i++)); do
+    grep -q 'stage bridge running' "$out" 2>/dev/null && break
+    kill -0 "$bpid" 2>/dev/null || break
+    sleep 0.1
+  done
+  grep -q 'stage bridge running' "$out" || fail "bridge: not running"
+  grep -q '^\[bridge\] bridge fake: --socket /dev/socket/omamobile-fp/bridge.sock --state /data/vendor/omamobile-fp uid 0' "$out" ||
+    fail "bridge: its arguments"
+  grep -q '^\[bridge\] bridge fake: /data/vendor/omamobile-fp/secret written' "$out" || fail "bridge: state not writable"
+  [[ $(grep -n 'listeners registered' "$out" | cut -d: -f1) -lt $(grep -n 'starting bridge' "$out" | cut -d: -f1) ]] ||
+    fail "bridge: started before the listeners"
+  [[ -S $SD/bridge.sock ]] || fail "bridge: no socket on the host at $SD/bridge.sock"
+  [[ $(stat -c '%u %a' "$SD/bridge.sock") == "$(id -u) 600" ]] || fail "bridge: socket is $(stat -c '%u %a' "$SD/bridge.sock")"
+  [[ $(stat -c '%u %a' "$SD") == "$(id -u) 700" ]] || fail "bridge: socket directory is $(stat -c '%u %a' "$SD")"
+  [[ $(stat -c '%a' "$STATE/data/vendor/omamobile-fp") == 700 && -d $STATE/data/vendor_de/0/fpdata ]] ||
+    fail "bridge: the state directories"
+  grep -q "$SD: s bridge.sock (root, 0600; directory root, 0700)" "$out" || fail "bridge: the socket audit"
+  CTL=$HERE/../packages/omamobile-fingerprint/lib/omamobile-fp-ctl
+  "$CTL" --socket "$SD/bridge.sock" --timeout 5 STATUS > "$t/ctl" 2>&1 || { cat "$t/ctl" >&2; fail "bridge: ctl STATUS"; }
+  { grep -qx '<- READY 0 0 0' "$t/ctl" && grep -qx '<- OK' "$t/ctl"; } || { cat "$t/ctl" >&2; fail "bridge: STATUS answers"; }
+  { "$CTL" --socket "$SD/bridge.sock" --timeout 5 LIST > "$t/ctl" 2>&1 && grep -qx '<- LIST 7' "$t/ctl"; } ||
+    { cat "$t/ctl" >&2; fail "bridge: ctl LIST"; }
+  pass "bridge: after the listeners, socket on the host (0600, directory 0700), a client outside gets READY 0 0 0"
+
+  env OMAMOBILE_FP_TEST=1 OMAMOBILE_FP_TEST_ROOT="$H" "$STAGE" stop > "$t/stop" 2>&1 || { cat "$t/stop" >&2; fail "stop"; }
+  wait "$bpid" || true
+  grep -q '^\[bridge\] bridge fake: TERM' "$out" || fail "bridge: not stopped with TERM"
+  grep -q '^\[qseecomd\] qseecomd fake: TERM' "$out" || fail "bridge: qseecomd not stopped"
+  [[ $(grep -n 'bridge fake: TERM' "$out" | cut -d: -f1) -lt $(grep -n 'qseecomd fake: TERM' "$out" | cut -d: -f1) ]] ||
+    fail "bridge: qseecomd stopped before the bridge"
+  [[ ! -e $SD ]] || fail "bridge: socket directory left after stop"
+  env OMAMOBILE_FP_TEST=1 OMAMOBILE_FP_TEST_ROOT="$H" "$STAGE" stop 2>&1 | grep -q 'no stage running' ||
+    fail "stop with nothing running"
+  pass "bridge: stop takes the bridge down before qseecomd, removes the socket directory"
 else
   echo "skip - hal with fakes: no gcc -static"
 fi

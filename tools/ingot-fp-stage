@@ -18,6 +18,14 @@
 #                                    --hal-root: as root); then the sensor
 #                                    driver's chipid/version and the kernel log.
 #                                    PASS for S3: chipid 5f83
+#   ingot-fp-stage bridge    --image DIR --bin DIR
+#                                    qseecomd, then omamobile-fp-bridge-ingot
+#                                    as uid/gid 1000 (it hosts the HAL itself),
+#                                    serving fprintd's socket on the host at
+#                                    /run/omamobile-fp/sock/bridge.sock (root,
+#                                    0600), until stopped. S4 and later
+#   ingot-fp-stage stop              stop a running stage in order (TERM to
+#                                    its namespace's PID 1) and wait for it
 #   ingot-fp-stage run       --image DIR --bin DIR [--as-system] -- CMD...
 #                                    an Android binary in the same environment:
 #                                    inside a running listeners/hal stage if
@@ -28,8 +36,9 @@
 # system/, apex/; the vendor's, never shipped). --bin holds our builds:
 # librpmb.so and libssd.so (stub listener libraries: they register the RPMB
 # and SSD listeners, answer every request "failed" and open no device),
-# omamobile-fp-halhost (for hal), and optionally omamobile-fp-shim.so (the
-# preload shim: properties and logging; preloaded only if present).
+# omamobile-fp-halhost (for hal), omamobile-fp-bridge-ingot (for bridge), and
+# optionally omamobile-fp-shim.so (the preload shim: properties and logging;
+# preloaded only if present).
 #
 # SAFETY (enforced below; check and every start verify and print it):
 #   - The chroot's /dev is a fresh tmpfs holding ONLY these character devices,
@@ -55,6 +64,19 @@
 #     even as root it cannot make a device node, mount, or set the clock.
 #   - /sys is a tmpfs with copies of the two clock uevent files libqisl
 #     reads; the host's /sys is not visible inside.
+#   - bridge (and audit) only: the one host directory the chroot sees is
+#     the bridge's socket directory, /run/omamobile-fp/sock (the path
+#     fprintd's drop-in and omamobile-fp-ctl use on the Pixel), made empty
+#     by this script and bind-mounted at /dev/socket/omamobile-fp. The
+#     audit refuses that mount unless it is exactly this directory, and any
+#     entry in it but the bridge's socket. The directory belongs to uid
+#     1000 only while the bridge starts (it binds its socket there); once
+#     the socket is up, both are root's again (directory 0700, socket 0600,
+#     as on the Pixel): a listening socket keeps working, and only root
+#     (fprintd, omamobile-fp-ctl) can connect. A stop removes the directory.
+#     The bridge's own state is /data/vendor/omamobile-fp (secret,
+#     gatekeeper handle), its HAL's templates /data/vendor_de/0/fpdata:
+#     both under the state directory, uid 1000, 0700/0770.
 #   Left as is: the chroot's /proc shows the namespace's PID 1 (this
 #   script), whose /proc/1/root is the host's root; a root process inside
 #   could deliberately walk out through it (no vendor code here does).
@@ -64,13 +86,15 @@
 # Network: the host's namespace (the sensor driver's netlink socket, protocol
 # 26, exists only in the initial one). Mount and PID namespaces are private:
 # when this script (the namespace's PID 1) exits, every Android process dies
-# with it. ^C/TERM stops the HAL host first, then qseecomd; the kernel then
-# unregisters the listeners and unloads the trusted app as their files close.
+# with it. ^C/TERM (or ingot-fp-stage stop) stops the HAL host or the bridge
+# first, then qseecomd; the kernel then unregisters the listeners and unloads
+# the trusted app as their files close.
 #
 # Logging: without logd, bionic's liblog sends to /dev/socket/logdw; a
 # reader (python3) on that datagram socket prints each line prefixed with
 # the sending process's name. With the shim, liblog's output goes to stderr
-# instead. Everything also lands in $RUN/stage.log.
+# instead. Everything, this script's own lines included, also lands in
+# $RUN/stage.log (truncated at each start).
 #
 # Needs on the phone: bash, util-linux (unshare, nsenter, setpriv, setsid,
 # mount, findmnt, flock, dmesg), coreutils (chroot, sha256sum, stat, mknod,
@@ -85,7 +109,10 @@
 # (a fault for the audit to catch) are honoured only with OMAMOBILE_FP_TEST=1.
 set -euo pipefail
 
-say() { printf 'ingot-fp: %s\n' "$*" >&2; }
+say() {
+  printf 'ingot-fp: %s\n' "$*" >&2
+  [[ -z ${SAYLOG:-} ]] || printf 'ingot-fp: %s\n' "$*" >> "$LOG" 2>/dev/null || true
+}
 die() { say "error: $*"; exit 1; }
 usage() { sed -n '/^#   ingot-fp-stage check/,/^#   Options:/p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
@@ -100,6 +127,13 @@ ROOT=$RUN/root
 NSPID=$RUN/ns.pid
 LOG=$RUN/stage.log
 SYSFP=$HSYS/devices/platform/fingerprint
+# The bridge's socket: the host path the Pixel uses (fprintd's drop-in,
+# omamobile-fp-ctl), and where the chroot sees it.
+SOCKDIR=$TROOT/run/omamobile-fp/sock
+SOCK=$SOCKDIR/bridge.sock
+CSOCKDIR=/dev/socket/omamobile-fp
+# The bridge's own state directory, in the chroot
+BRIDGE_STATE=/data/vendor/omamobile-fp
 # Android's system user: qseecomd drops to it, the HAL runs as it. A user
 # namespace in the tests maps only root.
 SYS_ID=1000
@@ -124,7 +158,7 @@ declare -A NODES=(
 )
 # Nodes uid 1000 must open after qseecomd drops privileges (and the HAL).
 SYS_NODES=" qseecom blfp dma_heap/qcom,qseecom dma_heap/qcom,qseecom-ta "
-# Optional on the host: only the hal stage needs the sensor.
+# Optional on the host: only the hal and bridge stages need the sensor.
 OPT_NODES=" blfp "
 
 # Strings no stub may contain: the vendor's RPMB/SSD device paths.
@@ -132,6 +166,17 @@ FORBIDDEN=(/dev/block ufs-bsg mmcblk /dev/sg /dev/0:0:0 by-name/ssd)
 
 MODE=${1:-}; [[ -n $MODE ]] || usage
 shift
+# stop: TERM to the running stage's PID 1 (it stops its processes in order)
+if [[ $MODE == stop ]]; then
+  p=$(cat "$NSPID" 2>/dev/null || true)
+  if ! [[ $p =~ ^[0-9]+$ ]] || ! kill -0 "$p" 2>/dev/null; then
+    say "no stage running"; exit 0
+  fi
+  say "stopping the stage (PID $p)"
+  kill -TERM "$p"
+  for ((i = 0; i < 300; i++)); do kill -0 "$p" 2>/dev/null || { say "stopped"; exit 0; }; sleep 0.1; done
+  die "the stage (PID $p) still runs after 30 s"
+fi
 IMAGE='' BIN='' STATE=/var/lib/omamobile-fp-ingot SECONDS_ARG='' HAL_ROOT=0 AS_SYSTEM=0
 CMD=()
 while (($#)); do
@@ -152,11 +197,12 @@ done
 IMAGE=$(realpath -e -- "$IMAGE") || die "no such directory: --image"
 BIN=$(realpath -e -- "$BIN") || die "no such directory: --bin"
 [[ $STATE == /* ]] || die "--state must be an absolute path"
-case $STATE in /dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/run/omamobile-fp-ingot*|/) die "--state $STATE: not there" ;; esac
+case $STATE in /dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/run/omamobile-fp-ingot*|/run/omamobile-fp|/run/omamobile-fp/*|/) die "--state $STATE: not there" ;; esac
 [[ -z $SECONDS_ARG || $SECONDS_ARG =~ ^[0-9]+$ ]] || die "--seconds takes a number"
 
 SHIM=$BIN/omamobile-fp-shim.so
 HALHOST=$BIN/omamobile-fp-halhost
+BRIDGE=$BIN/omamobile-fp-bridge-ingot
 
 # --- Device nodes ------------------------------------------------------------
 
@@ -227,6 +273,7 @@ check() {
   stub_ok librpmb.so || ok=0
   stub_ok libssd.so || ok=0
   if [[ -f $HALHOST ]]; then say "HAL host: $HALHOST"; else say "no $HALHOST: hal can't run"; fi
+  if [[ -f $BRIDGE ]]; then say "bridge: $BRIDGE"; else say "no $BRIDGE: bridge can't run"; fi
   if [[ -f $SHIM ]]; then say "shim: $SHIM (preloaded)"
   else say "no shim in $BIN: not preloaded (properties unset, logs through logdw)"; fi
   for n in "${!NODES[@]}"; do
@@ -253,6 +300,9 @@ audit() {
     case $t:$p in
       d:dma_heap|d:socket|d:__omamobile_props__) continue ;;
       s:socket/logdw|f:__omamobile_props__/*) continue ;;
+      # the bridge's socket directory (its contents: audit_sockdir)
+      d:socket/omamobile-fp) [[ $MODE == audit || $MODE == bridge ]] && continue ;;
+      s:socket/omamobile-fp/bridge.sock) [[ $MODE == bridge ]] && continue ;;
     esac
     name=$p
     if [[ -n ${NODES[$name]+x} ]] && { [[ $t == c ]] || [[ -n $TROOT && $t == f ]]; }; then
@@ -280,6 +330,15 @@ audit() {
     majmin=$(findmnt -n -o MAJ:MIN -T "$p" | tr -d " ")
     [[ -n $majmin ]] && allowed_dev[$majmin]=1
   done
+  # the socket directory's file system and its path in there (mountinfo's
+  # root field of a bind of it)
+  local sock_majmin=none sock_root=none sock_seen=0 target fsroot
+  if [[ -d $SOCKDIR ]]; then
+    sock_majmin=$(findmnt -n -o MAJ:MIN -T "$SOCKDIR" | tr -d " ")
+    target=$(findmnt -n -o TARGET -T "$SOCKDIR")
+    fsroot=$(findmnt -n -o FSROOT -T "$SOCKDIR")
+    sock_root=${fsroot%/}${SOCKDIR#"${target%/}"}
+  fi
   while read -r mi; do
     majmin=$(cut -d' ' -f3 <<<"$mi")
     mp=$(cut -d' ' -f5 <<<"$mi")
@@ -295,7 +354,16 @@ audit() {
       /sys) want=tmpfs:sys ;;
       /proc) want=proc:proc ;;
       # binds: only from the file systems of --image, --bin and --state
-      /system|/vendor|/apex|/vendor/lib64/librpmb.so|/vendor/lib64/libssd.so|/data|/mnt/vendor/persist|/persist|/omamobile/omamobile-fp-halhost|/omamobile/omamobile-fp-shim.so) want=bind ;;
+      /system|/vendor|/apex|/vendor/lib64/librpmb.so|/vendor/lib64/libssd.so|/data|/mnt/vendor/persist|/persist|/omamobile/omamobile-fp-halhost|/omamobile/omamobile-fp-bridge-ingot|/omamobile/omamobile-fp-shim.so) want=bind ;;
+      # the one host directory: exactly $SOCKDIR, whatever its file system
+      "$CSOCKDIR")
+        if [[ $MODE == audit || $MODE == bridge ]] && [[ $majmin == "$sock_majmin" && $(cut -d' ' -f4 <<<"$mi") == "$sock_root" ]]; then
+          say "  $p: bind of the host's $SOCKDIR ($fs $majmin, root $sock_root)"
+          ((++sock_seen))
+        else
+          say "  $p: $fs $majmin root $(cut -d' ' -f4 <<<"$mi") is not the host's $SOCKDIR ($sock_majmin root $sock_root): REFUSED"; ok=0
+        fi
+        continue ;;
       *) say "  $p: unexpected mount point: REFUSED"; ok=0; continue ;;
     esac
     if [[ $want == bind ]]; then
@@ -310,6 +378,10 @@ audit() {
       say "  $p: $fs $src, want ${want/:/ }: REFUSED"; ok=0
     fi
   done < /proc/self/mountinfo
+  if [[ $MODE == audit || $MODE == bridge ]]; then
+    ((sock_seen == 1)) || { say "  $CSOCKDIR: $sock_seen binds of the host's $SOCKDIR, want 1: REFUSED"; ok=0; }
+    audit_sockdir empty || ok=0
+  fi
 
   say "audit: the stubs as the chroot sees them"
   for name in librpmb.so libssd.so; do
@@ -337,6 +409,28 @@ audit() {
   say "audit passed"
 }
 
+# The socket directory: empty (before the bridge), or exactly the bridge's
+# socket, root's, 0600, in a root-only directory (after). $1 empty|socket
+audit_sockdir() {
+  local ok=1 e want
+  [[ $1 == empty ]] && want="" || want="s bridge.sock"
+  e=$(find "$SOCKDIR" -mindepth 1 -printf '%y %P\n' | sort | tr '\n' ' ')
+  e=${e% }
+  if [[ $e != "$want" ]]; then
+    say "  $SOCKDIR holds '${e}', want '${want}': REFUSED"; ok=0
+  fi
+  if [[ $1 == socket ]]; then
+    e=$(stat -c '%u:%g %a' -- "$SOCKDIR")
+    [[ $e == "0:0 700" ]] || { say "  $SOCKDIR is $e, want 0:0 700: REFUSED"; ok=0; }
+    if [[ -S $SOCK ]]; then
+      e=$(stat -c '%u:%g %a' -- "$SOCK")
+      [[ $e == "0:0 600" ]] || { say "  $SOCK is $e, want 0:0 600: REFUSED"; ok=0; }
+    fi
+  fi
+  ((ok)) && say "  $SOCKDIR: ${want:-empty}${want:+ (root, 0600; directory root, 0700)}"
+  ((ok))
+}
+
 # --- Building the chroot (inside the private namespace) -------------------------
 
 bind() { # src dst [ro]
@@ -362,11 +456,15 @@ setup_state() {
   local d
   install -d -m 0700 "$STATE"
   for d in data data/vendor data/vendor/tzstorage data/misc data/misc/qsee data/vendor/blfp \
-      data/vendor/blfp/pic persist persist/data; do
+      data/vendor/blfp/pic persist persist/data data/vendor/omamobile-fp data/vendor_de \
+      data/vendor_de/0 data/vendor_de/0/fpdata; do
     install -d -m 0770 "$STATE/$d"
     chown "$SYS_ID:$SYS_ID" "$STATE/$d"
   done
-  chmod 0771 "$STATE/data" "$STATE/data/vendor" "$STATE/data/misc"
+  chmod 0771 "$STATE/data" "$STATE/data/vendor" "$STATE/data/misc" "$STATE/data/vendor_de" \
+    "$STATE/data/vendor_de/0"
+  # the bridge's secret and gatekeeper handle: its user only
+  chmod 0700 "$STATE/data/vendor/omamobile-fp"
   # the audit finds this marker through both persist mount points
   : > "$STATE/persist/.omamobile-fp-ingot"
 }
@@ -389,6 +487,7 @@ setup() {
   mount -t tmpfs -o mode=1777,nosuid,nodev tmp "$ROOT/tmp"
   mount -t proc -o nosuid,nodev,noexec proc "$ROOT/proc"
   [[ -f $HALHOST ]] && bind "$HALHOST" "$ROOT/omamobile/omamobile-fp-halhost" ro
+  [[ $MODE == bridge && -f $BRIDGE ]] && bind "$BRIDGE" "$ROOT/omamobile/omamobile-fp-bridge-ingot" ro
   [[ -f $SHIM ]] && bind "$SHIM" "$ROOT/omamobile/omamobile-fp-shim.so" ro
 
   # /dev: the allowlist, nothing else
@@ -397,6 +496,15 @@ setup() {
     make_node "$n" || [[ $OPT_NODES == *" $n "* ]] || die "can't make /dev/$n"
   done
   install -d -m 0755 "$ROOT/dev/socket"
+  # the bridge's socket directory, fresh and root's (bridge_socket hands it
+  # to the bridge and back)
+  if [[ $MODE == audit || $MODE == bridge ]]; then
+    install -d -m 0755 "$(dirname "$SOCKDIR")"
+    rm -rf -- "$SOCKDIR"
+    install -d -m 0700 "$SOCKDIR"
+    chown 0:0 "$SOCKDIR"
+    bind "$SOCKDIR" "$ROOT$CSOCKDIR"
+  fi
   mkdir -p "$ROOT/dev/__omamobile_props__"
   mount -t tmpfs -o mode=0775,nosuid,nodev,noexec props "$ROOT/dev/__omamobile_props__"
   chown "$SYS_ID:$SYS_ID" "$ROOT/dev/__omamobile_props__"
@@ -423,6 +531,9 @@ setup() {
     dev-wrong) mount -o remount,rw,bind "$ROOT/dev"; echo 'c 1:5' > "$ROOT/dev/qseecom" ;;
     mount-extra) mkdir -p "$ROOT/mnt/x"; mount -t tmpfs x "$ROOT/mnt/x" ;;
     stub-vendor) mount --bind "$IMAGE/vendor/lib64/librpmb.so" "$ROOT/vendor/lib64/librpmb.so" ;;
+    sock-extra) : > "$SOCKDIR/planted" ;;
+    sock-wrong) mount --bind "$STATE/persist/data" "$ROOT$CSOCKDIR" ;;
+    sock-twice) mkdir -p "$ROOT/tmp/s"; mount --bind "$SOCKDIR" "$ROOT/tmp/s" ;;
   esac
   return 0
 }
@@ -543,8 +654,11 @@ stop() {
   [[ -n $STOPPING ]] && exit "$code"
   STOPPING=1
   trap '' TERM INT
-  say "stopping: the HAL host first, then qseecomd"
+  say "stopping: the HAL host or the bridge first, then qseecomd"
   stop_one halhost 50
+  stop_one bridge 50
+  # nothing listens any more: fprintd's next connect fails at once
+  [[ $MODE == bridge || $MODE == audit ]] && rm -rf -- "$SOCKDIR"
   [[ $MODE == hal && -n ${PIDS[halhost]:-} ]] && kernel_report
   stop_one run 30
   stop_one qseecomd 50
@@ -578,6 +692,31 @@ wait_listeners() {
   die "qseecomd's listeners not registered in 90 s"
 }
 
+# Wait for the bridge's socket, then make it and its directory root's: the
+# listening socket keeps working, and uid 1000 can no longer connect to it,
+# replace it or add anything next to it.
+bridge_socket() {
+  local i
+  for ((i = 0; i < 1200; i++)); do
+    [[ -S $SOCK ]] && break
+    alive "${PIDS[bridge]}" || die "the bridge exited before its socket appeared"
+    alive "${PIDS[qseecomd]}" || die "qseecomd exited before the bridge's socket appeared"
+    sleep 0.1
+  done
+  [[ -S $SOCK ]] || die "no socket $SOCK after 120 s"
+  # the bridge chmods and listens right after its bind: let it finish (its
+  # "ready on" line, or 2 s) before the socket is no longer its own
+  for ((i = 0; i < 20; i++)); do
+    grep -q 'ready on' "$LOG" 2>/dev/null && break
+    sleep 0.1
+  done
+  chown 0:0 "$SOCK" "$SOCKDIR"
+  chmod 0600 "$SOCK"
+  chmod 0700 "$SOCKDIR"
+  say "audit: the bridge's socket"
+  audit_sockdir socket || die "the socket directory is not as it should be: stopping"
+}
+
 # The namespace's PID 1.
 inner() {
   [[ $$ == 1 ]] || die "the inner start runs only as a new PID namespace's PID 1"
@@ -588,6 +727,7 @@ inner() {
   trap 'stop 0' TERM INT
   trap 'stop $?' EXIT
   : > "$LOG"
+  SAYLOG=1
   check
   setup
   audit
@@ -610,6 +750,19 @@ inner() {
     [[ -n $STOPPING ]] || say "$(alive "${PIDS[qseecomd]}" && echo "the HAL host" || echo qseecomd) exited"
     stop 0
   fi
+  if [[ $MODE == bridge ]]; then
+    wait_listeners
+    [[ -c $ROOT/dev/blfp || ( -n $TROOT && -f $ROOT/dev/blfp ) ]] || die "no /dev/blfp in the chroot"
+    # the bridge binds its socket as uid 1000: the directory is its until then
+    chown "$SYS_ID:$SYS_ID" "$SOCKDIR"
+    spawn bridge system /omamobile/omamobile-fp-bridge-ingot --socket "$CSOCKDIR/bridge.sock" \
+      --state "$BRIDGE_STATE"
+    bridge_socket
+    say "stage bridge running: $SOCK (^C or ingot-fp-stage stop stops)"
+    wait -n "${PIDS[bridge]}" "${PIDS[qseecomd]}" || true
+    [[ -n $STOPPING ]] || say "$(alive "${PIDS[qseecomd]}" && echo "the bridge" || echo qseecomd) exited"
+    stop 1
+  fi
   say "stage listeners running (^C stops)"
   wait -n "${PIDS[qseecomd]}" || true
   [[ -n $STOPPING ]] || say "qseecomd exited"
@@ -631,10 +784,10 @@ outer() {
   check
   install -d -m 0700 "$RUN"
   exec 9> "$RUN/lock"
-  flock -n 9 || die "another listeners/hal stage is running (run attaches to it)"
+  flock -n 9 || die "another listeners/hal/bridge stage is running (run attaches to it; ingot-fp-stage stop stops it)"
   if [[ -z $TROOT ]]; then
     [[ -c /dev/qseecom ]] || modprobe qcom_qseecom_user || true
-    [[ $MODE != hal || -c /dev/blfp ]] || modprobe betterlife-fp || true
+    [[ ( $MODE != hal && $MODE != bridge ) || -c /dev/blfp ]] || modprobe betterlife-fp || true
     command -v udevadm >/dev/null && udevadm settle -t 5 || true
   fi
   local fwd=()
@@ -650,9 +803,10 @@ outer() {
 
 case $MODE in
   check) check ;;
-  audit|listeners|hal|run)
+  audit|listeners|hal|bridge|run)
     [[ $MODE != run ]] || ((${#CMD[@]})) || die "usage: ingot-fp-stage run --image DIR --bin DIR -- CMD..."
     [[ $MODE != hal || -f $HALHOST ]] || die "no $HALHOST"
+    [[ $MODE != bridge || -f $BRIDGE ]] || die "no $BRIDGE"
     if [[ -n ${OMAMOBILE_FP_INGOT_INNER:-} ]]; then
       inner
     else
