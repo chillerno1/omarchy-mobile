@@ -369,8 +369,16 @@ static void op_done(void)
 		reply("FINGER UP");
 		finger_down = false;
 	}
-	if (op == OP_ENROLL)
+	if (op == OP_ENROLL) {
 		fp->post_enroll(fp);	/* revoke the single-use challenge */
+		/* The HAL's finger list is a cache it refreshes only on
+		 * set_active_group, remove and authenticate (libBtlFpHal's
+		 * sync_user_info is called with sync=0 by enumerate and never
+		 * by enroll), so without this a LIST right after ENROLLED
+		 * would miss the new finger until the next restart. */
+		if (fp->set_active_group(fp, active_gid, data_path))
+			say("set_active_group after enrol failed");
+	}
 	op = OP_NONE;
 	op_ending = false;
 	ending_reply = false;
