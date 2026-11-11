@@ -6,10 +6,31 @@
  *
  * Qualcomm's listener daemon, qseecomd, serves TrustZone's requests for
  * storage. Its RPMB and SSD libraries reach the UFS RPMB partition and the
- * ssd partition; in S3 nothing may touch RPMB or a block device, so these
- * stand-ins answer every request as a failed operation and log it. They
- * open no device and no file: the only thing opened is /dev/qseecom, by
- * libQSEEComAPI.so when the listener registers.
+ * ssd partition; nothing of ours may touch the real RPMB or a block device.
+ *
+ * librpmb.so (-DSTUB_RPMB) is a FILE-BACKED RPMB EMULATOR at the listener
+ * boundary (omamobile-rpmb-emu.c, #included here so the library stays one
+ * link unit). It answers TrustZone as a 4 MiB UFS RPMB would (8192
+ * sectors, 64 frames per transfer, type 9): program key, read counter,
+ * authenticated read and write, with real HMAC-SHA256 MACs once TrustZone
+ * has programmed its key, and result 0x0007 (key not yet programmed)
+ * before that. Its state lives in a directory inside the chroot, taken
+ * from OMAMOBILE_RPMB_EMU_DIR (default /data/vendor/omamobile-rpmb-emu; the
+ * stage tool creates it root:root 0700):
+ *   rpmb.img  the data area, 16384 blocks of 256 bytes, zero-filled
+ *             (ftruncate) on first use;
+ *   state     magic, version, key_programmed, the 32-byte key, the write
+ *             counter; created on first use.
+ * Both are opened in rpmb_init_service(), as root, before qseecomd drops to
+ * uid 1000, and kept for the listener thread; a missing directory or a
+ * failed open fails the init, so qseecomd exits loudly. SAFETY: the
+ * emulator opens exactly these two regular files under its state directory
+ * (O_NOFOLLOW, checked S_ISREG) and no device; besides them the only thing
+ * opened is /dev/qseecom, by libQSEEComAPI.so when the listener registers.
+ * It never logs the key or the data, only the first 4 bytes of a nonce.
+ *
+ * libssd.so (-DSTUB_SSD) is still a stub: it answers every request as a
+ * failed operation and logs it. It opens no device and no file.
  *
  * What qseecomd expects (its disassembly):
  *  - it dlopen()s the library by name (RTLD_NOW), so this one must come
@@ -26,9 +47,11 @@
  *
  * Wire formats (the vendor libraries' disassembly):
  *  RPMB, buffer 0x6400, served in place in the shared buffer: request
- *    command at +0 (0x101 init, 0x102 read, 0x103 write, 0x104 cfg). Reply
- *    20 bytes: +0 command (left as is), +4 status (0 success, 0xffffffff
- *    failed operation, 0xfffffff9 unknown command), +8 0, +0xc 0x14.
+ *    command at +0 (0x101 init, 0x102 read, 0x103 write, 0x104 cfg), +4 the
+ *    frame count (0x101: sub-op), +0x14 frames per transfer (0x103), the
+ *    request frames at +0x18. Reply: +4 status, +8 bytes moved, +0xc 20,
+ *    the reply frames written at +0x14; 20 bytes are sent (0x101 and 0x104
+ *    have their own short shapes, see omamobile-rpmb-emu.c).
  *  SSD, buffer 0x5000, request copied out (0x2008 bytes): command at +0
  *    (0x202 read, 0x203 write), data at +8. Reply: +0 command, +4 status,
  *    +8 byte count, +0xc data. Read: status 0 success, 3 failed, sent as
@@ -77,12 +100,14 @@ int __android_log_print(int prio, const char *tag, const char *fmt, ...);
 
 #if defined(STUB_RPMB)
 #define SVC		"rpmb"
-#define TAG		"omamobile-rpmb-stub"
+#define TAG		"omamobile-rpmb-emu"
 #define SB_LENGTH	0x6400u
+#define SERVES		"served by the file-backed emulator"
 #elif defined(STUB_SSD)
 #define SVC		"ssd"
 #define TAG		"omamobile-ssd-stub"
 #define SB_LENGTH	0x5000u
+#define SERVES		"every request fails"
 #else
 #error "build with -DSTUB_RPMB or -DSTUB_SSD"
 #endif
@@ -95,7 +120,7 @@ static unsigned long requests;
 __attribute__((format(printf, 2, 3)))
 static void say(int prio, const char *fmt, ...)
 {
-	char buf[512];
+	char buf[1024];
 	va_list ap;
 
 	va_start(ap, fmt);
@@ -105,37 +130,47 @@ static void say(int prio, const char *fmt, ...)
 	__android_log_print(prio, TAG, "%s", buf);
 }
 
-/* The first 32 bytes of a request, as hex words. */
-static void log_request(const void *req, uint32_t cmd)
-{
-	const uint32_t *w = req;
-	char hex[8 * 9 + 1];
-	size_t i, n = 0;
-
-	for (i = 0; i < 8; i++)
-		n += (size_t)snprintf(hex + n, sizeof(hex) - n, " %08x", w[i]);
-	requests++;
-	say(LOG_INFO, "listener 0x%x request %lu: command 0x%x, failing it;%s",
-	    listener, requests, cmd, hex);
-}
-
 #if defined(STUB_RPMB)
 
-#define RPMB_STATUS_FAILED	0xffffffffu
-#define RPMB_STATUS_UNKNOWN	0xfffffff9u
-#define RPMB_RESP_LEN		20u
+#include <stdlib.h>
+#include "omamobile-rpmb-emu.c"
 
+#define EMU_DIR_DEFAULT	"/data/vendor/omamobile-rpmb-emu"
+
+static struct rpmb_emu emu;
+
+/* Requests are served one at a time by the listener thread, so the
+ * emulator's state needs no lock. */
 static uint32_t serve_one(unsigned char *sb)
 {
-	uint32_t *w = (uint32_t *)sb;
-	uint32_t cmd = w[0];
+	char desc[768];
+	uint32_t len;
 
-	log_request(sb, cmd);
-	w[1] = cmd >= 0x101 && cmd <= 0x104 ? RPMB_STATUS_FAILED
-					    : RPMB_STATUS_UNKNOWN;
-	w[2] = 0;
-	w[3] = RPMB_RESP_LEN;
-	return RPMB_RESP_LEN;
+	len = rpmb_emu_serve(&emu, sb, SB_LENGTH, desc, sizeof(desc));
+	requests++;
+	say(LOG_INFO, "listener 0x%x request %lu: %s", listener, requests,
+	    desc);
+	return len;
+}
+
+static int init_service(void)
+{
+	const char *dir = getenv("OMAMOBILE_RPMB_EMU_DIR"), *probe;
+	char err[256];
+
+	if (!dir || !*dir)
+		dir = EMU_DIR_DEFAULT;
+	if (rpmb_emu_open(&emu, dir, err, sizeof(err))) {
+		say(LOG_ERROR, "rpmb_init_service: emulator: %s", err);
+		return -1;
+	}
+	probe = getenv("OMAMOBILE_RPMB_EMU_PROBE");
+	if (probe && !strcmp(probe, "unauthenticated-ok"))
+		emu.probe_unauth_ok = 1;
+	say(LOG_INFO, "rpmb emulator: state %s, key programmed %u, "
+	    "counter %u%s", dir, emu.st.key_programmed, emu.st.write_counter,
+	    emu.probe_unauth_ok ? ", PROBE: unauthenticated OK reads" : "");
+	return 0;
 }
 
 static void *serve(void *arg)
@@ -162,6 +197,20 @@ static void *serve(void *arg)
 }
 
 #else /* STUB_SSD */
+
+/* The first 32 bytes of a request, as hex words. */
+static void log_request(const void *req, uint32_t cmd)
+{
+	const uint32_t *w = req;
+	char hex[8 * 9 + 1];
+	size_t i, n = 0;
+
+	for (i = 0; i < 8; i++)
+		n += (size_t)snprintf(hex + n, sizeof(hex) - n, " %08x", w[i]);
+	requests++;
+	say(LOG_INFO, "listener 0x%x request %lu: command 0x%x, failing it;%s",
+	    listener, requests, cmd, hex);
+}
 
 #define SSD_REQ_LEN		0x2008u
 #define SSD_DATA_LEN		0x2000u
@@ -226,13 +275,13 @@ static void *serve(void *arg)
 	}
 }
 
-#endif
-
 static int init_service(void)
 {
 	say(LOG_INFO, "%s_init_service: stub, nothing opened", SVC);
 	return 0;
 }
+
+#endif
 
 static int start(uint32_t lstnr_id)
 {
@@ -260,7 +309,7 @@ static int start(uint32_t lstnr_id)
 		return -1;
 	}
 	say(LOG_INFO, "%s_start: listener 0x%x registered (buffer 0x%x), "
-	    "every request fails", SVC, lstnr_id, SB_LENGTH);
+	    SERVES, SVC, lstnr_id, SB_LENGTH);
 	return 0;
 }
 

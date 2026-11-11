@@ -12,6 +12,8 @@
 #   make test NDK=... CHROOT=...                  also builds out/fingerprint.fake.so
 #   make check NDK=... CHROOT=...                 and drives the bridge with it
 #                                                 (test/bridge-test, qemu-aarch64)
+#   make rpmb-emu-test                            the RPMB emulator's frame logic
+#                                                 on the host (cc, no NDK)
 #
 # The bridge and the HAL host share the module ABI and bionic start-up in
 # halhost/omamobile-fp-hal.h. out/fingerprint.fake.so is OUR test stand-in
@@ -35,17 +37,25 @@ OUT      ?= out
 CFLAGS   ?= -O2
 WARN     := -Wall -Wextra -Werror
 STUB_SRC := stubs/omamobile-listener-stub.c
+# The listener stub #includes the emulator (one link unit for librpmb.so).
+EMU_SRC  := stubs/omamobile-rpmb-emu.c stubs/omamobile-rpmb-emu.h
+EMU_TEST := test/rpmb-emu-test.c
+HOSTCC   ?= cc
 HALHOST_SRC := halhost/omamobile-fp-halhost.c
 BRIDGE_SRC := bridge/omamobile-fp-bridge-ingot.c
 FAKEHAL_SRC := test/fakehal.c
 HAL_HDR := halhost/omamobile-fp-hal.h
 SHIM_SRC := ../shim/omamobile-fp-shim.c
 
+# The host test needs neither the NDK nor the chroot.
+HOST_ONLY := $(if $(MAKECMDGOALS),$(if $(filter-out rpmb-emu-test clean,$(MAKECMDGOALS)),,1))
+ifndef HOST_ONLY
 ifndef CHROOT
 $(error set CHROOT=<extract-fingerprint-vendor-ingot output>/root)
 endif
 ifndef NDK
 $(error set NDK=<android-ndk r27 or later>)
+endif
 endif
 CC       := $(NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android$(API)-clang
 
@@ -73,7 +83,7 @@ EXE_LINK = $(CC) $(CFLAGS) $(WARN) -fPIE -pie -nostdlib -fno-stack-protector \
 STUB_LINK = $(CC) $(CFLAGS) $(WARN) -fPIC -fvisibility=hidden -shared \
 	-nostdlib -Wl,--no-undefined -Wl,-z,now -Wl,-z,relro
 
-$(OUT)/librpmb.so: $(STUB_SRC)
+$(OUT)/librpmb.so: $(STUB_SRC) $(EMU_SRC)
 	@mkdir -p $(OUT)
 	$(STUB_LINK) -DSTUB_RPMB -Wl,-soname,librpmb.so -o $@ $< \
 		$(LIBQSEECOM) $(LIBLOG) $(LIBC)
@@ -105,7 +115,15 @@ $(OUT)/omamobile-fp-shim.so: $(SHIM_SRC)
 		-Wl,--no-undefined -Wl,-soname,omamobile-fp-shim.so -o $@ $< \
 		$(LIBC) $(LIBDL)
 
+# Host build of the emulator and its test; the test makes its own temp dir.
+$(OUT)/rpmb-emu-test: $(EMU_TEST) $(EMU_SRC)
+	@mkdir -p $(OUT)
+	$(HOSTCC) $(CFLAGS) $(WARN) -Istubs -o $@ $(EMU_TEST) stubs/omamobile-rpmb-emu.c
+
+rpmb-emu-test: $(OUT)/rpmb-emu-test
+	$(OUT)/rpmb-emu-test
+
 clean:
 	rm -rf $(OUT)
 
-.PHONY: all test check clean
+.PHONY: all test check clean rpmb-emu-test
