@@ -37,8 +37,10 @@
 #
 # --image is the tree tools/extract-fingerprint-vendor-ingot made (vendor/,
 # system/, apex/; the vendor's, never shipped). --bin holds our builds:
-# librpmb.so and libssd.so (stub listener libraries: they register the RPMB
-# and SSD listeners, answer every request "failed" and open no device),
+# librpmb.so and libssd.so (our listener libraries: they register the RPMB
+# and SSD listeners and open no device; librpmb.so either answers every
+# request "failed" (the old stub) or emulates the RPMB partition in two
+# files, see SAFETY),
 # omamobile-fp-halhost (for hal), omamobile-fp-bridge-ingot (for bridge), and
 # optionally omamobile-fp-shim.so (the preload shim: properties and logging;
 # preloaded only if present).
@@ -80,6 +82,21 @@
 #     The bridge's own state is /data/vendor/omamobile-fp (secret,
 #     gatekeeper handle), its HAL's templates /data/vendor_de/0/fpdata:
 #     both under the state directory, uid 1000, 0700/0770.
+#   - The RPMB emulator (librpmb.so, in qseecomd's listener) keeps its state
+#     in /data/vendor/omamobile-rpmb-emu (OMAMOBILE_RPMB_EMU_DIR, set for
+#     every Android process): $STATE/data/vendor/omamobile-rpmb-emu on the
+#     host, root's, 0700, holding only regular files, root's, 0600 (rpmb.img
+#     and state; it opens them as root before qseecomd drops to uid 1000).
+#     check and the audit refuse it otherwise, never repair it: uid 1000
+#     owns data/vendor and could leave its own directory or a link there.
+#   - The fd audit (audit_fds), once the listeners are registered and again
+#     once the HAL host or the bridge's socket is up: every process of the
+#     namespace may hold only sockets, pipes, anonymous inodes, the
+#     allowlisted character devices, and files under the chroot, --image,
+#     --bin or the state directory (the runner's own helpers also $RUN,
+#     this script, and what they inherited as stdin/out/err). Any block
+#     device, any other character device or file, and any file of the
+#     emulator's directory but rpmb.img and state stops the stage.
 #   Left as is: the chroot's /proc shows the namespace's PID 1 (this
 #   script), whose /proc/1/root is the host's root; a root process inside
 #   could deliberately walk out through it (no vendor code here does).
@@ -147,6 +164,9 @@ SOCK=$SOCKDIR/bridge.sock
 CSOCKDIR=/dev/socket/omamobile-fp
 # The bridge's own state directory, in the chroot
 BRIDGE_STATE=/data/vendor/omamobile-fp
+# The RPMB emulator's state directory, in the chroot, and its two files
+EMU_DIR=/data/vendor/omamobile-rpmb-emu
+EMU_FILES=" rpmb.img state "
 # Android's system user: qseecomd drops to it, the HAL runs as it. A user
 # namespace in the tests maps only root.
 SYS_ID=1000
@@ -303,6 +323,9 @@ check() {
   done
   [[ -d $SYSFP ]] || say "no $SYSFP (the betterlife-fp driver)"
   say "state: $STATE (/data, /mnt/vendor/persist, /persist inside; no partition)"
+  say "RPMB emulator state: $STATE$EMU_DIR ($EMU_DIR inside; rpmb.img, state)"
+  if [[ -e $STATE$EMU_DIR || -L $STATE$EMU_DIR ]]; then emu_dir_ok || ok=0
+  else say "  not there yet (a start makes it root's, 0700)"; fi
   ((ok)) || { say "preconditions NOT met"; return 1; }
   say "preconditions met"
 }
@@ -410,6 +433,8 @@ audit() {
     [[ ! -f $IMAGE/vendor/lib64/$name || $t != "$(sha "$IMAGE/vendor/lib64/$name")" ]] ||
       { say "  /vendor/lib64/$name is the vendor's: REFUSED"; ok=0; }
   done
+  say "audit: the RPMB emulator's state directory"
+  emu_dir_ok || ok=0
   [[ -f $ROOT/mnt/vendor/persist/.omamobile-fp-ingot ]] ||
     { say "  /mnt/vendor/persist is not the state directory's persist: REFUSED"; ok=0; }
   [[ -f $ROOT/persist/.omamobile-fp-ingot ]] ||
@@ -447,6 +472,122 @@ audit_sockdir() {
   ((ok))
 }
 
+# The RPMB emulator's state directory on the host: root's, 0700, reached
+# through no link, holding only regular files, root's, 0600. uid 1000 owns
+# data/vendor, so it could rename the directory away and leave its own (or a
+# link to anywhere) in its place: refused, never repaired.
+emu_dir_ok() {
+  local d=$STATE$EMU_DIR ok=1 e real
+  if [[ -L $d || ! -d $d ]]; then say "  $d is not a directory (or is a link): REFUSED"; return 1; fi
+  real=$(realpath -e -- "$STATE")$EMU_DIR
+  e=$(realpath -e -- "$d")
+  [[ $e == "$real" ]] || { say "  $d resolves to $e, not $real: REFUSED"; ok=0; }
+  e=$(stat -c '%u:%g %a' -- "$d")
+  [[ $e == "0:0 700" ]] || { say "  $d is $e, want 0:0 700: REFUSED"; ok=0; }
+  # "TYPE UID:GID MODE SIZE NAME" of everything in it (never its contents)
+  while IFS= read -r -d '' e; do
+    if [[ $e =~ ^f\ 0:0\ 600\ ([0-9]+)\ ([^/]+)$ ]]; then
+      say "  $d/${BASH_REMATCH[2]}: root's, 0600, ${BASH_REMATCH[1]} bytes"
+    else
+      say "  $d holds '$e' (want only regular files, 0:0 600): REFUSED"; ok=0
+    fi
+  done < <(find "$d" -mindepth 1 -printf '%y %U:%G %m %s %P\0')
+  ((ok)) && say "  $d: root's, 0700, only regular files (root's, 0600)"
+  ((ok))
+}
+
+# $1 is $2, or under it, for one of $2...
+under() {
+  local f=$1 p; shift
+  for p; do [[ $f == "$p" || $f == "$p"/* ]] && return 0; done
+  return 1
+}
+
+# What every process of the namespace holds open (SAFETY: the fd audit),
+# from the namespace's own /proc ($ROOT/proc: its pids, valid from here).
+# Android processes are the ones whose root is the chroot; the others are
+# this runner's own (the log reader, the log pipes, this shell), which may
+# also hold $RUN, this script and whatever they inherited as fds 0-2 (a
+# terminal, the journal, a log file). Stops the stage on any deviation.
+# $1: when.
+audit_fds() {
+  local ok=1 d p fd ty mm link comm android n devs emu bad id self
+  local -a mine
+  local -A allowed=() types=()
+  for n in "${!NODES[@]}"; do
+    id=$(node_id "$HDEV/${NODES[$n]}") && allowed[$id]=/dev/$n
+  done
+  self=$(realpath -e -- "$0")
+  mine=("$ROOT" "$IMAGE" "$BIN" "$STATE")
+  [[ -n $TROOT ]] && mine+=("$TROOT")
+  say "audit: open files of every process in the namespace ($1)"
+  for d in "$ROOT"/proc/[0-9]*; do
+    p=${d##*/}
+    { read -r comm < "$d/comm"; } 2>/dev/null || continue     # gone
+    android=0
+    [[ $(readlink "$d/root" 2>/dev/null) == "$ROOT" ]] && android=1
+    if ! [[ -r $d/fd && -x $d/fd ]]; then
+      [[ -d $d ]] && { say "  $comm ($p): its open files are unreadable: REFUSED"; ok=0; }
+      continue
+    fi
+    types=()
+    while IFS= read -r -d '' fd && IFS= read -r -d '' ty && IFS= read -r -d '' mm; do
+      types[${fd##*/}]="$ty|$mm"
+    done < <(stat -L --printf '%n\0%F\0%t:%T\0' -- "$d"/fd/* 2>/dev/null)
+    n=0 devs='' emu=''
+    while IFS= read -r -d '' fd && IFS= read -r -d '' link; do
+      [[ -n ${types[$fd]:-} ]] || continue                    # closed meanwhile
+      ((++n))
+      ty=${types[$fd]%|*} mm=${types[$fd]##*|} bad=''
+      case $ty in
+        "block special file") bad="block device $((16#${mm%:*})):$((16#${mm#*:})) $link" ;;
+        "character special file")
+          mm=$((16#${mm%:*})):$((16#${mm#*:}))
+          if [[ -n ${allowed[$mm]:-} ]]; then devs+=" ${allowed[$mm]}($mm)"
+          elif ((!android && fd <= 2)); then devs+=" $link($mm, inherited fd $fd)"
+          else bad="character device $mm $link, not an allowlisted node"; fi ;;
+        *)
+          case $link in
+            # no path: nothing outside reached through it
+            socket:\[*\]|pipe:\[*\]|anon_inode:*|/dmabuf:*|/memfd:*) ;;
+            "$ROOT$EMU_DIR"/*|"$STATE$EMU_DIR"/*)
+              if [[ $ty == regular* && $EMU_FILES == *" ${link##*/} "* &&
+                    ( $link == "$ROOT$EMU_DIR/${link##*/}" || $link == "$STATE$EMU_DIR/${link##*/}" ) ]]; then
+                emu+=" ${link##*/}"
+                say "  $comm ($p) fd $fd: the RPMB emulator's $link"
+              else
+                bad="$ty $link: in the RPMB emulator's directory, not its rpmb.img or state"
+              fi ;;
+            *)
+              under "$link" "${mine[@]}" && continue
+              ((!android)) && { under "$link" "$RUN" "$self" || ((fd <= 2)); } && continue
+              bad="$ty $link: outside the chroot, --image, --bin and the state directory" ;;
+          esac ;;
+      esac
+      [[ -z $bad ]] || { say "  $comm ($p) fd $fd: $bad: REFUSED"; ok=0; }
+    done < <(find "$d/fd" -mindepth 1 -maxdepth 1 -printf '%f\0%l\0' 2>/dev/null)
+    say "  $comm ($p$( ((android)) && echo ', in the chroot')): $n fds${devs:+; devices:$devs}${emu:+; RPMB emulator:$emu}"
+  done
+  ((ok)) || die "fd audit failed ($1): stopping"
+  say "fd audit passed ($1)"
+}
+
+# The spawned process $1 has exec'd its program in the chroot (5 s at most;
+# fails if it exited first).
+execd() {
+  local p=${PIDS[$1]} i c
+  for ((i = 0; i < 50; i++)); do
+    { read -r c < "$ROOT/proc/$p/comm"; } 2>/dev/null || return 1
+    alive "$p" || return 1
+    case $c in
+      env|setsid|setpriv|chroot) ;;
+      *) [[ $(readlink "$ROOT/proc/$p/root" 2>/dev/null) == "$ROOT" ]] && return 0 ;;
+    esac
+    sleep 0.1
+  done
+  return 1
+}
+
 # --- Building the chroot (inside the private namespace) -------------------------
 
 bind() { # src dst [ro]
@@ -481,6 +622,14 @@ setup_state() {
     "$STATE/data/vendor_de/0"
   # the bridge's secret and gatekeeper handle: its user only
   chmod 0700 "$STATE/data/vendor/omamobile-fp"
+  # the RPMB emulator's: root's only (it opens its files as root, before
+  # qseecomd drops to uid 1000). Never through a link: chown and chmod
+  # would follow it (check refuses one before this runs; this is the
+  # backstop).
+  [[ ! -L $STATE$EMU_DIR ]] || die "$STATE$EMU_DIR is a link: refusing"
+  install -d -m 0700 "$STATE$EMU_DIR"
+  chown 0:0 "$STATE$EMU_DIR"
+  chmod 0700 "$STATE$EMU_DIR"
   # the audit finds this marker through both persist mount points
   : > "$STATE/persist/.omamobile-fp-ingot"
 }
@@ -550,6 +699,8 @@ setup() {
     sock-extra) : > "$SOCKDIR/planted" ;;
     sock-wrong) mount --bind "$STATE/persist/data" "$ROOT$CSOCKDIR" ;;
     sock-twice) mkdir -p "$ROOT/tmp/s"; mount --bind "$SOCKDIR" "$ROOT/tmp/s" ;;
+    emu-wrong) chown "$SYS_ID:$SYS_ID" "$STATE$EMU_DIR"; chmod 0770 "$STATE$EMU_DIR" ;;
+    emu-link) ln -s /etc/passwd "$STATE$EMU_DIR/rpmb.img" ;;
   esac
   return 0
 }
@@ -621,6 +772,8 @@ android_cmd() {
   [[ -n $TROOT ]] && user=()
   local env=(PATH=/system/bin:/vendor/bin LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib64/hw:/system/lib64
              ANDROID_ROOT=/system ANDROID_DATA=/data OMAMOBILE_FP_PROPS=/dev/__omamobile_props__
+             OMAMOBILE_RPMB_EMU_DIR="$EMU_DIR"
+             ${OMAMOBILE_RPMB_EMU_PROBE:+OMAMOBILE_RPMB_EMU_PROBE="$OMAMOBILE_RPMB_EMU_PROBE"}
              OMAMOBILE_FP_LOGLEVEL="${OMAMOBILE_FP_LOGLEVEL:-3}")
   [[ -f $ROOT/omamobile/omamobile-fp-shim.so ]] && env+=(LD_PRELOAD=/omamobile/omamobile-fp-shim.so)
   CMDLINE=(env -i "${env[@]}" "$SETSID_BIN" "$SETPRIV_BIN" --bounding-set "$DROP_CAPS" --
@@ -631,7 +784,16 @@ spawn() { # name root|system command...
   local name=$1; shift
   say "starting $name: ${*:2}"
   android_cmd "$@"
-  "${CMDLINE[@]}" > >(logpipe "$name") 2>&1 &
+  # not the runner's lock (fd 9): nothing of the host's beyond the chroot
+  # (stdin is /dev/null: a background job's without job control)
+  if [[ -n $TROOT && $name == qseecomd && ${OMAMOBILE_FP_TEST_INJECT:-} == fd-* ]]; then
+    # tools/ingot-fp-stage-test: an fd the fd audit must refuse
+    local leak=/etc/passwd
+    [[ $OMAMOBILE_FP_TEST_INJECT == fd-char ]] && leak=/dev/ptmx
+    "${CMDLINE[@]}" 9>&- 7< "$leak" > >(logpipe "$name") 2>&1 &
+  else
+    "${CMDLINE[@]}" 9>&- > >(logpipe "$name") 2>&1 &
+  fi
   PIDS[$name]=$!
 }
 
@@ -758,9 +920,12 @@ inner() {
   spawn qseecomd root /vendor/bin/qseecomd
   if [[ $MODE == hal ]]; then
     wait_listeners
+    audit_fds "qseecomd's listeners up"
     [[ -c $ROOT/dev/blfp || ( -n $TROOT && -f $ROOT/dev/blfp ) ]] || die "no /dev/blfp in the chroot"
     local who=system; ((HAL_ROOT)) && who=root
     spawn halhost "$who" /omamobile/omamobile-fp-halhost ${SECONDS_ARG:+--seconds "$SECONDS_ARG"} open
+    if execd halhost; then audit_fds "the HAL host started"
+    else say "the HAL host exited before its fds could be audited"; fi
     say "stage hal running (^C stops)"
     wait -n "${PIDS[halhost]}" "${PIDS[qseecomd]}" || true
     [[ -n $STOPPING ]] || say "$(alive "${PIDS[qseecomd]}" && echo "the HAL host" || echo qseecomd) exited"
@@ -768,6 +933,7 @@ inner() {
   fi
   if [[ $MODE == bridge ]]; then
     wait_listeners
+    audit_fds "qseecomd's listeners up"
     [[ -c $ROOT/dev/blfp || ( -n $TROOT && -f $ROOT/dev/blfp ) ]] || die "no /dev/blfp in the chroot"
     # the bridge binds its socket as uid 1000: the directory is its until then
     chown "$SYS_ID:$SYS_ID" "$SOCKDIR"
@@ -775,6 +941,7 @@ inner() {
       --state "$BRIDGE_STATE" --data-path /data/vendor_de/0/fpdata \
       ${ENROLL_TIMEOUT:+--enroll-timeout "$ENROLL_TIMEOUT"}
     bridge_socket
+    audit_fds "the bridge's socket up"
     say "stage bridge running: $SOCK (^C or ingot-fp-stage stop stops)"
     wait -n "${PIDS[bridge]}" "${PIDS[qseecomd]}" || true
     [[ -n $STOPPING ]] || say "$(alive "${PIDS[qseecomd]}" && echo "the bridge" || echo qseecomd) exited"

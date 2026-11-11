@@ -17,7 +17,16 @@
 #   hal (static fakes of qseecomd and the HAL host; needs gcc -static)
 #                            -> the logdw reader names the sender, the
 #                               listeners are seen, the HAL host starts after
-#                               them, chipid 5f83 gives PASS, stop in order
+#                               them, chipid 5f83 gives PASS, stop in order;
+#                               the fd audit passes after the listeners and
+#                               after the HAL host (the emulator's two files
+#                               seen open, through OMAMOBILE_RPMB_EMU_DIR),
+#                               and stops the stage in order for a leaked
+#                               file, a leaked character device, a third file
+#                               of the emulator's
+#   audit, RPMB emulator     -> its state directory made root's, 0700; a
+#                               file in it root's 0600 listed; refused (check
+#                               and audit) for a 0770 directory, a link in it
 #   audit, socket directory  -> the host's socket directory bound once, empty;
 #                               refused for a file planted in it, another
 #                               directory in its place, a second bind of it
@@ -150,6 +159,27 @@ for f in dev-extra dev-wrong mount-extra stub-vendor; do
 done
 pass "audit: refused an extra node, a wrong node, an extra mount, the vendor's library"
 
+EMU=$STATE/data/vendor/omamobile-rpmb-emu
+st audit > "$out" 2>&1 || fail "audit (RPMB emulator)"
+[[ -d $EMU && $(stat -c '%u %a' "$EMU") == "$(id -u) 700" ]] || fail "audit: the emulator's directory is not ours, 0700"
+grep -q "  $EMU: root's, 0700, only regular files" "$out" || fail "audit: the emulator's directory not checked"
+grep -q "RPMB emulator state: $EMU" "$out" || fail "check: the emulator's directory not named"
+printf 'x' > "$EMU/state" && chmod 0600 "$EMU/state"
+st audit > "$out" 2>&1 || fail "audit with the emulator's state file"
+grep -q "  $EMU/state: root's, 0600, 1 bytes" "$out" || fail "audit: the emulator's file not listed"
+rm -f "$EMU/state"
+for f in "emu-wrong:is 0:0 770, want 0:0 700" "emu-link:holds 'l 0:0 777 [0-9]* rpmb.img'"; do
+  OMAMOBILE_FP_TEST_INJECT=${f%%:*} st audit > "$out" 2>&1 && fail "audit passed with ${f%%:*}"
+  { grep -q "${f#*:}.*REFUSED" "$out" && grep -q 'audit failed: nothing started' "$out"; } ||
+    fail "audit with ${f%%:*}: no refusal for '${f#*:}'"
+  # left behind: check refuses it before the next start repairs anything
+  st check > "$out" 2>&1 && fail "check passed after ${f%%:*}"
+  grep -q "${f#*:}.*REFUSED" "$out" || fail "check after ${f%%:*}: no refusal for '${f#*:}'"
+  rm -f "$EMU/rpmb.img"; chmod 0700 "$EMU"
+done
+st check > "$out" 2>&1 || fail "check after the emulator faults are undone"
+pass "audit: the RPMB emulator's directory root's 0700, its files listed; check and audit refuse a 0770 one, a link in it"
+
 st audit > "$out" 2>&1 || fail "audit (socket directory)"
 grep -q "  /dev/socket/omamobile-fp: bind of the host's $H/run/omamobile-fp/sock" "$out" || fail "audit: socket directory bind"
 grep -q "  $H/run/omamobile-fp/sock: empty" "$out" || fail "audit: socket directory empty"
@@ -171,6 +201,7 @@ pass "audit, bridge: refused while the Pixel runner's stack owns the socket dire
 if printf 'int main(void){return 0;}\n' > "$t/cc.c" && gcc -static -o "$t/cc" "$t/cc.c" 2>/dev/null; then
   cat > "$t/fake.c" <<'EOF'
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -290,6 +321,20 @@ int main(int argc, char **argv)
 {
 	signal(SIGTERM, term);
 	if (strstr(argv[0], "qseecomd")) {
+		/* as the RPMB emulator: its two files, opened and kept (and a
+		 * third one if the test planted it) */
+		const char *emu = getenv("OMAMOBILE_RPMB_EMU_DIR");
+		char e[256];
+		if (emu) {
+			snprintf(e, sizeof(e), "%s/rpmb.img", emu);
+			open(e, O_RDWR | O_CREAT, 0600);
+			snprintf(e, sizeof(e), "%s/state", emu);
+			open(e, O_RDWR | O_CREAT, 0600);
+			snprintf(e, sizeof(e), "%s/extra", emu);
+			open(e, O_RDONLY);
+			printf("omamobile-rpmb-emu[%d]: rpmb emulator: state %s, key programmed 0, counter 0\n",
+			       (int)getpid(), emu);
+		}
 		logdw("QSEECOMD", "listener services: Started (Listener ID = 8192)");
 		logdw("QSEECOMD", "listener services: Started (Listener ID = 12288)");
 		/* as the RPMB stub logs a request on its stderr */
@@ -298,6 +343,11 @@ int main(int argc, char **argv)
 		/* its liblog copy, as the shim prints it: not a second request */
 		printf("I omamobile-rpmb-stub[%d]: listener 0x2000 request 1: command 0x101, failing it; 00000101\n",
 		       (int)getpid());
+		/* the emulator's shape of the same, and its liblog copy */
+		printf("omamobile-rpmb-emu[%d]: listener 0x2000 request 2: command 0x102, frames 1 (64 per tx): "
+		       "auth-read addr 0x0000 k 1 nonce=1a2b3c4d -> result 0x0007\n", (int)getpid());
+		printf("I omamobile-rpmb-emu[%d]: listener 0x2000 request 2: command 0x102, frames 1 (64 per tx): "
+		       "auth-read addr 0x0000 k 1 nonce=1a2b3c4d -> result 0x0007\n", (int)getpid());
 		fflush(stdout);
 		while (!done)
 			pause();
@@ -352,6 +402,32 @@ MP
     fail "hal: qseecomd stopped before the report"
   pass "hal: missing modules loaded before the check; log reader, listeners, HAL host after them, PASS, ordered stop"
 
+  CROOT=$H/run/omamobile-fp-ingot/root
+  grep -q "fd audit passed (qseecomd's listeners up)" "$out" || fail "hal: no fd audit after the listeners"
+  grep -q 'fd audit passed (the HAL host started)' "$out" || fail "hal: no fd audit after the HAL host"
+  grep -q "^ingot-fp:   qseecomd ([0-9]*) fd [0-9]*: the RPMB emulator's $CROOT/data/vendor/omamobile-rpmb-emu/rpmb.img" "$out" ||
+    fail "hal: the emulator's rpmb.img not seen open (OMAMOBILE_RPMB_EMU_DIR?)"
+  grep -q "^ingot-fp:   qseecomd ([0-9]*, in the chroot): [0-9]* fds; devices: /dev/null(1:3); RPMB emulator: rpmb.img state" "$out" ||
+    fail "hal: qseecomd's fd summary"
+  grep -q "^ingot-fp:   omamobile-fp-ha ([0-9]*, in the chroot): " "$out" || fail "hal: the HAL host's fd summary"
+  [[ $(stat -c '%a' "$STATE/data/vendor/omamobile-rpmb-emu/rpmb.img") == 600 ]] || fail "hal: the emulator's file mode"
+  for f in "fd-file:fd 7: regular file /etc/passwd: outside the chroot" "fd-char:fd 7: character device 5:2 /dev/ptmx, not an allowlisted node" \
+      "emu-extra:fd [0-9]*: regular empty file $CROOT/data/vendor/omamobile-rpmb-emu/extra: in the RPMB emulator's directory"; do
+    # a third file there (root's, 0600: the directory audit passes), which
+    # the fake qseecomd opens
+    if [[ ${f%%:*} == emu-extra ]]; then
+      : > "$STATE/data/vendor/omamobile-rpmb-emu/extra"; chmod 0600 "$STATE/data/vendor/omamobile-rpmb-emu/extra"
+    fi
+    OMAMOBILE_FP_TEST_INJECT=${f%%:*} TIMEOUT=60 st hal --seconds 1 > "$out" 2>&1 && fail "hal passed with ${f%%:*}"
+    grep -q "qseecomd ([0-9]*) ${f#*:}.*: REFUSED" "$out" || fail "hal with ${f%%:*}: no refusal for '${f#*:}'"
+    grep -q "error: fd audit failed (qseecomd's listeners up): stopping" "$out" || fail "hal with ${f%%:*}: not stopped"
+    grep -q '^\[qseecomd\] qseecomd fake: TERM' "$out" || fail "hal with ${f%%:*}: qseecomd not stopped in order"
+    grep -q 'starting halhost' "$out" && fail "hal with ${f%%:*}: the HAL host started"
+    rm -f "$STATE/data/vendor/omamobile-rpmb-emu/extra"
+  done
+  out=$t/out
+  pass "hal: the fd audit passes after the listeners and the HAL host, sees the emulator's two files; stops the stage for a leaked file, a character device, a third emulator file"
+
   # --- bridge, with a fake bridge ---
   cp "$t/fake" "$BIN/omamobile-fp-bridge-ingot"
   chmod 0755 "$BIN/omamobile-fp-bridge-ingot"
@@ -381,6 +457,7 @@ MP
   [[ $(stat -c '%a' "$STATE/data/vendor/omamobile-fp") == 700 && -d $STATE/data/vendor_de/0/fpdata ]] ||
     fail "bridge: the state directories"
   grep -q "$SD: s bridge.sock (root, 0600; directory root, 0700)" "$out" || fail "bridge: the socket audit"
+  grep -q "fd audit passed (the bridge's socket up)" "$out" || fail "bridge: no fd audit after the socket"
   CTL=$HERE/../packages/omamobile-fingerprint/lib/omamobile-fp-ctl
   "$CTL" --socket "$SD/bridge.sock" --timeout 5 STATUS > "$t/ctl" 2>&1 || { cat "$t/ctl" >&2; fail "bridge: ctl STATUS"; }
   { grep -qx '<- READY 0 0 0' "$t/ctl" && grep -qx '<- OK' "$t/ctl"; } || { cat "$t/ctl" >&2; fail "bridge: STATUS answers"; }
@@ -427,8 +504,13 @@ MP
   [[ $(cat "$S4LOGS/enrolled-id") == 7 ]] || fail "s4 enrol: the saved id"
   s4ok verify
   s4ok storage
-  grep -q 'rpmb: 2 requests, by command: 0x101 init x2' "$out" || fail "s4 storage: the stub's requests (one per start: irq, bridge)"
-  grep -q 'TrustZone asked for RPMB' "$out" || fail "s4 storage: the RPMB verdict"
+  grep -q 'rpmb: 4 requests, by command: 0x101 init x2  0x102 read x2' "$out" ||
+    fail "s4 storage: the listener's requests, both shapes (two per start: irq, bridge)"
+  grep -q 'TrustZone asked for RPMB; the emulator answered: 0x0007 x2' "$out" || fail "s4 storage: the RPMB verdict"
+  grep -q 'the RPMB emulator (latest start): state /data/vendor/omamobile-rpmb-emu, key programmed 0, counter 0' "$out" ||
+    fail "s4 storage: the emulator's state line"
+  { grep -q "the RPMB emulator's state $STATE/data/vendor/omamobile-rpmb-emu" "$out" && grep -q ' rpmb.img$' "$out"; } ||
+    fail "s4 storage: the emulator's directory listing"
   grep -q ' data/vendor_de/0/fpdata/7$' "$out" || fail "s4 storage: the template file in the listing"
   s4ok persist
   grep -q 'MATCH 7 after the restart' "$out" || fail "s4 persist: AUTH after the restart"
@@ -457,7 +539,7 @@ MP
   # the preflight loads what is missing, as after a reboot
   rm -rf "$H/sys/module/qcom_qseecom_user" "$H/sys/module/betterlife_fp" "$t/modprobe.log"
   OMAMOBILE_FP_TEST_MODPROBE=$t/modprobe agg "$out" nofinger || fail "s4 nofinger"
-  grep -q 'modprobe qcom_qseecom_user (not loaded)' "$out" && grep -q 'modprobe betterlife-fp (not loaded)' "$out" ||
+  { grep -q 'modprobe qcom_qseecom_user (not loaded)' "$out" && grep -q 'modprobe betterlife-fp (not loaded)' "$out"; } ||
     fail "s4 nofinger: the preflight did not load the missing modules"
   grep -q '^S4 nofinger: PASS' "$out" || fail "s4 nofinger: no PASS"
   for r in preflight hal bridge storage restart stop; do row "$out" "$r" PASS nofinger; done
