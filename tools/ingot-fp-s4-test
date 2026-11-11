@@ -324,8 +324,16 @@ log_trouble() { # mark
   info "the stack's log since this step began, lines that look like trouble (last 25):"
   printf '      %s\n' "${t//$'\n'/$'\n'      }"
 }
-rpmb_since() { # mark -> the stubs' RPMB requests since then
-  tail -n +"$(($1 + 1))" "$STAGELOG" 2>/dev/null | grep -cE '\] omamobile-rpmb-stub\[[0-9]+\]: listener 0x[0-9a-f]+ request'
+# One RPMB request, as the listener logs it on its stderr (not its liblog
+# copy, which would count twice): the old stub's ("..., failing it; <hex>")
+# or the emulator's ("... -> result 0x....").
+RPMB_RE='\] omamobile-rpmb-(stub|emu)\[[0-9]+\]: listener 0x[0-9a-f]+ request [0-9]+: command 0x[0-9a-f]+'
+rpmb_since() { # mark -> the RPMB requests since then
+  tail -n +"$(($1 + 1))" "$STAGELOG" 2>/dev/null | grep -cE "$RPMB_RE"
+}
+rpmb_results() { # request lines on stdin -> what the emulator answered, "0x0007 x12, 0x0000 x3" (empty: the stub's)
+  sed -n 's/.* -> result \(0x[0-9a-fA-F]*\)$/\1/p' | sort | uniq -c | sort -k1,1nr -k2 |
+    awk '{printf "%s%s x%s", (NR > 1 ? ", " : ""), $2, $1}'
 }
 
 # --- Steps -------------------------------------------------------------------
@@ -448,10 +456,18 @@ s_storage() {
   else
     fail "no state directory $STATE"
   fi
+  # the RPMB emulator's (root's, 0700: this runs as root)
+  t=$STATE/data/vendor/omamobile-rpmb-emu
+  if [[ -d $t ]]; then
+    does "the RPMB emulator's state $t (names, sizes, owners; never contents):"
+    find "$t" -printf '%M %u:%g %10s %TY-%Tm-%Td %TH:%TM %P\n' 2>/dev/null | sort -k6 | sed 's/^/      /'
+  else
+    info "no RPMB emulator state $t (the old stub, or no start yet)"
+  fi
   logs=$(all_logs)
   does "the stubs' requests (from the runner's output of this test's starts):"
   # the stub's own stderr line (its liblog copy would count twice)
-  rpmb=$(grep -E '\] omamobile-rpmb-stub\[[0-9]+\]: listener 0x[0-9a-f]+ request [0-9]+: command 0x[0-9a-f]+' <<<"$logs" || true)
+  rpmb=$(grep -E "$RPMB_RE" <<<"$logs" || true)
   ssd=$(grep -E '\] omamobile-ssd-stub\[[0-9]+\]: listener 0x[0-9a-f]+ request [0-9]+: command 0x[0-9a-f]+' <<<"$logs" || true)
   for t in rpmb ssd; do
     if [[ $t == rpmb ]]; then c=$rpmb; else c=$ssd; fi
@@ -462,7 +478,15 @@ s_storage() {
         awk '{n = $2; d = (n == "0x101") ? " init" : (n == "0x102") ? " read" : (n == "0x103") ? " write" : (n == "0x104") ? " cfg" : (n == "0x202") ? " read" : (n == "0x203") ? " write" : ""; printf "%s%s x%s  ", n, d, $1}')"
     fi
   done
-  if [[ -z $rpmb ]]; then info "  => TrustZone did not ask for RPMB"; else info "  => TrustZone asked for RPMB (answered 'failed')"; fi
+  if [[ -z $rpmb ]]; then
+    info "  => TrustZone did not ask for RPMB"
+  else
+    c=$(rpmb_results <<<"$rpmb")
+    info "  => TrustZone asked for RPMB; ${c:+the emulator answered: $c}${c:-the stub answered 'failed'}"
+  fi
+  # the emulator's own account of its state, at its latest start
+  c=$(grep -E '\] omamobile-rpmb-emu\[[0-9]+\]: rpmb emulator: ' <<<"$logs" | tail -1 | sed 's/.*: rpmb emulator: //')
+  [[ -n $c ]] && info "  the RPMB emulator (latest start): $c"
   does "the runner's audit at each start:"
   info "  audit passed: $(grep -c 'ingot-fp: audit passed' <<<"$logs") time(s); REFUSED lines: $(grep -c 'REFUSED' <<<"$logs")"
   grep -q 'ingot-fp: audit passed' <<<"$logs" || fail "no 'audit passed' in the runner's output"
@@ -912,7 +936,7 @@ m_bridge() {
 }
 
 m_enrol() {
-  local f id='' n first try tries=${INGOT_FP_ENROL_TRIES:-2} mark r
+  local f id='' n first try tries=${INGOT_FP_ENROL_TRIES:-2} mark r c
   step "enrol one finger through the bridge (omamobile-fp-ctl ENROLL)"
   info "The HAL wants one good touch after another; each accepted one is a"
   info "PROGRESS line counting down. Use ONE finger and remember which: it is"
@@ -933,7 +957,10 @@ m_enrol() {
     first=$(sed -n 's/^<- PROGRESS [^ ]* \([0-9]*\)$/\1/p' "$f" | head -1)
     info "PROGRESS lines: $n (first remaining: ${first:-none}); ACQUIRED lines: $(grep -c '^<- ACQUIRED ' "$f")"
     r=$(rpmb_since "$mark")
-    ((r > 0)) && info "TrustZone asked for RPMB $r time(s) during this enrolment (the stub answered 'failed')"
+    if ((r > 0)); then
+      c=$(tail -n +"$((mark + 1))" "$STAGELOG" 2>/dev/null | grep -E "$RPMB_RE" | rpmb_results)
+      info "TrustZone asked for RPMB $r time(s) during this enrolment (${c:+the emulator answered: $c}${c:-the stub answered 'failed'})"
+    fi
     [[ -n $id ]] && break
     r=$(grep -E '^<- (ERROR|LOCKOUT)' "$f" | tail -1 | cut -c4-)
     info "ENROLL ended without ENROLLED: ${r:-no final line (timeout?)}"
