@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: MIT
+# Notifications: on a phone held upright, the cards span the screen. The
+# deck is a fixed 380 px wide and hangs from the top-right corner. A
+# 1080 px panel at scale 3 is 360 px wide, so the card ran off the left
+# edge and cut off the first letters of every line; on a wider phone it
+# hung lopsided, with a large gap on the left and none on the right. On a
+# portrait screen narrower than 600 px the cards now take the screen's
+# width, with the same gap on both sides: the outer gap, or the shell's md
+# spacing when the gap is smaller (a phone's gaps_out is 0). Landscape and
+# desktop screens keep the fixed card.
+#
+# Omarchy 4.5 only: the 4.0.6 family's deck has the same fixed width, but
+# no 4.0.6 phone is narrower than the card.
+
+diff --git i/shell/plugins/notifications/Service.qml w/shell/plugins/notifications/Service.qml
+--- i/shell/plugins/notifications/Service.qml
++++ w/shell/plugins/notifications/Service.qml
+@@ -1555,6 +1555,13 @@ Item {
+       screen: modelData
+       readonly property bool showingNotifications: service.showsOn(String(modelData.name))
+       readonly property var margins: service.marginsFor(String(modelData.name))
++      // A phone held upright: the cards span the screen with the same gap on
++      // both sides, as a phone's notifications do. The fixed card is wider
++      // than a 360 px screen, and on a wider phone it hung lopsided from the
++      // right edge. Landscape and desktop screens keep the fixed card.
++      readonly property bool upright: modelData.width < modelData.height && modelData.width < 600
++      readonly property int edge: upright ? Math.max(margins.right, Style.spacing.md) : margins.right
++      readonly property int cardWidth: upright ? Math.max(1, modelData.width - 2 * edge) : service.notificationWidth
+       readonly property bool stepAside: service.fullscreenOn(String(modelData.name))
+       readonly property bool hasSomethingToShow: showingNotifications && toasts.count > 0
+       visible: !stepAside || hasSomethingToShow
+@@ -1569,7 +1576,7 @@ Item {
+ 
+       // Constant width and full height, so the buffer is allocated once.
+       anchors { top: true; bottom: true; right: true }
+-      implicitWidth: clipper.width + Style.space(10)
++      implicitWidth: upright ? modelData.width : clipper.width + Style.space(10)
+ 
+       mask: Region { item: surface.showingNotifications ? deck : null }
+ 
+@@ -1588,14 +1595,14 @@ Item {
+         anchors.topMargin: surface.margins.top
+         // Room for the arrival's scale animation, and the gap from the edge.
+         readonly property int motionInset: Style.spacing.sm
+-        width: service.notificationWidth + motionInset + surface.margins.right
++        width: surface.cardWidth + motionInset + surface.edge
+         height: deck.y + deck.height + motionInset
+         clip: true
+ 
+         Item {
+           id: deck
+           x: clipper.motionInset
+-          width: service.notificationWidth
++          width: surface.cardWidth
+           height: service.deckHeight
+ 
+           // One hover region over the whole deck, so crossing between cards does
