@@ -196,6 +196,8 @@ int main(void)
 	      "open: /dev/null (a character device) and the log: %s", err[0] ? err : "ok");
 	check(stat(logpath, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & 0777) == 0600,
 	      "open: the log is created as a regular file, 0600");
+	check(rpmb_pt_request_sense(&p, err, sizeof(err)) != 0 && strstr(err, "request-sense"),
+	      "request sense on /dev/null: reported as a failure, the init goes on (%s)", err);
 	p.xfer = fake_xfer;
 	p.xfer_ctx = NULL;
 

@@ -216,11 +216,14 @@ static int init_service(void)
 		return -1;
 	}
 	fstat(pt.dev_fd, &st);
+	/* the vendor's init sends one REQUEST SENSE after the open; the
+	 * outcome goes in the banner, a failure does not stop the init */
+	rpmb_pt_request_sense(&pt, err, sizeof(err));
 	snprintf(banner, sizeof(banner), "rpmb pass-through: device %s "
-		 "(c %u:%u), log %s, fpt %u, sectors %u, writes %s", dev,
+		 "(c %u:%u), log %s, fpt %u, sectors %u, writes %s; %s", dev,
 		 (unsigned int)major(st.st_rdev),
 		 (unsigned int)minor(st.st_rdev), log && *log ? log : "none",
-		 fpt, sectors, writes ? "ENABLED" : "refused");
+		 fpt, sectors, writes ? "ENABLED" : "refused", err);
 	say(LOG_INFO, "%s", banner);
 	rpmb_pt_log(&pt, banner);
 	return 0;

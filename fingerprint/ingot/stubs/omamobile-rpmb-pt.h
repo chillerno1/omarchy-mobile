@@ -64,6 +64,14 @@ int rpmb_pt_sg_xfer(void *ctx, int dir_in, void *buf, size_t len, char *err,
 		    size_t errlen);
 
 /*
+ * REQUEST SENSE on the node (SG_IO; not an RPMB frame), once after the
+ * open, as the vendor's init does: it reads away the unit attention the
+ * W-LU raises on its first command after a reset or a runtime resume. 0
+ * with the sense key in info, or a negative status with the reason.
+ */
+int rpmb_pt_request_sense(struct rpmb_pt *p, char *info, size_t infolen);
+
+/*
  * Serve one request in place in sb (sb_len bytes). Returns the number of
  * bytes to send back; desc gets a one-line decode for the log (header
  * fields only: never a key, a MAC or a data block). The same line, with a

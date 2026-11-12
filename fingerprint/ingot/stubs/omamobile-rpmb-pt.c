@@ -162,30 +162,21 @@ void rpmb_pt_log(struct rpmb_pt *p, const char *line)
 /* ---- the SG_IO transport ---- */
 
 #ifdef __linux__
-int rpmb_pt_sg_xfer(void *ctx, int dir_in, void *buf, size_t len, char *err,
-		    size_t errlen)
+/* One SCSI command through sg_io_v4 on the node: dir_in 1 reads len bytes
+ * into buf, 0 writes len bytes from buf. 0, or a negative status. */
+static int sg_cmd(struct rpmb_pt *p, const uint8_t *cdb, size_t cdblen,
+		  int dir_in, void *buf, size_t len, const char *what,
+		  char *err, size_t errlen)
 {
-	struct rpmb_pt *p = ctx;
 	struct sg_io_v4 io;
-	uint8_t cdb[12] = { 0 };
 	uint8_t sense[96];
 
-	/* UFS RPMB: SECURITY PROTOCOL IN/OUT, protocol 0xec, specific 0x0001,
-	 * INC_512 clear, the length in bytes (bytes 6..9, big-endian) */
-	cdb[0] = dir_in ? 0xa2 : 0xb5;
-	cdb[1] = 0xec;
-	cdb[2] = 0x00;
-	cdb[3] = 0x01;
-	cdb[6] = (uint8_t)(len >> 24);
-	cdb[7] = (uint8_t)(len >> 16);
-	cdb[8] = (uint8_t)(len >> 8);
-	cdb[9] = (uint8_t)len;
 	memset(&io, 0, sizeof(io));
 	memset(sense, 0, sizeof(sense));
 	io.guard = 'Q';
 	io.protocol = BSG_PROTOCOL_SCSI;
 	io.subprotocol = BSG_SUB_PROTOCOL_SCSI_CMD;
-	io.request_len = sizeof(cdb);
+	io.request_len = (uint32_t)cdblen;
 	io.request = (uintptr_t)cdb;
 	io.max_response_len = sizeof(sense);
 	io.response = (uintptr_t)sense;
@@ -200,23 +191,63 @@ int rpmb_pt_sg_xfer(void *ctx, int dir_in, void *buf, size_t len, char *err,
 	if (ioctl(p->dev_fd, SG_IO, &io)) {
 		int e = errno;
 
-		snprintf(err, errlen, "%s: SG_IO failed: errno %d",
-			 dir_in ? "spi" : "spo", e);
+		snprintf(err, errlen, "%s: SG_IO failed: errno %d", what, e);
 		return e > 0 ? -e : -EIO;
 	}
 	if (io.device_status || io.transport_status || io.driver_status) {
 		snprintf(err, errlen, "%s: device status 0x%x, transport "
 			 "status 0x%x, driver status 0x%x, sense key 0x%x",
-			 dir_in ? "spi" : "spo", io.device_status,
-			 io.transport_status, io.driver_status,
+			 what, io.device_status, io.transport_status,
+			 io.driver_status,
 			 io.response_len >= 3 ? sense[2] & 0xf : 0);
 		return -5;
 	}
 	if (dir_in && io.din_resid) {
-		snprintf(err, errlen, "spi: short by %u bytes", io.din_resid);
+		snprintf(err, errlen, "%s: short by %u bytes", what,
+			 io.din_resid);
 		return -5;
 	}
 	return 0;
+}
+
+int rpmb_pt_sg_xfer(void *ctx, int dir_in, void *buf, size_t len, char *err,
+		    size_t errlen)
+{
+	struct rpmb_pt *p = ctx;
+	uint8_t cdb[12] = { 0 };
+
+	/* UFS RPMB: SECURITY PROTOCOL IN/OUT, protocol 0xec, specific 0x0001,
+	 * INC_512 clear, the length in bytes (bytes 6..9, big-endian) */
+	cdb[0] = dir_in ? 0xa2 : 0xb5;
+	cdb[1] = 0xec;
+	cdb[2] = 0x00;
+	cdb[3] = 0x01;
+	cdb[6] = (uint8_t)(len >> 24);
+	cdb[7] = (uint8_t)(len >> 16);
+	cdb[8] = (uint8_t)(len >> 8);
+	cdb[9] = (uint8_t)len;
+	return sg_cmd(p, cdb, sizeof(cdb), dir_in, buf, len,
+		      dir_in ? "spi" : "spo", err, errlen);
+}
+
+/* REQUEST SENSE once after the open, as the vendor's init does: the
+ * W-LU answers its first command after a reset or a runtime resume with
+ * a unit attention, which this reads away. Not an RPMB frame: 18 bytes
+ * of sense data come back, nothing goes to the device. Returns 0 and
+ * the sense key in info, or the transport's error (the init goes on). */
+int rpmb_pt_request_sense(struct rpmb_pt *p, char *info, size_t infolen)
+{
+	const uint8_t cdb[6] = { 0x03, 0, 0, 0, 18, 0 };
+	uint8_t sense[18];
+	int ret;
+
+	memset(sense, 0, sizeof(sense));
+	ret = sg_cmd(p, cdb, sizeof(cdb), 1, sense, sizeof(sense),
+		     "request-sense", info, infolen);
+	if (ret == 0)
+		snprintf(info, infolen, "request-sense ok, sense key 0x%x",
+			 sense[2] & 0xf);
+	return ret;
 }
 #else
 int rpmb_pt_sg_xfer(void *ctx, int dir_in, void *buf, size_t len, char *err,
@@ -224,6 +255,13 @@ int rpmb_pt_sg_xfer(void *ctx, int dir_in, void *buf, size_t len, char *err,
 {
 	(void)ctx; (void)dir_in; (void)buf; (void)len;
 	snprintf(err, errlen, "no SG_IO on this platform");
+	return -ENOSYS;
+}
+
+int rpmb_pt_request_sense(struct rpmb_pt *p, char *info, size_t infolen)
+{
+	(void)p;
+	snprintf(info, infolen, "no SG_IO on this platform");
 	return -ENOSYS;
 }
 #endif
