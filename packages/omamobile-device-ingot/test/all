@@ -581,7 +581,39 @@ awk '/^If.dmic \{/ {inside = 1} !inside && /VA[ _]/ && /cset/ {bad = 1} END {exi
   || fail "the VA macro's controls are set only behind the ControlExists check"
 grep -A3 '^If.dmic {' "$hifi" | grep -q 'Type ControlExists' && grep -q "Control \"name='VA DMIC MUX0'\"" "$hifi" \
   || fail "the Mic device exists only when the card has the VA macro"
-pass "the sound profile is staged, balanced, and sets only controls the card has"
+# 0.1.9: PipeWire's probe opens every device's PCM after the verb's
+# EnableSequence and before any device's, so the capture back end mixer is
+# the verb's, in the If block's True branch; the False branch (a kernel
+# without the VA macro) is a verb of its own that sets only the playback
+# back end, so the profile still loads there.
+section() { # FILE BRANCH SECTION: the lines of one section inside If.dmic's branch
+  awk -v br="$2" -v sec="$3" '
+    /^If.dmic \{/ {inif = 1; next}
+    inif && $0 ~ "^\t" br " \\{" {inbr = 1; next}
+    inbr && /^\t\}/ {inbr = 0}
+    inbr && index($0, "\t\t" sec " {") == 1 {insec = 1; next}
+    insec && /^\t\t\}/ {insec = 0}
+    insec' "$1"
+}
+grep -q '^[[:space:]]*SectionVerb' <(sed '/^If.dmic {/,/^}/d' "$hifi") && fail "the verb is defined only inside If.dmic"
+[[ $(grep -c '^If\.' "$hifi") == 1 ]] || fail "the profile has one top-level If block"
+for br in True False; do
+  section "$hifi" "$br" SectionVerb | grep -q "cset \"name='WSA_CODEC_DMA_RX_0 Audio Mixer MultiMedia2' 1\"" \
+    || fail "the $br branch's verb sets the WSA (playback) back end mixer"
+  section "$hifi" "$br" SectionVerb | grep -q "cset \"name='WSA_CODEC_DMA_RX_0 Audio Mixer MultiMedia2' 0\"" \
+    || fail "the $br branch's verb clears the WSA back end mixer"
+  section "$hifi" "$br" SectionVerb | grep -q 'TQ "HiFi"' || fail "the $br branch's verb has its TQ"
+done
+section "$hifi" True SectionVerb | grep -q "cset \"name='MultiMedia3 Mixer VA_CODEC_DMA_TX_0' 1\"" \
+  && section "$hifi" True SectionVerb | grep -q "cset \"name='MultiMedia3 Mixer VA_CODEC_DMA_TX_0' 0\"" \
+  || fail "the verb sets (and clears) the VA capture back end mixer when the VA macro exists"
+section "$hifi" True SectionVerb | grep -q "cset \"name='MultiMedia3 Mixer TX_CODEC_DMA_TX_3' 0\"" \
+  || fail "the verb keeps MultiMedia3 off the TX macro's back end"
+section "$hifi" True 'SectionDevice."Mic"' | grep -q 'MultiMedia3 Mixer' && fail "the Mic device leaves the back end mixers to the verb"
+section "$hifi" True 'SectionDevice."Mic"' | grep -q "VA DMIC MUX0' DMIC1" || fail "the Mic device is in the True branch"
+section "$hifi" False SectionVerb | grep -q 'VA[ _]' && fail "the False branch sets no VA control"
+grep -q 'SectionDevice."Mic"' <(section "$hifi" False SectionVerb; sed -n '/^\tFalse {/,/^\t}/p' "$hifi") && fail "there is no Mic without the VA macro"
+pass "the sound profile is staged, balanced, sets only controls the card has, and sets both back ends in the verb"
 
 # No speaker protection in the kernel: the gains are fixed at their lowest
 # and nothing in the profile lets the desktop raise them.
