@@ -60,6 +60,7 @@ for f in usr/bin/reboot-to \
          usr/lib/systemd/network/20-usb-gadget.network \
          usr/lib/systemd/logind.conf.d/10-omamobile-power-key.conf \
          usr/lib/systemd/system/plymouth-quit.service.d/10-omamobile-retain-splash.conf \
+         usr/lib/systemd/sleep.conf.d/10-omamobile.conf \
          usr/lib/NetworkManager/conf.d/10-omamobile-usb.conf \
          usr/lib/NetworkManager/conf.d/20-omamobile-wifi-mac.conf \
          usr/lib/modprobe.d/omamobile-wifi.conf \
@@ -116,6 +117,16 @@ for absent in usr/bin/omamobile-boot-success usr/bin/omamobile-bootctl \
   [[ ! -e $tmp/root/$absent ]] || fail "install includes $absent"
 done
 pass "install stages the udev rule, the USB link, and the mirrorlist, and nothing that marks a slot or starts the modem, Wi-Fi bring-up or a camera"
+
+# --- 0.1.7: suspend is suspend-to-idle, as on the Pixels ---
+sleep=vendor/systemd/sleep.conf.d/10-omamobile.conf
+[[ $(grep -v '^#' "$sleep") == "$(grep -v '^#' "../omamobile-device-cheetah/$sleep")" ]] \
+  || fail "the sleep drop-in's settings drifted from the cheetah package"
+grep -qx 'MemorySleepMode=s2idle' "$tmp/root/usr/lib/systemd/sleep.conf.d/10-omamobile.conf" \
+  || fail "suspend must use s2idle: the kernel's default is deep, which is untested on the Saga"
+grep -qx 'AllowHibernation=no' "$tmp/root/usr/lib/systemd/sleep.conf.d/10-omamobile.conf" \
+  || fail "hibernation must be off: there is no swap"
+pass "suspend is suspend-to-idle with hibernation off, the same settings as the Pixel packages"
 
 # --- 0.1.4: the phone's own firmware, the ADSP, Bluetooth, Wi-Fi policy ---
 r=$tmp/root

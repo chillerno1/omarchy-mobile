@@ -21,6 +21,7 @@ Omarchy Mobile's userspace package for the Solana Mobile Saga (codename ingot, S
 | `vendor/systemd/network/20-usb-gadget.network` | `/usr/lib/systemd/network` | Sets usb0 to 172.16.42.1/24 after handover. Same file as the Pixel 7 package |
 | `vendor/systemd/logind.conf.d/10-omamobile-power-key.conf` | `/usr/lib/systemd/logind.conf.d` | A short power press does not power the phone off. Same drop-in as the Pixel 7 Pro package |
 | `vendor/systemd/system/plymouth-quit.service.d/10-omamobile-retain-splash.conf` | `/usr/lib/systemd/system/plymouth-quit.service.d` | From 0.1.6: Plymouth quits with `--retain-splash`, so the Omarchy boot screen stays up until Hyprland draws, instead of a black panel while the session starts. The boot is quiet from `boot_a`'s command line (`quiet splash`, `device/ingot/initramfs/build`); without this drop-in the splash goes black a few seconds early. Same drop-in as the Pixel 7 Pro package |
+| `vendor/systemd/sleep.conf.d/10-omamobile.conf` | `/usr/lib/systemd/sleep.conf.d` | From 0.1.7: suspend means suspend-to-idle (`MemorySleepMode=s2idle`), and no hibernation. The firmware advertises PSCI SYSTEM_SUSPEND, so the kernel makes `deep` the default; deep sleep is untested on the Saga, while suspend-to-idle woke from the RTC with Wi-Fi and Bluetooth back in every run of the suspend tests. The bring-up phone had the same setting by hand in `/etc/systemd/sleep.conf.d`. Same settings as the Pixel packages |
 | `vendor/NetworkManager/conf.d/10-omamobile-usb.conf` | `/usr/lib/NetworkManager/conf.d` | Keeps NetworkManager off that link |
 | `etc/omamobile-mirrorlist` | `/etc/pacman.d/omamobile-mirrorlist` | Where pacman finds the `[omamobile]` repository. Same file as the Pixel 7 Pro package |
 | `omamobile-device-ingot.install` | pacman hook | Adds `[omamobile]` to `pacman.conf` before `[omarchy]`, once. Same script as the Pixel 7 Pro package |
@@ -79,6 +80,7 @@ The bring-up system had these by hand. A file in `/etc` with the same name as a 
    From 0.1.5 the package also owns the sound profile under `/usr/share/alsa/ucm2/conf.d/sm8475/` and `/usr/share/alsa/ucm2/Solana/ingot/`, and the topology link `/usr/lib/firmware/updates/qcom/sm8475/SM8475-Solana-Saga-tplg.bin`. Hand-made copies there stop the upgrade ("exists in filesystem"): delete them first, or let pacman replace them with `--overwrite '/usr/share/alsa/ucm2/*' --overwrite '/usr/lib/firmware/updates/qcom/sm8475/*'`.
 6. Remove a hand-made NetworkManager file in `/etc/NetworkManager/conf.d` that set the Wi-Fi MAC policy.
    From 0.1.6, also a hand copy of the Plymouth drop-in in `/etc/systemd/system/plymouth-quit.service.d/` (the bring-up phone tested the quiet boot with one), then `systemctl daemon-reload`.
+   From 0.1.7, also a hand-written sleep drop-in in `/etc/systemd/sleep.conf.d/` that set `MemorySleepMode=s2idle` (an `/etc` drop-in wins over the package's, so a later change there would never apply).
 7. Reboot once, then check the list below.
 
 ## Check on the phone
