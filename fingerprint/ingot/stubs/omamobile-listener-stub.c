@@ -1,36 +1,54 @@
 // SPDX-License-Identifier: MIT
 /*
  * omamobile-listener-stub: our librpmb.so and libssd.so for the Solana Saga's
- * fingerprint chroot (stage S3). Built twice from this file, with
- * -DSTUB_RPMB and with -DSTUB_SSD (fingerprint/ingot/Makefile).
+ * fingerprint chroot. Built from this file with -DSTUB_RPMB (the RPMB
+ * pass-through, librpmb.so), -DSTUB_RPMB_EMU (the file-backed RPMB
+ * emulator, librpmb-emu.so, kept for experiments) and -DSTUB_SSD (libssd.so),
+ * see fingerprint/ingot/Makefile.
  *
  * Qualcomm's listener daemon, qseecomd, serves TrustZone's requests for
  * storage. Its RPMB and SSD libraries reach the UFS RPMB partition and the
- * ssd partition; nothing of ours may touch the real RPMB or a block device.
+ * ssd partition.
  *
- * librpmb.so (-DSTUB_RPMB) is a FILE-BACKED RPMB EMULATOR at the listener
- * boundary (omamobile-rpmb-emu.c, #included here so the library stays one
- * link unit). It answers TrustZone as a 4 MiB UFS RPMB would (8192
- * sectors, 64 frames per transfer, type 9): program key, read counter,
- * authenticated read and write, with real HMAC-SHA256 MACs once TrustZone
- * has programmed its key, and result 0x0007 (key not yet programmed)
- * before that. Its state lives in a directory inside the chroot, taken
- * from OMAMOBILE_RPMB_EMU_DIR (default /data/vendor/omamobile-rpmb-emu; the
- * stage tool creates it root:root 0700):
- *   rpmb.img  the data area, 16384 blocks of 256 bytes, zero-filled
- *             (ftruncate) on first use;
- *   state     magic, version, key_programmed, the 32-byte key, the write
- *             counter; created on first use.
- * Both are opened in rpmb_init_service(), as root, before qseecomd drops to
- * uid 1000, and kept for the listener thread; a missing directory or a
- * failed open fails the init, so qseecomd exits loudly. SAFETY: the
- * emulator opens exactly these two regular files under its state directory
- * (O_NOFOLLOW, checked S_ISREG) and no device; besides them the only thing
- * opened is /dev/qseecom, by libQSEEComAPI.so when the listener registers.
- * It never logs the key or the data, only the first 4 bytes of a nonce.
+ * librpmb.so (-DSTUB_RPMB) is a PASS-THROUGH to the real RPMB
+ * (omamobile-rpmb-pt.c, #included here so the library stays one link
+ * unit): the frames TrustZone produces go to the UFS RPMB well-known LU
+ * unmodified, through the one bsg node the stage tool hands it, and the
+ * chip's replies come back unmodified. TrustZone does all the
+ * cryptography; the listener never builds, changes or replays a frame.
+ * Its rules, from the environment the stage tool sets (every variable is
+ * read once in rpmb_init_service):
+ *   OMAMOBILE_RPMB_DEV      the node to open (the stage tool makes it in
+ *                           the chroot as /dev/rpmb-wlu, root's, 0600, from
+ *                           the host's UFS RPMB W-LU bsg node). Opened once,
+ *                           as root, O_RDWR|O_NOFOLLOW, before qseecomd
+ *                           drops to uid 1000; must be a character device.
+ *                           It is the only device the library ever opens.
+ *   OMAMOBILE_RPMB_LOG      the audit log, appended as root, created 0600:
+ *                           one timestamped line per request and reply
+ *                           (command, frame counts, request and response
+ *                           types, address, block count, write counter,
+ *                           result; never a key, a MAC or a data block).
+ *   OMAMOBILE_RPMB_WRITES   "1" forwards 0x103 writes; anything else
+ *                           refuses every write without touching the
+ *                           device (status -1, the reply area untouched).
+ *   OMAMOBILE_RPMB_FPT      frames per transfer (bRPMB_ReadWriteSize) and
+ *   OMAMOBILE_RPMB_SECTORS  the RPMB's size in 512-byte sectors, from the
+ *                           host's sysfs, for 0x101 and the read split.
+ * A PROGRAM KEY request (type 0x0001) is refused on either path, whoever
+ * asks, before any I/O, and logged. The SG_IO ioctls need CAP_SYS_RAWIO,
+ * which qseecomd keeps after its drop to uid 1000.
  *
- * libssd.so (-DSTUB_SSD) is still a stub: it answers every request as a
- * failed operation and logs it. It opens no device and no file.
+ * librpmb-emu.so (-DSTUB_RPMB_EMU) is the file-backed emulator of
+ * omamobile-rpmb-emu.c: it answers as a 4 MiB UFS RPMB would, from two
+ * regular files under OMAMOBILE_RPMB_EMU_DIR (default
+ * /data/vendor/omamobile-rpmb-emu), and opens no device. TrustZone verifies
+ * every reply's MAC with the device's own key, which the emulator cannot
+ * hold, so it serves experiments only (OMAMOBILE_RPMB_EMU_PROBE=
+ * unauthenticated-ok is its probe knob). Not shipped in a stage bundle.
+ *
+ * libssd.so (-DSTUB_SSD) is a stub: it answers every request as a failed
+ * operation and logs it. It opens no device and no file.
  *
  * What qseecomd expects (its disassembly):
  *  - it dlopen()s the library by name (RTLD_NOW), so this one must come
@@ -48,10 +66,10 @@
  * Wire formats (the vendor libraries' disassembly):
  *  RPMB, buffer 0x6400, served in place in the shared buffer: request
  *    command at +0 (0x101 init, 0x102 read, 0x103 write, 0x104 cfg), +4 the
- *    frame count (0x101: sub-op), +0x14 frames per transfer (0x103), the
- *    request frames at +0x18. Reply: +4 status, +8 bytes moved, +0xc 20,
- *    the reply frames written at +0x14; 20 bytes are sent (0x101 and 0x104
- *    have their own short shapes, see omamobile-rpmb-emu.c).
+ *    frame count (0x101: sub-op), +0xc the request frames' offset (0x18),
+ *    +0x14 frames per transfer (0x103). Reply: +4 status, +8 bytes moved,
+ *    +0xc 20, the reply frames written at +0x14; 20 bytes are sent (0x101
+ *    and 0x104 have their own short shapes, see omamobile-rpmb-pt.c).
  *  SSD, buffer 0x5000, request copied out (0x2008 bytes): command at +0
  *    (0x202 read, 0x203 write), data at +8. Reply: +0 command, +4 status,
  *    +8 byte count, +0xc data. Read: status 0 success, 3 failed, sent as
@@ -71,6 +89,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #define EXPORT __attribute__((visibility("default")))
@@ -100,6 +120,11 @@ int __android_log_print(int prio, const char *tag, const char *fmt, ...);
 
 #if defined(STUB_RPMB)
 #define SVC		"rpmb"
+#define TAG		"omamobile-rpmb-pt"
+#define SB_LENGTH	0x6400u
+#define SERVES		"passed through to the RPMB W-LU"
+#elif defined(STUB_RPMB_EMU)
+#define SVC		"rpmb"
 #define TAG		"omamobile-rpmb-emu"
 #define SB_LENGTH	0x6400u
 #define SERVES		"served by the file-backed emulator"
@@ -109,7 +134,7 @@ int __android_log_print(int prio, const char *tag, const char *fmt, ...);
 #define SB_LENGTH	0x5000u
 #define SERVES		"every request fails"
 #else
-#error "build with -DSTUB_RPMB or -DSTUB_SSD"
+#error "build with -DSTUB_RPMB, -DSTUB_RPMB_EMU or -DSTUB_SSD"
 #endif
 
 static struct QSEECom_handle *handle;
@@ -131,6 +156,100 @@ static void say(int prio, const char *fmt, ...)
 }
 
 #if defined(STUB_RPMB)
+
+#include <stdlib.h>
+#include "omamobile-rpmb-pt.c"
+
+static struct rpmb_pt pt;
+
+/* Requests are served one at a time by the listener thread. */
+static uint32_t serve_one(unsigned char *sb)
+{
+	char desc[1024];
+	uint32_t len;
+
+	len = rpmb_pt_serve(&pt, sb, SB_LENGTH, desc, sizeof(desc));
+	requests++;
+	say(LOG_INFO, "listener 0x%x %s", listener, desc);
+	return len;
+}
+
+/* A decimal from the environment, or 0. */
+static uint32_t env_number(const char *name)
+{
+	const char *v = getenv(name);
+	char *end;
+	unsigned long n;
+
+	if (!v || !*v)
+		return 0;
+	n = strtoul(v, &end, 10);
+	if (*end || n > 0xffffffffu)
+		return 0;
+	return (uint32_t)n;
+}
+
+static int init_service(void)
+{
+	const char *dev = getenv("OMAMOBILE_RPMB_DEV");
+	const char *log = getenv("OMAMOBILE_RPMB_LOG");
+	const char *w = getenv("OMAMOBILE_RPMB_WRITES");
+	uint32_t fpt = env_number("OMAMOBILE_RPMB_FPT");
+	uint32_t sectors = env_number("OMAMOBILE_RPMB_SECTORS");
+	int writes = w && !strcmp(w, "1");
+	char err[256], banner[512];
+	struct stat st;
+
+	if (!dev || !*dev) {
+		say(LOG_ERROR, "rpmb_init_service: OMAMOBILE_RPMB_DEV is not "
+		    "set: no RPMB node to pass through to");
+		return -1;
+	}
+	if (!fpt) {
+		say(LOG_ERROR, "rpmb_init_service: OMAMOBILE_RPMB_FPT (frames "
+		    "per transfer) is not set");
+		return -1;
+	}
+	if (rpmb_pt_open(&pt, dev, log, writes, fpt, sectors, err,
+			 sizeof(err))) {
+		say(LOG_ERROR, "rpmb_init_service: pass-through: %s", err);
+		return -1;
+	}
+	fstat(pt.dev_fd, &st);
+	snprintf(banner, sizeof(banner), "rpmb pass-through: device %s "
+		 "(c %u:%u), log %s, fpt %u, sectors %u, writes %s", dev,
+		 (unsigned int)major(st.st_rdev),
+		 (unsigned int)minor(st.st_rdev), log && *log ? log : "none",
+		 fpt, sectors, writes ? "ENABLED" : "refused");
+	say(LOG_INFO, "%s", banner);
+	rpmb_pt_log(&pt, banner);
+	return 0;
+}
+
+static void *serve(void *arg)
+{
+	int ret;
+
+	(void)arg;
+	for (;;) {
+		unsigned char *sb = handle->ion_sbuffer;
+
+		ret = QSEECom_receive_req(handle, sb, SB_LENGTH);
+		if (ret == RECEIVE_RESTART)
+			continue;
+		if (ret) {
+			say(LOG_ERROR, "receive_req failed: %d (errno %d), "
+			    "listener thread ends", ret, errno);
+			return NULL;
+		}
+		ret = QSEECom_send_resp(handle, sb, serve_one(sb));
+		if (ret)
+			say(LOG_ERROR, "send_resp failed: %d (errno %d)",
+			    ret, errno);
+	}
+}
+
+#elif defined(STUB_RPMB_EMU)
 
 #include <stdlib.h>
 #include "omamobile-rpmb-emu.c"
@@ -332,7 +451,7 @@ static int close_service(void)
 	return 0;
 }
 
-#if defined(STUB_RPMB)
+#if defined(STUB_RPMB) || defined(STUB_RPMB_EMU)
 EXPORT int rpmb_init_service(void) { return init_service(); }
 EXPORT int rpmb_start(uint32_t lstnr_id) { return start(lstnr_id); }
 EXPORT int rpmb_close(void) { return close_service(); }
