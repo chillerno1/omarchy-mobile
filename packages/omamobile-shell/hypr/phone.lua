@@ -89,6 +89,14 @@ o.launch_on_start(
 -- menu, and power + volume down takes a screenshot. omamobile-keys works out
 -- which gesture it was.
 --
+-- The desktop's first seconds: omamobile-keys session-up waits for the
+-- shell's lock and marks the moment the desktop came up, and a short power
+-- press before that mark or within 10 s of it never locks or darkens the
+-- screen (the boot is quiet, so a press then is the user checking that the
+-- phone is alive, and acting on it locked the phone into the dark the moment
+-- its desktop appeared).
+o.launch_on_start("omamobile-keys session-up")
+--
 -- Only real keyboards may trigger these: squeekboard is a virtual keyboard
 -- whose key codes are its layout's own, numbered up from 9, and on a long
 -- layout one of them lands on 124, which Hyprland's keymap reads as

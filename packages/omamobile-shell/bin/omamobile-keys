@@ -16,6 +16,14 @@
 #   power + volume down together: screenshot (Omarchy's, full screen)
 #   wake                omamobile-sleepd, after Power woke the phone from
 #                       sleep: the PIN pad, as the lost press would have
+#   session-up          hypr/phone.lua, at the session's start: waits for the
+#                       shell's lock, then marks the moment the desktop came
+#                       up. A short press before that mark, or in the 10 s
+#                       after it, lights a dark screen and otherwise does
+#                       nothing: the boot is quiet, so a press then is the
+#                       user checking that the phone is alive, and acting on
+#                       it locked the phone into the dark the moment its
+#                       desktop appeared (the Saga, 2026-11-12)
 #   double-tap          omamobile-doubletap, after a double tap on the
 #                       touchscreen: a dark screen wakes as a short press
 #                       wakes it (locked or not); a lit one is left alone
@@ -44,6 +52,9 @@ now() { date +%s%3N; }
 
 # Keys count as pressed together within this many milliseconds.
 window=500
+# A short press within this many milliseconds of the desktop coming up
+# (session-up) never locks or turns the screen off.
+guard=10000
 # A press held this long is a long press.
 hold=0.6
 # Volume down waits this long for power before it lowers the volume.
@@ -133,6 +144,23 @@ screen_off() {
   hyprctl monitors -j 2>/dev/null | jq -e 'any(.[]; .dpmsStatus == false)' >/dev/null
 }
 
+# The desktop's first seconds. session-up (hypr/phone.lua, at Hyprland's
+# start) marks the moment the shell's lock first answered: before that mark,
+# the shell can't take a lock anyway, and locking blind set the brightness
+# to 0 and powered the panel off just as the desktop appeared, which looked
+# like a boot that hung. Young until $guard ms after the mark; with no mark
+# in this session (an older phone.lua, or the mark not written yet), young
+# while the shell's lock does not answer.
+session_young() {
+  local up
+  up=$(cat "$state/session-up" 2>/dev/null || echo 0)
+  if (( up == 0 )); then
+    ! omarchy-shell lock status >/dev/null 2>&1
+    return
+  fi
+  (( $(now) - up < guard ))
+}
+
 # The chord marker is cleared on power's release, but Hyprland drops that
 # release once another key went down, so a marker older than this is stale.
 in_chord() {
@@ -186,6 +214,14 @@ short_press() {
   # The press that woke the phone from sleep, if it gets here at all:
   # omamobile-sleepd has lit the PIN pad for it already.
   [[ -f $state/power-wake ]] && (( now - $(<"$state/power-wake") < 1500 )) && return 0
+  # The desktop just came up (or isn't up yet): never lock or darken it. A
+  # dark screen wakes, a lit one is left alone.
+  if session_young; then
+    if screen_off; then
+      if locked; then wake_locked; else wake_unlocked; fi
+    fi
+    return 0
+  fi
   if screensaver_up; then
     omarchy-system-lock
   elif locked; then
@@ -331,6 +367,18 @@ case "${1:-}" in
     now >"$state/power-wake"
     if locked && screen_off; then wake_locked; fi
     ;;
+  session-up)
+    # hypr/phone.lua, once per Hyprland start: the desktop is up when the
+    # shell's lock answers (Omarchy's lock-on-start waits for the same). Up
+    # to two minutes, then the mark is set anyway, so a shell that never
+    # comes up leaves the keys as they were after the guard.
+    rm -f "$state/session-up"
+    for _ in $(seq 600); do
+      omarchy-shell lock status >/dev/null 2>&1 && break
+      sleep 0.2
+    done
+    now >"$state/session-up"
+    ;;
   double-tap)
     # omamobile-doubletap: a double tap on the touchscreen. Only a dark
     # screen wakes; the lock ignores touches while dark (patches/omarchy/0029),
@@ -351,7 +399,7 @@ case "${1:-}" in
     lock_dark
     ;;
   *)
-    echo "Usage: omamobile-keys power-down|power-up|volume-down|volume-up|volume-up-release|wake|double-tap|dark-unlocked" >&2
+    echo "Usage: omamobile-keys power-down|power-up|volume-down|volume-up|volume-up-release|wake|session-up|double-tap|dark-unlocked" >&2
     exit 1
     ;;
 esac

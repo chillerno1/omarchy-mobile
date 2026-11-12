@@ -242,3 +242,56 @@ ptt; release
 [[ $(voice keyPress) == 0 ]] || fail "no push-to-talk on the lock screen"
 echo false >"$t/locked"
 echo "ok - power + volume up: push-to-talk only when turned on, never locked, stops on release, volume untouched"
+
+# The desktop's first seconds (session-up): a short press before the mark,
+# while the shell's lock doesn't answer, or within 10 s of it, never locks
+# or turns the screen off; a dark screen wakes. After the guard a press
+# locks as before. With no mark and the shell answering, nothing changes.
+rm -f "$t/config/omamobile/voice.json"
+cat >"$t/bin/omarchy-shell" <<STUB
+#!/bin/bash
+[[ "\$*" == "lock isLocked" ]] && { cat "$t/locked"; exit 0; }
+[[ "\$*" == "lock status" ]] && { [[ -e $t/shell-down ]] && exit 1; printf '{"locked":true,"secure":%s}\n' "\$(cat "$t/secure")"; exit 0; }
+echo "omarchy-shell \$*" >>"$log"
+STUB
+chmod +x "$t/bin/omarchy-shell"
+echo true >"$t/secure"
+# A press that keeps the session mark: only the debounce timestamp goes.
+press_again() { : >"$log"; rm -f "$t/run/omamobile-keys/last-press"; keys power-down; keys power-up; sleep 0.5; }
+# No mark, the shell down (the desktop isn't up yet): nothing locks.
+echo false >"$t/locked"; echo true >"$t/dpms"
+touch "$t/shell-down"
+press; grep -qE "omarchy-system-lock|brightness-display off|brightnessctl" "$log" && fail "before the desktop is up: a press neither locks nor darkens"
+rm -f "$t/shell-down"
+# No mark, the shell answering (an older phone.lua): as before.
+press; grep -q "omarchy-system-lock" "$log" || fail "no session mark and the shell up: a press locks as before"
+# session-up marks the moment the lock answers; a press within the guard
+# leaves a lit screen alone, lit or locked, and wakes a dark one.
+reset; keys session-up
+[[ -f $t/run/omamobile-keys/session-up ]] || fail "session-up writes the mark once the lock answers"
+echo false >"$t/locked"; echo true >"$t/dpms"
+press_again
+[[ ! -s $log ]] || fail "just after the desktop came up, unlocked and lit: a press does nothing"
+echo true >"$t/locked"; echo true >"$t/dpms"
+press_again
+grep -qE "brightness-display off|lock dark|omamobile-sleepd" "$log" && fail "just after the desktop came up, locked and lit: a press leaves the screen on"
+echo true >"$t/locked"; echo false >"$t/dpms"
+press_again
+grep -q "omarchy-shell lock wake" "$log" && grep -q "omarchy-brightness-display on" "$log" || fail "just after the desktop came up, dark: a press wakes the lock screen"
+echo false >"$t/locked"; echo false >"$t/dpms"
+press_again
+grep -q "omarchy-brightness-display on" "$log" || fail "just after the desktop came up, unlocked and dark: a press lights the screen"
+grep -q "omarchy-system-lock" "$log" && fail "just after the desktop came up, unlocked and dark: no lock"
+# Past the guard (an old mark): a press locks and darkens as before.
+echo $(( $(date +%s%3N) - 11000 )) >"$t/run/omamobile-keys/session-up"
+echo false >"$t/locked"; echo true >"$t/dpms"
+press_again
+grep -q "omarchy-system-lock" "$log" && grep -q "omarchy-brightness-display off" "$log" || fail "after the guard: a press locks and turns the screen off as before"
+# session-up waits for the lock: with the shell down it keeps polling.
+rm -rf "$t/run/omamobile-keys"; touch "$t/shell-down"
+( keys session-up ) & up=$!
+sleep 0.7
+[[ ! -e $t/run/omamobile-keys/session-up ]] || fail "session-up doesn't mark the desktop up while the lock doesn't answer"
+rm -f "$t/shell-down"; wait $up
+[[ -f $t/run/omamobile-keys/session-up ]] || fail "session-up marks the desktop up once the lock answers"
+echo "ok - power key: the desktop's first seconds never lock or darken, a dark screen wakes, and the guard lapses"
