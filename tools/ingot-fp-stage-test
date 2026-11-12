@@ -5,28 +5,37 @@
 # "device nodes" as files reading "c MAJ:MIN" (OMAMOBILE_FP_TEST=1 and
 # OMAMOBILE_FP_TEST_ROOT). Nothing on this machine's real /dev is touched.
 #
-#   check                    -> preconditions met; refused without a stub, with
-#                               the vendor's library as the stub, with a stub
-#                               naming a device path, without /dev/qseecom
+#   check                    -> preconditions met, the RPMB W-LU found in the
+#                               fake sysfs (node, fpt, sectors), writes refused;
+#                               refused without a stub, with the vendor's
+#                               library as the stub, with a stub naming a
+#                               device path, without /dev/qseecom, with the
+#                               W-LU's type not 30 (audit too), --rpmb-writes
 #   the overrides            -> ignored without OMAMOBILE_FP_TEST=1
 #   audit                    -> exactly the allowlisted nodes, from the host's
-#                               numbers; the stubs over the vendor's; persist
+#                               numbers (/dev/rpmb-wlu the W-LU's bsg node,
+#                               0600); the stubs over the vendor's; persist
 #                               in the chroot's /proc/mounts; and refused for
 #                               an extra node, a wrong node, an extra mount,
-#                               the vendor's library over the stub
+#                               the vendor's library over the stub, the RPMB
+#                               node 0660
 #   hal (static fakes of qseecomd and the HAL host; needs gcc -static)
 #                            -> the logdw reader names the sender, the
 #                               listeners are seen, the HAL host starts after
 #                               them, chipid 5f83 gives PASS, stop in order;
 #                               the fd audit passes after the listeners and
-#                               after the HAL host (the emulator's two files
-#                               seen open, through OMAMOBILE_RPMB_EMU_DIR),
-#                               and stops the stage in order for a leaked
-#                               file, a leaked character device, a third file
-#                               of the emulator's
-#   audit, RPMB emulator     -> its state directory made root's, 0700; a
-#                               file in it root's 0600 listed; refused (check
-#                               and audit) for a 0770 directory, a link in it
+#                               after the HAL host (qseecomd holding the RPMB
+#                               node and the pass-through's log, through
+#                               OMAMOBILE_RPMB_DEV/_LOG; it keeps sys_rawio,
+#                               the HAL host doesn't), and stops the stage in
+#                               order for a leaked file, a leaked character
+#                               device, a second file of the pass-through's,
+#                               the RPMB node held by the HAL host;
+#                               --rpmb-writes reaches the listener (and
+#                               OMAMOBILE_RPMB_WRITES=0 without it)
+#   audit, RPMB pass-through -> its directory made root's, 0700; a file in
+#                               it root's 0600 listed; refused (check and
+#                               audit) for a 0770 directory, a link in it
 #   audit, socket directory  -> the host's socket directory bound once, empty;
 #                               refused for a file planted in it, another
 #                               directory in its place, a second bind of it
@@ -78,6 +87,19 @@ echo "DEVNAME=arch_sys_timer" > "$H/sys/bus/clockevents/devices/clockevent0/ueve
 echo "DEVNAME=arch_sys_counter" > "$H/sys/bus/clocksource/devices/clocksource0/uevent"
 echo 5f83 > "$H/sys/devices/platform/fingerprint/chipid"
 echo 1.0 > "$H/sys/devices/platform/fingerprint/version"
+# the UFS RPMB well-known LU, as on the phone: SCSI 0:0:0:49476, bsg 241:1
+UFS=$H/sys/devices/platform/soc@0/1d84000.ufshc
+WLU=$UFS/host0/target0:0:0/0:0:0:49476
+mkdir -p "$UFS/geometry_descriptor" "$WLU/bsg/0:0:0:49476" "$WLU/unit_descriptor" \
+  "$H/sys/class/scsi_device/0:0:0:49476" "$H/dev/bsg"
+echo 0xF8 > "$UFS/geometry_descriptor/rpmb_rw_size"
+echo 30 > "$WLU/type"
+echo 241:1 > "$WLU/bsg/0:0:0:49476/dev"
+echo 0x0000000000010000 > "$WLU/unit_descriptor/logical_block_count"
+echo 0x08 > "$WLU/unit_descriptor/logical_block_size"
+ln -s ../../../devices/platform/soc@0/1d84000.ufshc/host0/target0:0:0/0:0:0:49476 \
+  "$H/sys/class/scsi_device/0:0:0:49476/device"
+node bsg/0:0:0:49476 241:1
 mkdir -p "$IMG/system/bin" "$IMG/system/lib64" "$IMG/apex/com.android.runtime/bin" \
   "$IMG/vendor/bin" "$IMG/vendor/lib64/hw" "$IMG/vendor/firmware_mnt/image"
 ln -s /apex/com.android.runtime/bin/linker64 "$IMG/system/bin/linker64"
@@ -106,8 +128,25 @@ st check > "$out" 2>&1 || fail "check on a good fake phone"
 grep -q 'preconditions met' "$out" || fail "check: no 'preconditions met'"
 grep -q "node /dev/dma_heap/qcom,qseecom-ta <- host $H/dev/dma_heap/default_cma_region (c 249:2)" "$out" ||
   fail "check: the qcom,qseecom-ta alias"
+grep -q "node /dev/rpmb-wlu <- host $H/dev/bsg/0:0:0:49476 (c 241:1)" "$out" || fail "check: the RPMB node"
+grep -q "RPMB: the UFS RPMB well-known LU $WLU (type 30), node $H/dev/bsg/0:0:0:49476 (c 241:1) -> /dev/rpmb-wlu" "$out" ||
+  fail "check: the RPMB W-LU"
+grep -q 'RPMB: 248 frames per transfer, 32768 sectors of 512 bytes' "$out" || fail "check: the RPMB's fpt and sectors"
+grep -q 'RPMB writes: refused by the listener' "$out" || fail "check: RPMB writes not said refused"
 [[ ! -e $STATE ]] || fail "check created the state directory"
-pass "check: preconditions met, changes nothing"
+pass "check: preconditions met, the RPMB W-LU found (node, fpt 248, sectors 32768), writes refused, changes nothing"
+
+st check --rpmb-writes > "$out" 2>&1 && fail "check --rpmb-writes accepted"
+grep -q -- '--rpmb-writes is for the audit, listeners, hal and bridge stages' "$out" || fail "check --rpmb-writes: the reason"
+echo 0 > "$WLU/type"
+st check > "$out" 2>&1 && fail "check with the W-LU's type 0"
+grep -q 'RPMB: 0 SCSI devices of LUN 49476, type 30, under a ufshc .*0:0:0:49476 (type 0): refusing' "$out" ||
+  fail "check with the W-LU's type 0: the reason"
+st audit > "$out" 2>&1 && fail "audit with the W-LU's type 0"
+grep -q 'preconditions NOT met' "$out" || fail "audit with the W-LU's type 0: not refused before the build"
+grep -q 'audit: /dev in the chroot' "$out" && fail "audit with the W-LU's type 0: the chroot was built"
+echo 30 > "$WLU/type"
+pass "check: --rpmb-writes refused; check and audit refuse (nothing built) when the W-LU's type is not 30"
 
 mv "$BIN/libssd.so" "$t/libssd.so"
 st check > "$out" 2>&1 && fail "check without libssd.so"
@@ -143,9 +182,10 @@ pass "the overrides are ignored without OMAMOBILE_FP_TEST=1"
 st audit > "$out" 2>&1 || fail "audit on a good fake phone"
 grep -q 'audit passed' "$out" || fail "audit: no 'audit passed'"
 got=$(sed -n 's/^ingot-fp:   c \([0-9:]*\) [^ ]* [0-9]* \(\/dev\/[^ ]*\) .*/\2 \1/p' "$out" | sort | tr '\n' ' ')
-want="/dev/blfp 10:120 /dev/dma_heap/qcom,qseecom 249:2 /dev/dma_heap/qcom,qseecom-ta 249:2 /dev/full 1:7 /dev/null 1:3 /dev/qseecom 236:0 /dev/random 1:8 /dev/urandom 1:9 /dev/zero 1:5 "
+want="/dev/blfp 10:120 /dev/dma_heap/qcom,qseecom 249:2 /dev/dma_heap/qcom,qseecom-ta 249:2 /dev/full 1:7 /dev/null 1:3 /dev/qseecom 236:0 /dev/random 1:8 /dev/rpmb-wlu 241:1 /dev/urandom 1:9 /dev/zero 1:5 "
 [[ $got == "$want" ]] || fail "audit: /dev is '$got', want '$want'"
 grep -q 'REFUSED' "$out" && fail "audit: a REFUSED line on a good phone"
+grep -q "^ingot-fp:   c 241:1 [^ ]* 600 /dev/rpmb-wlu (= host bsg/0:0:0:49476)" "$out" || fail "audit: /dev/rpmb-wlu 0600"
 grep -q "/vendor/lib64/librpmb.so = $BIN/librpmb.so" "$out" || fail "audit: stub over librpmb.so"
 grep -q "/vendor/lib64/libssd.so = $BIN/libssd.so" "$out" || fail "audit: stub over libssd.so"
 grep -q '  /mnt/vendor/persist: bind from' "$out" || fail "audit: persist bind"
@@ -153,32 +193,33 @@ grep -q '  /mnt/vendor/persist: bind from' "$out" || fail "audit: persist bind"
   fail "audit: the state directories"
 pass "audit: exactly the allowlist, the stubs, persist from the state directory"
 
-for f in dev-extra dev-wrong mount-extra stub-vendor; do
+for f in dev-extra dev-wrong mount-extra stub-vendor rpmb-mode; do
   OMAMOBILE_FP_TEST_INJECT=$f st audit > "$out" 2>&1 && fail "audit passed with $f"
   { grep -q 'REFUSED' "$out" && grep -q 'audit failed: nothing started' "$out"; } || fail "audit with $f: no refusal"
 done
-pass "audit: refused an extra node, a wrong node, an extra mount, the vendor's library"
+grep -q '/dev/rpmb-wlu is 0:0 660, want 0:0 600: REFUSED' "$out" || fail "audit with rpmb-mode: the reason"
+pass "audit: refused an extra node, a wrong node, an extra mount, the vendor's library, the RPMB node 0660"
 
-EMU=$STATE/data/vendor/omamobile-rpmb-emu
-st audit > "$out" 2>&1 || fail "audit (RPMB emulator)"
-[[ -d $EMU && $(stat -c '%u %a' "$EMU") == "$(id -u) 700" ]] || fail "audit: the emulator's directory is not ours, 0700"
-grep -q "  $EMU: root's, 0700, only regular files" "$out" || fail "audit: the emulator's directory not checked"
-grep -q "RPMB emulator state: $EMU" "$out" || fail "check: the emulator's directory not named"
-printf 'x' > "$EMU/state" && chmod 0600 "$EMU/state"
-st audit > "$out" 2>&1 || fail "audit with the emulator's state file"
-grep -q "  $EMU/state: root's, 0600, 1 bytes" "$out" || fail "audit: the emulator's file not listed"
-rm -f "$EMU/state"
-for f in "emu-wrong:is 0:0 770, want 0:0 700" "emu-link:holds 'l 0:0 777 [0-9]* rpmb.img'"; do
+RPMB=$STATE/data/vendor/omamobile-rpmb
+st audit > "$out" 2>&1 || fail "audit (RPMB pass-through)"
+[[ -d $RPMB && $(stat -c '%u %a' "$RPMB") == "$(id -u) 700" ]] || fail "audit: the pass-through's directory is not ours, 0700"
+grep -q "  $RPMB: root's, 0700, only regular files" "$out" || fail "audit: the pass-through's directory not checked"
+grep -q "RPMB pass-through log: $RPMB/passthrough.log" "$out" || fail "check: the pass-through's log not named"
+printf 'x' > "$RPMB/passthrough.log" && chmod 0600 "$RPMB/passthrough.log"
+st audit > "$out" 2>&1 || fail "audit with the pass-through's log"
+grep -q "  $RPMB/passthrough.log: root's, 0600, 1 bytes" "$out" || fail "audit: the pass-through's log not listed"
+rm -f "$RPMB/passthrough.log"
+for f in "rpmb-wrong:is 0:0 770, want 0:0 700" "rpmb-link:holds 'l 0:0 777 [0-9]* passthrough.log'"; do
   OMAMOBILE_FP_TEST_INJECT=${f%%:*} st audit > "$out" 2>&1 && fail "audit passed with ${f%%:*}"
   { grep -q "${f#*:}.*REFUSED" "$out" && grep -q 'audit failed: nothing started' "$out"; } ||
     fail "audit with ${f%%:*}: no refusal for '${f#*:}'"
   # left behind: check refuses it before the next start repairs anything
   st check > "$out" 2>&1 && fail "check passed after ${f%%:*}"
   grep -q "${f#*:}.*REFUSED" "$out" || fail "check after ${f%%:*}: no refusal for '${f#*:}'"
-  rm -f "$EMU/rpmb.img"; chmod 0700 "$EMU"
+  rm -f "$RPMB/passthrough.log"; chmod 0700 "$RPMB"
 done
-st check > "$out" 2>&1 || fail "check after the emulator faults are undone"
-pass "audit: the RPMB emulator's directory root's 0700, its files listed; check and audit refuse a 0770 one, a link in it"
+st check > "$out" 2>&1 || fail "check after the pass-through faults are undone"
+pass "audit: the RPMB pass-through's directory root's 0700, its files listed; check and audit refuse a 0770 one, a link in it"
 
 st audit > "$out" 2>&1 || fail "audit (socket directory)"
 grep -q "  /dev/socket/omamobile-fp: bind of the host's $H/run/omamobile-fp/sock" "$out" || fail "audit: socket directory bind"
@@ -223,6 +264,32 @@ static void logdw(const char *tag, const char *msg)
 }
 static volatile sig_atomic_t done;
 static void term(int s) { (void)s; done = 1; }
+/* the bounding set, as /proc/self/status gives it */
+static void capbnd(const char *who)
+{
+	char l[128];
+	FILE *f = fopen("/proc/self/status", "r");
+
+	while (f && fgets(l, sizeof(l), f))
+		if (!strncmp(l, "CapBnd:", 7))
+			printf("%s fake: CapBnd %s", who, l + 8);
+	if (f)
+		fclose(f);
+}
+/* a line of the RPMB pass-through: stderr (here stdout) and its log */
+static int ptlog = -1;
+static void pt(const char *m)
+{
+	char l[512];
+
+	snprintf(l, sizeof(l), "omamobile-rpmb-pt[%d]: %s", (int)getpid(), m);
+	printf("%s\n", l);
+	/* its liblog copy, as the shim prints it: not a second request */
+	if (strstr(l, " request "))
+		printf("I %s\n", l);
+	if (ptlog >= 0)
+		dprintf(ptlog, "2026-01-01T00:00:00 %s\n", l);
+}
 /* the line protocol, canned: READY 0 0 0; ENROLL enrols id 7 in three
  * touches (a file in the HAL's template directory, so it survives a
  * restart; ERROR 1 after one touch while the state has "fail-enroll");
@@ -321,33 +388,49 @@ int main(int argc, char **argv)
 {
 	signal(SIGTERM, term);
 	if (strstr(argv[0], "qseecomd")) {
-		/* as the RPMB emulator: its two files, opened and kept (and a
-		 * third one if the test planted it) */
-		const char *emu = getenv("OMAMOBILE_RPMB_EMU_DIR");
-		char e[256];
-		if (emu) {
-			snprintf(e, sizeof(e), "%s/rpmb.img", emu);
-			open(e, O_RDWR | O_CREAT, 0600);
-			snprintf(e, sizeof(e), "%s/state", emu);
-			open(e, O_RDWR | O_CREAT, 0600);
-			snprintf(e, sizeof(e), "%s/extra", emu);
-			open(e, O_RDONLY);
-			printf("omamobile-rpmb-emu[%d]: rpmb emulator: state %s, key programmed 0, counter 0\n",
-			       (int)getpid(), emu);
+		/* as the RPMB pass-through: its node and its log, opened and
+		 * kept (and a second file there if the test planted one) */
+		const char *dev = getenv("OMAMOBILE_RPMB_DEV"), *log = getenv("OMAMOBILE_RPMB_LOG");
+		const char *w = getenv("OMAMOBILE_RPMB_WRITES");
+		char e[256], c[32] = "?", b[512];
+		FILE *df;
+		int writes = w && !strcmp(w, "1");
+
+		capbnd("qseecomd");
+		/* a test's node is a file on the chroot's read-only /dev */
+		if (dev && (open(dev, O_RDWR) >= 0 || open(dev, O_RDONLY) >= 0) && (df = fopen(dev, "r"))) {
+			if (fgets(c, sizeof(c), df))
+				c[strcspn(c, "\n")] = 0;
+			fclose(df);
 		}
+		if (log) {
+			ptlog = open(log, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0600);
+			snprintf(e, sizeof(e), "%s", log);
+			if (strrchr(e, '/')) {
+				strcpy(strrchr(e, '/'), "/extra");
+				open(e, O_RDONLY);
+			}
+		}
+		snprintf(b, sizeof(b), "rpmb pass-through: device %s (%s), log %s, fpt %s, sectors %s, writes %s "
+			 "(OMAMOBILE_RPMB_WRITES=%s)", dev ? dev : "(none)", c, log ? log : "(none)",
+			 getenv("OMAMOBILE_RPMB_FPT") ? getenv("OMAMOBILE_RPMB_FPT") : "(none)",
+			 getenv("OMAMOBILE_RPMB_SECTORS") ? getenv("OMAMOBILE_RPMB_SECTORS") : "(none)",
+			 writes ? "ENABLED" : "refused", w ? w : "(unset)");
+		pt(b);
 		logdw("QSEECOMD", "listener services: Started (Listener ID = 8192)");
 		logdw("QSEECOMD", "listener services: Started (Listener ID = 12288)");
-		/* as the RPMB stub logs a request on its stderr */
+		/* as the old RPMB stub logs a request on its stderr */
 		printf("omamobile-rpmb-stub[%d]: listener 0x2000 request 1: command 0x101, failing it; 00000101\n",
 		       (int)getpid());
 		/* its liblog copy, as the shim prints it: not a second request */
 		printf("I omamobile-rpmb-stub[%d]: listener 0x2000 request 1: command 0x101, failing it; 00000101\n",
 		       (int)getpid());
-		/* the emulator's shape of the same, and its liblog copy */
-		printf("omamobile-rpmb-emu[%d]: listener 0x2000 request 2: command 0x102, frames 1 (64 per tx): "
-		       "auth-read addr 0x0000 k 1 nonce=1a2b3c4d -> result 0x0007\n", (int)getpid());
-		printf("I omamobile-rpmb-emu[%d]: listener 0x2000 request 2: command 0x102, frames 1 (64 per tx): "
-		       "auth-read addr 0x0000 k 1 nonce=1a2b3c4d -> result 0x0007\n", (int)getpid());
+		/* the pass-through's: a read, and a write if enabled */
+		pt("listener 0x2000 request 2: command 0x102, frames 6 (248 per tx): tx1 auth-read addr 0x00a6 k 6 "
+		   "nonce=a7b36b67.. spo 512 ok, spi 3072 ok, resp 0x0400 addr 0x00a6 count 6 counter 0 -> result 0x0007");
+		if (writes)
+			pt("listener 0x2000 request 3: command 0x103, frames 1 (1 per tx): tx1 auth-write addr 0x0010 k 1 "
+			   "counter 5 spo 512 ok, spo result-read ok, spi 512 ok, resp 0x0300 addr 0x0010 counter 6 -> result 0x0000");
 		fflush(stdout);
 		while (!done)
 			pause();
@@ -356,8 +439,11 @@ int main(int argc, char **argv)
 	}
 	if (strstr(argv[0], "bridge"))
 		return bridge(argc, argv);
+	/* the test's fault: the HAL host holds the RPMB node */
+	int rpmb = !access("/data/vendor/omamobile-fp/open-rpmb", F_OK) && open("/dev/rpmb-wlu", O_RDONLY) >= 0;
 	printf("halhost fake: %s %s %s uid %d\n", argc > 1 ? argv[1] : "", argc > 2 ? argv[2] : "",
 	       argc > 3 ? argv[3] : "", (int)getuid());
+	capbnd("halhost");
 	FILE *f = fopen("/dev/blfp", "r");
 	char l[64] = "";
 	if (f && fgets(l, sizeof(l), f))
@@ -365,7 +451,7 @@ int main(int argc, char **argv)
 	logdw("BtlFpHal", "chip id 0x5f83");
 	logdw("BtlFpHal", "netlink: irq event, finger down");
 	fflush(stdout);
-	sleep(1);
+	sleep(rpmb ? 3 : 1);
 	return 0;
 }
 EOF
@@ -405,28 +491,53 @@ MP
   CROOT=$H/run/omamobile-fp-ingot/root
   grep -q "fd audit passed (qseecomd's listeners up)" "$out" || fail "hal: no fd audit after the listeners"
   grep -q 'fd audit passed (the HAL host started)' "$out" || fail "hal: no fd audit after the HAL host"
-  grep -q "^ingot-fp:   qseecomd ([0-9]*) fd [0-9]*: the RPMB emulator's $CROOT/data/vendor/omamobile-rpmb-emu/rpmb.img" "$out" ||
-    fail "hal: the emulator's rpmb.img not seen open (OMAMOBILE_RPMB_EMU_DIR?)"
-  grep -q "^ingot-fp:   qseecomd ([0-9]*, in the chroot): [0-9]* fds; devices: /dev/null(1:3); RPMB emulator: rpmb.img state" "$out" ||
-    fail "hal: qseecomd's fd summary"
+  grep -q "^ingot-fp:   qseecomd ([0-9]*) fd [0-9]*: the RPMB pass-through's $CROOT/data/vendor/omamobile-rpmb/passthrough.log" "$out" ||
+    fail "hal: the pass-through's log not seen open (OMAMOBILE_RPMB_LOG?)"
+  grep -q "^ingot-fp:   qseecomd ([0-9]*, in the chroot): [0-9]* fds; devices: \(/dev/null(1:3) \)\{0,1\}/dev/rpmb-wlu(241:1); RPMB log: passthrough.log" "$out" ||
+    fail "hal: qseecomd's fd summary (the RPMB node through OMAMOBILE_RPMB_DEV?)"
   grep -q "^ingot-fp:   omamobile-fp-ha ([0-9]*, in the chroot): " "$out" || fail "hal: the HAL host's fd summary"
-  [[ $(stat -c '%a' "$STATE/data/vendor/omamobile-rpmb-emu/rpmb.img") == 600 ]] || fail "hal: the emulator's file mode"
+  [[ $(stat -c '%a' "$STATE/data/vendor/omamobile-rpmb/passthrough.log") == 600 ]] || fail "hal: the pass-through's log mode"
+  grep -q '^\[qseecomd\] omamobile-rpmb-pt\[[0-9]*\]: rpmb pass-through: device /dev/rpmb-wlu (c 241:1), log /data/vendor/omamobile-rpmb/passthrough.log, fpt 248, sectors 32768, writes refused (OMAMOBILE_RPMB_WRITES=0)' "$out" ||
+    fail "hal: the pass-through's environment (device, log, fpt, sectors, writes 0)"
+  grep -q 'auth-read addr 0x00a6' "$STATE/data/vendor/omamobile-rpmb/passthrough.log" || fail "hal: the pass-through's log not written"
+  # qseecomd keeps CAP_SYS_RAWIO (bit 17) for SG_IO; the HAL host doesn't
+  capbit() { local v; v=$(sed -n "s/^\[$1\] $1 fake: CapBnd \([0-9a-f]*\)$/\1/p" "$out" | head -1); [[ -n $v ]] && echo $(((16#$v >> 17) & 1)); }
+  [[ $(capbit qseecomd) == 1 ]] || fail "hal: qseecomd lost sys_rawio ($(capbit qseecomd))"
+  [[ $(capbit halhost) == 0 ]] || fail "hal: the HAL host kept sys_rawio ($(capbit halhost))"
+  pass "hal: qseecomd holds /dev/rpmb-wlu and the pass-through's log, gets its environment, keeps sys_rawio; the HAL host loses it"
+
   for f in "fd-file:fd 7: regular file /etc/passwd: outside the chroot" "fd-char:fd 7: character device 5:2 /dev/ptmx, not an allowlisted node" \
-      "emu-extra:fd [0-9]*: regular empty file $CROOT/data/vendor/omamobile-rpmb-emu/extra: in the RPMB emulator's directory"; do
-    # a third file there (root's, 0600: the directory audit passes), which
+      "rpmb-extra:fd [0-9]*: regular empty file $CROOT/data/vendor/omamobile-rpmb/extra: in the RPMB pass-through's directory"; do
+    # a second file there (root's, 0600: the directory audit passes), which
     # the fake qseecomd opens
-    if [[ ${f%%:*} == emu-extra ]]; then
-      : > "$STATE/data/vendor/omamobile-rpmb-emu/extra"; chmod 0600 "$STATE/data/vendor/omamobile-rpmb-emu/extra"
+    if [[ ${f%%:*} == rpmb-extra ]]; then
+      : > "$STATE/data/vendor/omamobile-rpmb/extra"; chmod 0600 "$STATE/data/vendor/omamobile-rpmb/extra"
     fi
     OMAMOBILE_FP_TEST_INJECT=${f%%:*} TIMEOUT=60 st hal --seconds 1 > "$out" 2>&1 && fail "hal passed with ${f%%:*}"
     grep -q "qseecomd ([0-9]*) ${f#*:}.*: REFUSED" "$out" || fail "hal with ${f%%:*}: no refusal for '${f#*:}'"
     grep -q "error: fd audit failed (qseecomd's listeners up): stopping" "$out" || fail "hal with ${f%%:*}: not stopped"
     grep -q '^\[qseecomd\] qseecomd fake: TERM' "$out" || fail "hal with ${f%%:*}: qseecomd not stopped in order"
     grep -q 'starting halhost' "$out" && fail "hal with ${f%%:*}: the HAL host started"
-    rm -f "$STATE/data/vendor/omamobile-rpmb-emu/extra"
+    rm -f "$STATE/data/vendor/omamobile-rpmb/extra"
   done
+  # rpmb-hal: the HAL host opens /dev/rpmb-wlu (the fake does while this is there)
+  : > "$STATE/data/vendor/omamobile-fp/open-rpmb"
+  TIMEOUT=60 st hal --seconds 1 > "$out" 2>&1 && fail "hal passed with the HAL host holding the RPMB node"
+  rm -f "$STATE/data/vendor/omamobile-fp/open-rpmb"
+  grep -q "omamobile-fp-ha ([0-9]*) fd [0-9]*: character device 241:1 $CROOT/dev/rpmb-wlu, the RPMB node: only qseecomd may hold it: REFUSED" "$out" ||
+    fail "hal with rpmb-hal: no refusal"
+  grep -q "error: fd audit failed (the HAL host started): stopping" "$out" || fail "hal with rpmb-hal: not stopped"
+  grep -q '^\[qseecomd\] qseecomd fake: TERM' "$out" || fail "hal with rpmb-hal: qseecomd not stopped in order"
   out=$t/out
-  pass "hal: the fd audit passes after the listeners and the HAL host, sees the emulator's two files; stops the stage for a leaked file, a character device, a third emulator file"
+  pass "hal: the fd audit passes after the listeners and the HAL host; stops the stage for a leaked file, a character device, a second pass-through file, the RPMB node held by the HAL host"
+
+  TIMEOUT=60 st hal --seconds 1 --rpmb-writes > "$out" 2>&1 || fail "hal --rpmb-writes"
+  grep -q "RPMB writes: ENABLED (the listener forwards TrustZone's authenticated writes to the real RPMB)" "$out" ||
+    fail "hal --rpmb-writes: not said ENABLED"
+  grep -q '^\[qseecomd\] omamobile-rpmb-pt\[[0-9]*\]: rpmb pass-through: .*, writes ENABLED (OMAMOBILE_RPMB_WRITES=1)' "$out" ||
+    fail "hal --rpmb-writes: OMAMOBILE_RPMB_WRITES=1 did not reach the listener"
+  grep -q 'auth-write addr 0x0010' "$STATE/data/vendor/omamobile-rpmb/passthrough.log" || fail "hal --rpmb-writes: the write not logged"
+  pass "hal --rpmb-writes: said ENABLED, OMAMOBILE_RPMB_WRITES=1 reaches the listener (0 without it)"
 
   # --- bridge, with a fake bridge ---
   cp "$t/fake" "$BIN/omamobile-fp-bridge-ingot"
@@ -504,13 +615,10 @@ MP
   [[ $(cat "$S4LOGS/enrolled-id") == 7 ]] || fail "s4 enrol: the saved id"
   s4ok verify
   s4ok storage
-  grep -q 'rpmb: 4 requests, by command: 0x101 init x2  0x102 read x2' "$out" ||
-    fail "s4 storage: the listener's requests, both shapes (two per start: irq, bridge)"
-  grep -q 'TrustZone asked for RPMB; the emulator answered: 0x0007 x2' "$out" || fail "s4 storage: the RPMB verdict"
-  grep -q 'the RPMB emulator (latest start): state /data/vendor/omamobile-rpmb-emu, key programmed 0, counter 0' "$out" ||
-    fail "s4 storage: the emulator's state line"
-  { grep -q "the RPMB emulator's state $STATE/data/vendor/omamobile-rpmb-emu" "$out" && grep -q ' rpmb.img$' "$out"; } ||
-    fail "s4 storage: the emulator's directory listing"
+  # ingot-fp-s4-test does not read the pass-through's lines yet: the old
+  # stub's only
+  grep -q 'rpmb: 2 requests, by command: 0x101 init x2' "$out" ||
+    fail "s4 storage: the listener's requests (one per start: irq, bridge)"
   grep -q ' data/vendor_de/0/fpdata/7$' "$out" || fail "s4 storage: the template file in the listing"
   s4ok persist
   grep -q 'MATCH 7 after the restart' "$out" || fail "s4 persist: AUTH after the restart"
