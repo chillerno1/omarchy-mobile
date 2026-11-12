@@ -28,6 +28,10 @@ if [[ -f ../omamobile-device-cheetah/src/reboot-to.c ]]; then
     ../omamobile-device-cheetah/vendor/systemd/logind.conf.d/10-omamobile-power-key.conf \
     || fail "the power-key drop-in drifted from the cheetah package"
   pass "the power-key drop-in matches the cheetah package"
+  cmp -s vendor/systemd/system/plymouth-quit.service.d/10-omamobile-retain-splash.conf \
+    ../omamobile-device-cheetah/vendor/systemd/system/plymouth-quit.service.d/10-omamobile-retain-splash.conf \
+    || fail "the Plymouth retain-splash drop-in drifted from the cheetah package"
+  pass "the Plymouth retain-splash drop-in matches the cheetah package"
   cmp -s omamobile-device-ingot.install \
     ../omamobile-device-cheetah/omamobile-device-cheetah.install \
     || fail "the pacman install script drifted from the cheetah package"
@@ -55,6 +59,7 @@ for f in usr/bin/reboot-to \
          usr/lib/udev/rules.d/70-omamobile-dma-heap.rules \
          usr/lib/systemd/network/20-usb-gadget.network \
          usr/lib/systemd/logind.conf.d/10-omamobile-power-key.conf \
+         usr/lib/systemd/system/plymouth-quit.service.d/10-omamobile-retain-splash.conf \
          usr/lib/NetworkManager/conf.d/10-omamobile-usb.conf \
          usr/lib/NetworkManager/conf.d/20-omamobile-wifi-mac.conf \
          usr/lib/modprobe.d/omamobile-wifi.conf \

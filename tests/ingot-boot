@@ -175,10 +175,26 @@ pass "the container script refuses SELF_UPDATE without ARCH_BOOT first; --arch p
 
 # boot.img's command line asks for bootconfig, ahead of any "--", or the
 # kernel leaves ABL's androidboot.* keys (the slot) out of /proc/bootconfig
-cmdline=$(sed -n "s/^    --cmdline '\(.*\)' \\\\$/\1/p" "$build")
-[[ -n $cmdline ]] || fail "boot.img's --cmdline found in $build"
+cmdline=$(sed -n "s/^cmdline='\(.*\)'$/\1/p" "$build")
+[[ -n $cmdline ]] || fail "boot.img's command line (cmdline=) found in $build"
 [[ " ${cmdline%% -- *} " == *' bootconfig '* ]] || fail "boot.img's command line has bootconfig before any -- (got: $cmdline)"
 pass "boot.img's command line asks the kernel to parse ABL's bootconfig"
+
+# A normal (--arch) boot is quiet, with Plymouth's splash, and keeps the
+# kernel log: quiet and splash go on boot.img, never printk.devkmsg off or
+# console= dropped; boot-verbose.img is the same image with the text back.
+# The RAM-only probe stays verbose.
+quiet=$(sed -n "s/^quiet='\(.*\)'$/\1/p" "$build")
+for word in quiet loglevel=3 splash plymouth.graphical vt.global_cursor_default=0; do
+  [[ " $quiet " == *" $word "* ]] || fail "the quiet boot words include $word (got: $quiet)"
+done
+[[ " $cmdline " == *' console=tty0 '* && " $cmdline " == *' printk.devkmsg=on '* ]] \
+  || fail "the quiet boot keeps the console and the kernel log (got: $cmdline)"
+[[ " $cmdline " != *' quiet '* && " $cmdline " != *' splash '* ]] || fail "the probe's command line stays verbose"
+grep -q 'make_boot boot.img "\$cmdline \$quiet"' "$build" && grep -q 'make_boot boot-verbose.img "\$cmdline"' "$build" \
+  || fail "--arch builds the quiet boot.img and a boot-verbose.img with the text back"
+grep -q '^    make_boot boot.img "\$cmdline"$' "$build" || fail "the RAM-only probe builds boot.img verbose"
+pass "--arch boots quiet with Plymouth's splash and a verbose image beside it; the probe stays verbose"
 
 # build-ingot-probe --self-update without --arch, before Docker
 printf '#!/bin/sh\necho called >> "%s/calls"\nexit 97\n' "$t" > "$t/bin/docker"

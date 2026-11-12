@@ -20,6 +20,7 @@ Omarchy Mobile's userspace package for the Solana Mobile Saga (codename ingot, S
 | `share/firmware.map` | `/usr/share/omamobile/ingot/firmware.map` | What it copies (data, not code): `source-glob\|destination\|note` lines, and `wifi_board_name=` |
 | `vendor/systemd/network/20-usb-gadget.network` | `/usr/lib/systemd/network` | Sets usb0 to 172.16.42.1/24 after handover. Same file as the Pixel 7 package |
 | `vendor/systemd/logind.conf.d/10-omamobile-power-key.conf` | `/usr/lib/systemd/logind.conf.d` | A short power press does not power the phone off. Same drop-in as the Pixel 7 Pro package |
+| `vendor/systemd/system/plymouth-quit.service.d/10-omamobile-retain-splash.conf` | `/usr/lib/systemd/system/plymouth-quit.service.d` | From 0.1.6: Plymouth quits with `--retain-splash`, so the Omarchy boot screen stays up until Hyprland draws, instead of a black panel while the session starts. The boot is quiet from `boot_a`'s command line (`quiet splash`, `device/ingot/initramfs/build`); without this drop-in the splash goes black a few seconds early. Same drop-in as the Pixel 7 Pro package |
 | `vendor/NetworkManager/conf.d/10-omamobile-usb.conf` | `/usr/lib/NetworkManager/conf.d` | Keeps NetworkManager off that link |
 | `etc/omamobile-mirrorlist` | `/etc/pacman.d/omamobile-mirrorlist` | Where pacman finds the `[omamobile]` repository. Same file as the Pixel 7 Pro package |
 | `omamobile-device-ingot.install` | pacman hook | Adds `[omamobile]` to `pacman.conf` before `[omarchy]`, once. Same script as the Pixel 7 Pro package |
@@ -77,6 +78,7 @@ The bring-up system had these by hand. A file in `/etc` with the same name as a 
 5. Remove hand-copied udev rules from `/etc/udev/rules.d` that this package now ships (the storage, DMA-heap, Bluetooth and, from 0.1.5, SoundWire rules), then `udevadm control --reload`.
    From 0.1.5 the package also owns the sound profile under `/usr/share/alsa/ucm2/conf.d/sm8475/` and `/usr/share/alsa/ucm2/Solana/ingot/`, and the topology link `/usr/lib/firmware/updates/qcom/sm8475/SM8475-Solana-Saga-tplg.bin`. Hand-made copies there stop the upgrade ("exists in filesystem"): delete them first, or let pacman replace them with `--overwrite '/usr/share/alsa/ucm2/*' --overwrite '/usr/lib/firmware/updates/qcom/sm8475/*'`.
 6. Remove a hand-made NetworkManager file in `/etc/NetworkManager/conf.d` that set the Wi-Fi MAC policy.
+   From 0.1.6, also a hand copy of the Plymouth drop-in in `/etc/systemd/system/plymouth-quit.service.d/` (the bring-up phone tested the quiet boot with one), then `systemctl daemon-reload`.
 7. Reboot once, then check the list below.
 
 ## Check on the phone

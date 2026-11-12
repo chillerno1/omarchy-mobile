@@ -135,11 +135,37 @@ fdtput -t s /out/ingot.dtb /__symbols__ arch_timer /timer
 # bootconfig: ABL appends its androidboot.* keys (the slot suffix among
 # them) to the initrd as a bootconfig, and the kernel parses it into
 # /proc/bootconfig only when the command line asks for it.
-python3 /mkbootimg/mkbootimg.py --header_version 4 \
-    --kernel /input/kernel --ramdisk /out/initramfs.cpio.gz \
-    --os_version 14.0.0 --os_patch_level 2024-11 \
-    --cmdline 'console=tty0 rdinit=/init clk_ignore_unused pd_ignore_unused regulator_ignore_unused fw_devlink=permissive panic=10 printk.devkmsg=on systemd.firstboot=no bootconfig' \
-    -o /out/boot.img
+cmdline='console=tty0 rdinit=/init clk_ignore_unused pd_ignore_unused regulator_ignore_unused fw_devlink=permissive panic=10 printk.devkmsg=on systemd.firstboot=no bootconfig'
+# A normal boot (ARCH_BOOT) puts no kernel or systemd text on the panel, as
+# the Pixels boot (device/raven/device.conf): quiet keeps the console to
+# errors, and loglevel=3 (after it, so it wins) to worse than errors, since
+# this phone's UFS, Bluetooth and PCIe probes print over a hundred
+# error-level lines in the first 15 s, which quiet alone would still put on
+# the panel before Plymouth has it; splash puts Plymouth's Omarchy screen
+# up from Arch's start until Hyprland draws (omamobile-device-ingot's
+# plymouth-quit --retain-splash drop-in keeps it there while the session
+# starts), plymouth.graphical skips Plymouth's console check, and
+# vt.global_cursor_default=0 hides the console cursor on the dark panel
+# before it. The kernel log still reaches dmesg and the journal in full,
+# the USB gadget and SSH are unchanged, and the shared init's own lines
+# still go to kmsg. boot-verbose.img is the same image with the text back,
+# for a boot that doesn't come up: `fastboot boot boot-verbose.img` spends
+# no slot try. The RAM-only probe stays verbose: its text on the panel is
+# what a bring-up boot is for.
+quiet='quiet loglevel=3 splash plymouth.graphical plymouth.force-scale=1 vt.global_cursor_default=0'
+make_boot() {
+    python3 /mkbootimg/mkbootimg.py --header_version 4 \
+        --kernel /input/kernel --ramdisk /out/initramfs.cpio.gz \
+        --os_version 14.0.0 --os_patch_level 2024-11 \
+        --cmdline "$2" \
+        -o "/out/$1"
+}
+if [ "${ARCH_BOOT:-0}" = 1 ]; then
+    make_boot boot.img "$cmdline $quiet"
+    make_boot boot-verbose.img "$cmdline"
+else
+    make_boot boot.img "$cmdline"
+fi
 (cd /tmp && mkdir -p empty && cd empty && find . -print0 | cpio --null --quiet -o -H newc --owner=0:0) \
     | gzip -n -9 > /tmp/empty.cpio.gz
 python3 /mkbootimg/mkbootimg.py --header_version 4 --pagesize 4096 \
@@ -166,9 +192,10 @@ cat > /tmp/marker.dtso <<'DTS'
 DTS
 dtc -q -@ -I dts -O dtb -o /tmp/marker.dtbo /tmp/marker.dtso
 python3 /mkdtboimg/mkdtboimg.py create /out/dtbo.img --page_size=4096 /tmp/marker.dtbo
-for img in boot vendor_boot; do
+for img in boot boot-verbose vendor_boot; do
+    [ -f /out/$img.img ] || continue
     size=$(stat -c %s /out/$img.img)
     [ "$size" -le 100663296 ] || { rm /out/$img.img; echo "$img exceeds its 96 MiB partition" >&2; exit 1; }
 done
 [ "$(stat -c %s /out/dtbo.img)" -le 25165824 ] || { echo 'dtbo exceeds its 24 MiB partition' >&2; exit 1; }
-(cd /out && sha256sum boot.img vendor_boot.img dtbo.img ingot.dtb initramfs.cpio.gz RELEASE > SHA256SUMS)
+(cd /out && sha256sum boot.img $([ -f boot-verbose.img ] && echo boot-verbose.img) vendor_boot.img dtbo.img ingot.dtb initramfs.cpio.gz RELEASE > SHA256SUMS)
