@@ -1,0 +1,386 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# ingot-fp-provision: put the Solana Mobile Saga's (ingot) fingerprint
+# vendor tree on the phone, built from the phone's own partitions: the
+# Android build on slot B (vendor_b and system_b inside `super`, and
+# modem_b). Runs on the laptop; reaches the phone over tools/phone-ssh.
+#
+#   tools/ingot-fp-provision [options]
+#
+#  1. Finds `super` and modem_<slot> by PARTNAME in /sys/class/block/*/uevent
+#     (the root has no /dev/disk/by-partlabel): each exactly once, a block
+#     device, ro=1 (the storage guard holds) and not in /proc/mounts. The
+#     phone must be an ingot (osom,ingot), have python3, and have the
+#     omamobile-fingerprint package (/usr/lib/omamobile-fp-ingot/ingot-fp-stage).
+#  2. Reads super's logical-partition metadata on the phone with
+#     tools/lib/lp-metadata.py (read-only; magics and checksums checked):
+#     vendor_<slot> and system_<slot> as lists of LINEAR extents. A ZERO
+#     extent, or anything not LINEAR, is refused.
+#  3. Copies vendor_<slot> and system_<slot> out of super, extent by extent,
+#     and modem_<slot> whole, with dd (which opens them read-only) over SSH
+#     in 64 MiB chunks, each chunk's size checked and a failed chunk read
+#     again up to 5 times, into WORK as vendor.img, system.img and modem.img
+#     (about 0.9 + 1.0 + 0.3 GB). Each copy is checked against a SHA-256 the
+#     phone computes from a second read of the same bytes; vendor and system
+#     must be ext4 (EROFS is refused, as the extractor does), modem a FAT
+#     image. Then the partitions are found again and super's metadata read
+#     again: nothing may have moved.
+#  4. Runs tools/extract-fingerprint-vendor-ingot on that directory (needs
+#     debugfs, python3, readelf, unzip and sha256sum on the laptop).
+#  5. Pushes OUT/root, OUT/MANIFEST and OUT/SOURCE to
+#     /usr/lib/omamobile-fp-ingot/ (tar into a temporary directory there,
+#     each renamed into place, replacing what was there; the package's own
+#     bin/ and ingot-fp-stage are left alone), root's, and checks every file
+#     with sha256sum -c on the phone. It refuses while
+#     omamobile-fp-ingot.service is active: run
+#     `systemctl stop omamobile-fp-ingot` on the phone first.
+# Nothing else on the phone is written; no partition is opened for writing
+# or mounted. The vendor's files never leave the laptop except into this
+# phone, and are not to be redistributed.
+#
+# Options:
+#   --dry-run       steps 1 and 2, the file system magics (a 4 KiB read of
+#                   each), and the plan; nothing is copied, extracted or
+#                   pushed, nothing is written on the phone or the laptop
+#   --slot a|b      the slot whose Android build is read (default b)
+#   --work DIR      local scratch, about 2.2 GB of images plus the
+#                   extractor's scratch (default ~/.cache/omamobile-ingot-fp);
+#                   a run directory inside it is removed at exit
+#   --out DIR       keep the extracted tree in DIR (default: inside the run
+#                   directory, removed at exit)
+#   --keep-images   keep the run directory's img/ (the three images)
+#   --force-device  pass -f to the extractor (skip its device checks)
+#   -h, --help      this text
+#
+# Afterwards: `systemctl start omamobile-fp-ingot` on the phone, or reboot
+# (the unit starts by default once the tree is there).
+#
+# Test seams: PHONE_SSH, the command that runs a shell command on the phone
+# (default tools/phone-ssh, with OMAMOBILE_SSH_SHARE=1 unless set). Honoured
+# only with OMAMOBILE_INGOT_FP_TEST=1 (refused without it):
+# INGOT_FP_PHONE_ROOT, a directory prefixed to every path read or written
+# on the phone (a stand-in /sys, /proc, /dev and /usr tree whose partitions
+# are regular files); INGOT_FP_EXTRACT, a command run in place of the
+# extractor with the same arguments; INGOT_FP_CHUNK_BYTES, the chunk size;
+# INGOT_FP_RETRY_DELAY, seconds between tries. tests/ingot-fp-provision.
+set -euo pipefail
+CALLER=$PWD
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+ROOT=$PWD
+
+say() { printf '\e[1m==> %s\e[0m\n' "$*"; }
+note() { printf '    %s\n' "$*"; }
+die() { printf '\e[31mingot-fp-provision:\e[0m %s\n' "$*" >&2; exit 1; }
+
+COMPATIBLE=osom,ingot
+DEST=/usr/lib/omamobile-fp-ingot
+UNIT=omamobile-fp-ingot.service
+dry=0 slot=b work=${XDG_CACHE_HOME:-$HOME/.cache}/omamobile-ingot-fp out="" keep_images=0 force_device=0
+while (($#)); do
+  case $1 in
+    --dry-run) dry=1 ;;
+    --slot) slot=${2:?--slot needs a or b}; shift ;;
+    --work) work=${2:?--work needs a directory}; shift ;;
+    --out) out=${2:?--out needs a directory}; shift ;;
+    --keep-images) keep_images=1 ;;
+    --force-device) force_device=1 ;;
+    -h|--help) # shellcheck source=tools/lib/usage.sh
+      source "$ROOT/tools/lib/usage.sh"; usage_from_header "$0"; exit 0 ;;
+    *) die "unknown argument $1 (--help)" ;;
+  esac
+  shift
+done
+[[ $slot == a || $slot == b ]] || die "--slot is a or b, not $slot"
+# --work and --out are relative to where the tool was run from
+[[ $work == /* ]] || work=$CALLER/$work
+[[ -z $out || $out == /* ]] || out=$CALLER/$out
+
+# --- Test seams --------------------------------------------------------------
+R="" extract_cmd=() chunk_bytes=$((64 << 20)) retry_delay=2 tries=5
+if [[ ${OMAMOBILE_INGOT_FP_TEST:-} == 1 ]]; then
+  R=${INGOT_FP_PHONE_ROOT:-}
+  [[ -n ${INGOT_FP_EXTRACT:-} ]] && extract_cmd=("$INGOT_FP_EXTRACT")
+  chunk_bytes=${INGOT_FP_CHUNK_BYTES:-$chunk_bytes}
+  retry_delay=${INGOT_FP_RETRY_DELAY:-$retry_delay}
+else
+  for v in INGOT_FP_PHONE_ROOT INGOT_FP_EXTRACT INGOT_FP_CHUNK_BYTES INGOT_FP_RETRY_DELAY; do
+    [[ -z ${!v:-} ]] || die "$v is a test seam, honoured only with OMAMOBILE_INGOT_FP_TEST=1; unset it"
+  done
+fi
+((${#extract_cmd[@]})) || extract_cmd=("$ROOT/tools/extract-fingerprint-vendor-ingot")
+[[ -z $R || $R =~ ^/[A-Za-z0-9_./-]+$ ]] || die "INGOT_FP_PHONE_ROOT must be an absolute path of letters, digits and _ . / -"
+[[ $chunk_bytes =~ ^[1-9][0-9]*$ && $((chunk_bytes % 512)) == 0 ]] || die "INGOT_FP_CHUNK_BYTES is a multiple of 512"
+[[ $retry_delay =~ ^[0-9]+$ ]] || die "INGOT_FP_RETRY_DELAY is a number of seconds"
+
+PHONE_SSH=${PHONE_SSH:-}
+[[ -n $PHONE_SSH ]] || export OMAMOBILE_SSH_SHARE=${OMAMOBILE_SSH_SHARE:-1}
+phone() {
+  if [[ -n $PHONE_SSH ]]; then "$PHONE_SSH" "$@"; else bash "$ROOT/tools/phone-ssh" "$@"; fi
+}
+phone_reset() {
+  [[ -n $PHONE_SSH ]] || bash "$ROOT/tools/phone-ssh" --stop >/dev/null 2>&1 || true
+}
+mib() { echo $(( ($1 + 1048575) / 1048576 )); }
+
+modem=modem_$slot
+parts=(super "$modem")
+
+# --- 1. The phone and its partitions -------------------------------------------
+# One read-only command: the board, python3, the unit's state, the package,
+# then "name device type ro mounted bytes" per partition (device none when
+# PARTNAME isn't found, many when more than once). The names are fixed and
+# R is checked above, so nothing needs quoting.
+probe() {
+  phone "c=\$(tr '\\0' '\\n' < $R/proc/device-tree/compatible 2>/dev/null | head -1)
+echo \"compatible \${c:-none}\"
+if command -v python3 >/dev/null; then echo 'python yes'; else echo 'python no'; fi
+echo \"unit \$(systemctl is-active $UNIT 2>/dev/null || true)\"
+if [ -f $R$DEST/ingot-fp-stage ]; then echo 'package yes'; else echo 'package no'; fi
+for p in ${parts[*]}; do
+  m=\$(grep -lx \"PARTNAME=\$p\" $R/sys/class/block/*/uevent 2>/dev/null)
+  k=\$(printf '%s\\n' \"\$m\" | grep -c /)
+  if [ \"\$k\" = 0 ]; then echo \"\$p none - - - -\"; continue; fi
+  if [ \"\$k\" != 1 ]; then echo \"\$p many - - - -\"; continue; fi
+  d=\${m%/uevent}; d=\${d##*/}
+  t=other; if [ -b $R/dev/\$d ]; then t=block; elif [ -f $R/dev/\$d ]; then t=file; fi
+  s=\$(cat $R/sys/class/block/\$d/size 2>/dev/null)
+  echo \"\$p \$d \$t \$(cat $R/sys/class/block/\$d/ro 2>/dev/null || echo -) \$(grep -c \"^/dev/\$d \" $R/proc/mounts) \$((\${s:-0} * 512))\"
+done"
+}
+
+unit_active() { [[ $1 =~ ^(active|activating|deactivating|reloading|refreshing)$ ]]; }
+
+declare -A DEV=() SIZE=()
+check_probe() {
+  local out=$1 bad=() p d t ro mounted bytes want_type=block got
+  [[ -z $R ]] || want_type="file"
+  got=$(sed -n 's/^compatible //p' <<<"$out")
+  [[ $got == "$COMPATIBLE" ]] || die "step 1: the phone is '${got:-unknown}', not a Saga ($COMPATIBLE)"
+  [[ $(sed -n 's/^python //p' <<<"$out") == yes ]] ||
+    die "step 1: python3 isn't on the phone; it reads super's metadata (pacman -S python on the phone)"
+  [[ $(sed -n 's/^package //p' <<<"$out") == yes ]] ||
+    die "step 1: no $DEST/ingot-fp-stage on the phone: install omamobile-fingerprint first"
+  UNIT_STATE=$(sed -n 's/^unit //p' <<<"$out")
+  for p in "${parts[@]}"; do
+    d="" t="" ro="" mounted="" bytes=""
+    read -r d t ro mounted bytes < <(awk -v p="$p" '$1 == p { print $2, $3, $4, $5, $6; exit }' <<<"$out") || true
+    if [[ -z ${d:-} || $d == none ]]; then bad+=("$p: not found by PARTNAME")
+    elif [[ $d == many ]]; then bad+=("$p: more than one partition has this PARTNAME")
+    elif [[ ! $d =~ ^[a-z0-9]+$ ]]; then bad+=("$p: unexpected device name $d")
+    elif [[ $t != "$want_type" ]]; then bad+=("$p: /dev/$d is not a block device")
+    elif [[ $ro != 1 ]]; then bad+=("$p: /dev/$d is writable (ro=$ro): the storage guard isn't holding")
+    elif [[ $mounted != 0 ]]; then bad+=("$p: /dev/$d is mounted")
+    elif [[ ! $bytes =~ ^[1-9][0-9]*$ ]]; then bad+=("$p: /dev/$d has no size")
+    else DEV[$p]=$d SIZE[$p]=$bytes
+    fi
+  done
+  if ((${#bad[@]})); then
+    printf '    %s\n' "${bad[@]}" >&2
+    die "step 1: super and $modem must each be found once, read-only and unmounted. Don't work around this: ask in an issue"
+  fi
+}
+
+say "Finding super and $modem on the phone"
+probe_out=$(probe) || die "step 1: can't reach the phone over USB SSH (tools/phone-ssh 'uname -r' should answer)"
+check_probe "$probe_out"
+for p in "${parts[@]}"; do
+  note "$p: /dev/${DEV[$p]}, read-only, not mounted, $(mib "${SIZE[$p]}") MiB"
+done
+if unit_active "$UNIT_STATE"; then
+  die "step 1: $UNIT is $UNIT_STATE on the phone; the tree can't be replaced under it. Run 'systemctl stop omamobile-fp-ingot' on the phone first"
+fi
+note "$UNIT: ${UNIT_STATE:-unknown}"
+
+# --- 2. super's logical partitions ----------------------------------------------
+# EXT[name] = "start,count start,count ..." (512-byte sectors on super)
+declare -A EXT=() SECTORS=()
+read_lp() {
+  phone "python3 -I - $R/dev/${DEV[super]} --slot $slot vendor system" < "$ROOT/tools/lib/lp-metadata.py"
+}
+parse_lp() {
+  local out=$1 name n rest
+  EXT=() SECTORS=()
+  grep -q '^lp ' <<<"$out" || die "step 2: lp-metadata.py printed no header"
+  while read -r _ name n rest; do
+    [[ $name =~ ^(vendor|system)_[ab]$ && $n =~ ^[1-9][0-9]*$ && $rest =~ ^[0-9]+,[1-9][0-9]*( [0-9]+,[1-9][0-9]*)*$ ]] ||
+      die "step 2: unexpected line from lp-metadata.py: part $name $n $rest"
+    EXT[$name]=$rest SECTORS[$name]=$n
+  done < <(grep '^part ' <<<"$out")
+  [[ -n ${EXT[vendor_$slot]:-} && -n ${EXT[system_$slot]:-} ]] || die "step 2: vendor_$slot or system_$slot missing from lp-metadata.py's output"
+}
+say "Reading super's logical partitions (metadata slot $slot, on the phone)"
+lp_out=$(read_lp) || die "step 2: reading super's metadata failed (lp-metadata.py's reason above); nothing was copied"
+parse_lp "$lp_out"
+note "${lp_out%%$'\n'*}"
+for p in "vendor_$slot" "system_$slot"; do
+  set -f; read -ra e <<<"${EXT[$p]}"; set +f
+  note "$p: ${#e[@]} extent(s), ${SECTORS[$p]} sectors ($(mib $((SECTORS[$p] * 512))) MiB): ${EXT[$p]}"
+done
+
+# --- The file systems, from a 4 KiB read of each (on the phone) --------------
+head_hex() { # $1 device, $2 byte offset -> 4096 bytes as hex
+  phone "dd if=$R/dev/$1 iflag=skip_bytes,count_bytes bs=4096 skip=$2 count=4096 status=none | od -An -v -tx1" | tr -d ' \n'
+}
+check_fs() { # $1 name, $2 hex of its first 4 KiB
+  local h=$2
+  ((${#h} == 8192)) || die "step 2: couldn't read the start of $1 on the phone"
+  [[ ${h:2048:8} != e2e1f5e0 ]] || die "$1 is EROFS; this tool reads ext4 only (fsck.erofs --extract support is not written yet)"
+  [[ ${h:2160:4} == 53ef ]] || die "$1 is not ext4 (no 0xEF53 at byte 1080)"
+}
+for p in "vendor_$slot" "system_$slot"; do
+  first=${EXT[$p]%% *} start=${EXT[$p]%%,*}
+  ((${first#*,} >= 8)) || die "step 2: $p's first extent is under 4 KiB; refusing"
+  check_fs "$p" "$(head_hex "${DEV[super]}" $((start * 512)))"
+  note "$p: ext4"
+done
+mh=$(head_hex "${DEV[$modem]}" 0)
+[[ ${#mh} == 8192 && ${mh:1020:4} == 55aa ]] || die "step 2: $modem has no FAT boot sector"
+note "$modem: FAT boot sector"
+
+vs=${SECTORS[vendor_$slot]} ss=${SECTORS[system_$slot]}
+total=$(( (vs + ss) * 512 + SIZE[$modem] ))
+xf=(-o "OUT" -w "RUN")
+((force_device)) && xf=(-f "${xf[@]}")
+
+if ((dry)); then
+  say "Plan (dry run: nothing is copied, extracted or pushed)"
+  note "would make a run directory in $work (mode 700), $(mib "$total") MiB of images plus the extractor's scratch"
+  note "would copy vendor_$slot from super (/dev/${DEV[super]}) extent by extent into img/vendor.img ($(mib $((vs * 512))) MiB), checked against the phone's SHA-256"
+  note "would copy system_$slot from super (/dev/${DEV[super]}) extent by extent into img/system.img ($(mib $((ss * 512))) MiB), checked against the phone's SHA-256"
+  note "would copy $modem (/dev/${DEV[$modem]}) whole into img/modem.img ($(mib "${SIZE[$modem]}") MiB), checked against the phone's SHA-256"
+  note "would check the partitions and super's metadata again, unchanged"
+  note "would run: tools/extract-fingerprint-vendor-ingot ${xf[*]} RUN/img (OUT: ${out:-a directory in the run directory})"
+  note "would push root, MANIFEST and SOURCE to $DEST (replacing them; root's), verified with sha256sum -c"
+  note "then: systemctl start omamobile-fp-ingot on the phone, or reboot"
+  exit 0
+fi
+
+# --- 3. Copy ------------------------------------------------------------------
+# The run directory is mktemp's (700); WORK itself is left as it is
+mkdir -p "$work"
+umask 077
+avail=$(df -B1 --output=avail "$work" | tail -1 | tr -d ' ')
+need=$((total + (2 << 30)))
+[[ $avail =~ ^[0-9]+$ ]] || avail=0
+((avail >= need)) ||
+  die "step 3: $work has $(mib "$avail") MiB free, about $(mib "$need") MiB is needed (--work DIR)"
+W=$(mktemp -d "$work/run.XXXXXX")
+cleanup() {
+  if ((keep_images)) && [[ -d $W/img ]]; then
+    find "$W" -mindepth 1 -maxdepth 1 ! -name img -exec rm -rf {} +
+    note "kept the images in $W/img (the vendor's files: don't share them)"
+  else
+    rm -rf "$W"
+  fi
+}
+trap cleanup EXIT
+mkdir "$W/img"
+[[ -n $out ]] || out=$W/out
+
+# pull DEV START LENGTH FILE: append bytes START..START+LENGTH of /dev/DEV
+# to FILE, in chunks, each size-checked and retried on a new connection.
+pull() {
+  local d=$1 start=$2 len=$3 file=$4 off want n part=$W/.chunk
+  for ((off = 0; off < len; off += chunk_bytes)); do
+    want=$((len - off < chunk_bytes ? len - off : chunk_bytes))
+    for ((n = 1; ; n++)); do
+      if phone "dd if=$R/dev/$d iflag=skip_bytes,count_bytes,fullblock bs=4M skip=$((start + off)) count=$want status=none" > "$part" &&
+         [[ $(stat -c %s -- "$part") == "$want" ]]; then
+        break
+      fi
+      ((n < tries)) || die "step 3: reading /dev/$d at byte $((start + off)) failed $tries times. Check the USB cable and run again"
+      phone_reset; sleep "$retry_delay"
+    done
+    cat -- "$part" >> "$file"
+  done
+  rm -f -- "$part"
+}
+# The phone's SHA-256 of a shell command's output (a second read there)
+phone_sha() {
+  local n got
+  for ((n = 1; n <= tries; n++)); do
+    got=$(phone "$1 | sha256sum" | cut -d' ' -f1) || got=""
+    [[ $got =~ ^[0-9a-f]{64}$ ]] && { echo "$got"; return 0; }
+    phone_reset; sleep "$retry_delay"
+  done
+  return 1
+}
+copy_super() { # $1 partition, $2 file
+  local p=$1 file=$2 e s c cmd="" bytes=0
+  : > "$file"
+  for e in ${EXT[$p]}; do
+    s=${e%,*} c=${e#*,}
+    pull "${DEV[super]}" $((s * 512)) $((c * 512)) "$file"
+    cmd+="dd if=$R/dev/${DEV[super]} iflag=skip_bytes,count_bytes bs=4M skip=$((s * 512)) count=$((c * 512)) status=none; "
+    bytes=$((bytes + c * 512))
+  done
+  [[ $(stat -c %s -- "$file") == "$bytes" ]] || die "step 3: ${file##*/} is not $bytes bytes"
+  verify "$p" "$file" "{ $cmd}"
+}
+verify() { # $1 name, $2 file, $3 the phone's command for the same bytes
+  local mine theirs
+  mine=$(sha256sum < "$2" | cut -d' ' -f1)
+  theirs=$(phone_sha "$3") || die "step 3: can't read $1's SHA-256 on the phone"
+  [[ $mine == "$theirs" ]] || die "step 3: ${2##*/} differs from $1 read again on the phone; run again"
+  note "${2##*/}: $1, $(mib "$(stat -c %s -- "$2")") MiB, matches the phone"
+}
+
+say "Copying vendor_$slot, system_$slot and $modem ($(mib "$total") MiB) into $W/img"
+copy_super "vendor_$slot" "$W/img/vendor.img"
+copy_super "system_$slot" "$W/img/system.img"
+: > "$W/img/modem.img"
+pull "${DEV[$modem]}" 0 "${SIZE[$modem]}" "$W/img/modem.img"
+verify "$modem" "$W/img/modem.img" "cat $R/dev/${DEV[$modem]}"
+
+# Nothing moved meanwhile
+declare -A before=()
+for p in "${parts[@]}"; do before[$p]=${DEV[$p]}; done
+again=$(probe) || die "step 3: can't reach the phone after the copy; run again"
+check_probe "$again"
+for p in "${parts[@]}"; do
+  [[ ${DEV[$p]} == "${before[$p]}" ]] || die "step 3: $p moved from /dev/${before[$p]} to /dev/${DEV[$p]} during the copy; run again"
+done
+lp_again=$(read_lp) || die "step 3: reading super's metadata again failed"
+[[ $lp_again == "$lp_out" ]] || die "step 3: super's metadata changed during the copy; run again"
+
+is_ext4() { [[ "$(od -An -tx2 -j 1080 -N2 "$1" | tr -d ' ')" == ef53 ]]; }
+is_erofs() { [[ "$(od -An -tx4 -j 1024 -N4 "$1" | tr -d ' ')" == e0f5e1e2 ]]; }
+for p in vendor system; do
+  ! is_erofs "$W/img/$p.img" || die "$p.img is EROFS; this tool reads ext4 only (fsck.erofs --extract support is not written yet)"
+  is_ext4 "$W/img/$p.img" || die "step 3: $p.img is not ext4"
+done
+
+# --- 4. Extract ------------------------------------------------------------------
+xf=(-o "$out" -w "$W")
+((force_device)) && xf=(-f "${xf[@]}")
+say "Extracting the fingerprint tree (on this laptop)"
+# The tree is read in the chroot by uid 1000 (qseecomd, the HAL): its files
+# keep the image's modes (755/644), not this run's private umask, which is
+# for the images alone. The first real run pushed a 700/600 tree the
+# chroot's processes could not read.
+(umask 022; "${extract_cmd[@]}" "${xf[@]}" "$W/img") || die "step 4: tools/extract-fingerprint-vendor-ingot failed (its reason above)"
+for f in root MANIFEST SOURCE; do
+  [[ -e $out/$f ]] || die "step 4: the extractor left no $out/$f"
+done
+[[ -d $out/root && -s $out/MANIFEST && -s $out/SOURCE ]] || die "step 4: $out/root, MANIFEST and SOURCE are not a tree"
+((keep_images)) || rm -rf "$W/img"
+
+# --- 5. Push -----------------------------------------------------------------------
+say "Pushing root, MANIFEST and SOURCE to $DEST"
+n=$(find "$out/root" "$out/MANIFEST" "$out/SOURCE" -type f | wc -l)
+sums=$(cd "$out" && find root MANIFEST SOURCE -type f -print0 | sort -z | xargs -0r sha256sum)
+# The unit's state again, in the same command as the swap
+tar -C "$out" --owner=0 --group=0 --numeric-owner -cf - root MANIFEST SOURCE | phone "set -e
+  d=$R$DEST
+  if systemctl is-active --quiet $UNIT 2>/dev/null; then echo '$UNIT started meanwhile' >&2; exit 3; fi
+  t=\$(mktemp -d \"\$d/.provision.XXXXXX\")
+  trap 'rm -rf \"\$t\"' EXIT
+  tar -C \"\$t\" -xpf - --no-same-owner
+  for x in root MANIFEST SOURCE; do rm -rf \"\$d/\$x\"; mv \"\$t/\$x\" \"\$d/\$x\"; done" ||
+  die "step 5: the push failed; if $UNIT is running, run 'systemctl stop omamobile-fp-ingot' on the phone and run again"
+phone "cd $R$DEST && sha256sum -c --quiet" <<<"$sums" || die "step 5: the files in $DEST don't match after the push"
+note "pushed $n files to $DEST, verified"
+note "source: $(< "$out/SOURCE")"
+[[ $out == "$W/out" ]] || note "the extracted tree stays in $out (the vendor's files: don't share them)"
+
+say "Done. Next, on the phone: systemctl start omamobile-fp-ingot (or reboot; the unit starts by default now the tree is there)"

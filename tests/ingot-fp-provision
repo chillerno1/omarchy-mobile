@@ -1,0 +1,309 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Tests for tools/lib/lp-metadata.py and tools/ingot-fp-provision, with no
+# phone and no vendor files.
+#
+# lp-metadata.py against a synthetic super image built here (geometry and
+# its backup, two metadata slots with correct SHA-256s; in slot 1 a
+# vendor_b of two LINEAR extents, a system_b of one and a zero_b with a
+# ZERO extent; slot 0 its own _a partitions): the extents come back in
+# order, per slot, as lines and as JSON; the ZERO extent, a partition not
+# there, a damaged header, damaged tables and a damaged geometry are
+# refused.
+#
+# tools/ingot-fp-provision against a stand-in phone: a fake /proc, /sys,
+# /dev and /usr tree (the synthetic super and a made-up FAT modem_b as
+# regular files) and a fake phone-ssh that runs each command locally with a
+# stand-in systemctl. --dry-run prints the plan from the partition table and
+# leaves the phone's tree unchanged; the refusals (super writable, modem_b
+# mounted, a PARTNAME twice, the unit active, the wrong board, the test
+# seams without OMAMOBILE_INGOT_FP_TEST=1); and a full run with a stand-in
+# extractor (OMAMOBILE_INGOT_FP_TEST=1, INGOT_FP_EXTRACT): the images it
+# hands the extractor are the extents' bytes, the push lands in the fake
+# /usr/lib/omamobile-fp-ingot and leaves the package's own files alone.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+SRC=$PWD
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+t=$(mktemp -d)
+cleanup() { chmod -R u+w "$t" 2>/dev/null || true; rm -rf "$t"; }
+trap cleanup EXIT
+LP=$SRC/tools/lib/lp-metadata.py
+lp() { python3 -I "$LP" "$@"; }
+
+# --- A synthetic super image --------------------------------------------------
+mkdir -p "$t/gen"
+cat > "$t/gen/mksuper.py" <<'EOF'
+# Writes a synthetic super image: argv[1] the path, argv[2] a damage mode
+# (none, header, tables, geometry). Layout: 4 MiB, metadata_max_size
+# 65536, 2 slots, logical_block_size 4096, data from sector 2048.
+import hashlib, struct, sys
+path, damage = sys.argv[1], sys.argv[2]
+SECTORS = 8192
+MAX, SLOTS, BLOCK = 65536, 2, 4096
+img = bytearray(SECTORS * 512)
+
+def geometry():
+    g = bytearray(4096)
+    struct.pack_into("<II", g, 0, 0x616C4467, 52)
+    struct.pack_into("<III", g, 40, MAX, SLOTS, BLOCK)
+    g[8:40] = hashlib.sha256(bytes(g[:52])).digest()
+    return g
+
+def metadata(parts):
+    # parts: [(name, [(num_sectors, type, data)])]
+    pt, et = b"", b""
+    n = 0
+    for name, exts in parts:
+        pt += name.encode().ljust(36, b"\0") + struct.pack("<IIII", 1, n, len(exts), 0)
+        for num, kind, data in exts:
+            et += struct.pack("<QIQI", num, kind, data, 0)
+        n += len(exts)
+    gt = b"default".ljust(36, b"\0") + struct.pack("<IQ", 0, 0)
+    bt = struct.pack("<QIIQ", 2048, 0, 0, SECTORS * 512) + b"super".ljust(36, b"\0") + struct.pack("<I", 0)
+    tables = pt + et + gt + bt
+    h = bytearray(256)
+    struct.pack_into("<IHHI", h, 0, 0x414C5030, 10, 2, 256)
+    struct.pack_into("<I", h, 44, len(tables))
+    h[48:80] = hashlib.sha256(tables).digest()
+    off = 0
+    for at, t, size in ((80, pt, 52), (92, et, 24), (104, gt, 48), (116, bt, 64)):
+        struct.pack_into("<III", h, at, off, len(t) // size, size)
+        off += len(t)
+    struct.pack_into("<I", h, 128, 0)
+    h[12:44] = hashlib.sha256(bytes(h)).digest()
+    return bytes(h) + tables
+
+slot_parts = [
+    [("vendor_a", [(16, 0, 2048)]), ("system_a", [(16, 0, 2064)])],
+    [("vendor_b", [(24, 0, 4096), (16, 0, 3000)]), ("system_b", [(40, 0, 6000)]),
+     ("zero_b", [(8, 0, 7000), (8, 1, 0)])],
+]
+geo = geometry()
+img[4096:8192] = geo
+img[8192:12288] = geo
+for i, parts in enumerate(slot_parts):
+    md = metadata(parts)
+    base = 4096 + 2 * 4096 + i * MAX
+    img[base:base + len(md)] = md
+    img[base + SLOTS * MAX:base + SLOTS * MAX + len(md)] = md   # the backup copies
+# Recognisable data in each extent, and ext4's magic at byte 1080 of each
+# partition's first extent
+def fill(sector, count, tag):
+    for s in range(sector, sector + count):
+        img[s * 512:(s + 1) * 512] = (f"{tag} sector {s} ".encode() * 64)[:512]
+for name_parts in slot_parts:
+    for name, exts in name_parts:
+        for j, (num, kind, data) in enumerate(exts):
+            if kind == 0:
+                fill(data, num, f"{name}.{j}")
+        num, kind, data = exts[0]
+        struct.pack_into("<H", img, data * 512 + 1080, 0xEF53)
+if damage == "header":
+    img[4096 + 8192 + MAX + 20] ^= 1          # slot 1's header checksum field
+elif damage == "tables":
+    img[4096 + 8192 + MAX + 256 + 3] ^= 1     # slot 1's first partition name
+elif damage == "geometry":
+    img[4096 + 44] ^= 1                       # slot count, under the checksum
+open(path, "wb").write(img)
+EOF
+for d in none header tables geometry; do python3 -I "$t/gen/mksuper.py" "$t/super-$d.img" "$d"; done
+S=$t/super-none.img
+
+out=$(lp "$S" --slot b vendor system) || fail "lp-metadata.py reads the synthetic super: $out"
+[[ $out == "lp 10.2 slot=1 logical_block_size=4096 super_bytes=4194304
+part vendor_b 40 4096,24 3000,16
+part system_b 40 6000,40" ]] || fail "lp-metadata.py's lines for slot b: $out"
+out=$(lp "$S" --slot a vendor_a system) || fail "lp-metadata.py reads slot a: $out"
+[[ $out == *$'\npart vendor_a 16 2048,16\npart system_a 16 2064,16' ]] ||
+  fail "slot a's partitions come from metadata slot 0: $out"
+out=$(lp "$S" --json vendor) || fail "lp-metadata.py --json: $out"
+python3 -I -c 'import json, sys
+d = json.loads(sys.argv[1])
+assert d["slot"] == 1 and d["version"] == "10.2", d
+assert d["partitions"] == [{"name": "vendor_b", "sectors": 40, "extents": [[4096, 24], [3000, 16]]}], d' "$out" ||
+  fail "lp-metadata.py --json: $out"
+out=$(lp "$S" --list) || fail "lp-metadata.py --list: $out"
+grep -qx 'part zero_b 16 linear,zero' <<<"$out" || fail "--list shows zero_b's extent types: $out"
+pass "lp-metadata.py reads a synthetic super: extents in order, per metadata slot, lines and JSON"
+
+refused() { # $1 what, $2 regex of the reason, then the arguments
+  local what=$1 want=$2 got
+  shift 2
+  if got=$(lp "$@" 2>&1); then fail "lp-metadata.py refuses $what: it printed $got"; fi
+  grep -qE "$want" <<<"$got" || fail "lp-metadata.py refuses $what with '$want': $got"
+}
+refused "a ZERO extent" 'zero_b: extent 1 is a ZERO extent' "$S" zero
+refused "a partition that isn't there" 'product_b: found 0 times' "$S" product
+refused "slot b's _a partition" 'vendor_a_b: found 0 times' "$S" vendor_a
+refused "a damaged header" 'metadata slot 1: header checksum mismatch' "$t/super-header.img" vendor
+refused "damaged tables" 'metadata slot 1: tables checksum mismatch' "$t/super-tables.img" vendor
+refused "a damaged geometry" 'geometry at byte 4096: checksum mismatch' "$t/super-geometry.img" vendor
+head -c 65536 /dev/zero > "$t/zeros.img"
+refused "a file that isn't a super" 'no LP geometry' "$t/zeros.img" vendor
+refused "a file too short for a super" 'short read' "$t/gen/mksuper.py" vendor
+refused "slot c (the geometry has 2)" 'metadata slot 2 asked for' "$S" --slot c vendor
+pass "lp-metadata.py refuses a ZERO extent, a missing partition, damaged checksums, not-a-super, a slot past the geometry, a short file"
+
+# --- The stand-in phone ---------------------------------------------------------
+P=$t/phone
+make_phone() {
+  chmod -R u+w "$P" 2>/dev/null || true
+  rm -rf "$P"
+  mkdir -p "$P/proc/device-tree" "$P/dev" "$P/sys/class/block" "$P/usr/lib/omamobile-fp-ingot/bin"
+  printf 'osom,ingot\0qcom,sm8475\0' > "$P/proc/device-tree/compatible"
+  printf '/dev/sda20 / ext4 rw 0 0\n' > "$P/proc/mounts"
+  echo '# the package' > "$P/usr/lib/omamobile-fp-ingot/ingot-fp-stage"
+  echo '# the package' > "$P/usr/lib/omamobile-fp-ingot/bin/librpmb.so"
+  # an older tree, to be replaced
+  mkdir -p "$P/usr/lib/omamobile-fp-ingot/root/old"
+  echo old > "$P/usr/lib/omamobile-fp-ingot/root/old/file"
+  echo old > "$P/usr/lib/omamobile-fp-ingot/SOURCE"
+  local d
+  for d in sda1:super sde34:modem_b sde33:modem_a sda20:userdata; do
+    mkdir -p "$P/sys/class/block/${d%%:*}"
+    printf 'MAJOR=8\nMINOR=1\nDEVNAME=%s\nDEVTYPE=partition\nPARTNAME=%s\n' "${d%%:*}" "${d#*:}" > "$P/sys/class/block/${d%%:*}/uevent"
+    echo 1 > "$P/sys/class/block/${d%%:*}/ro"
+  done
+  echo 0 > "$P/sys/class/block/sda20/ro"
+  cp "$S" "$P/dev/sda1"
+  # modem_b: a made-up FAT boot sector, then filler
+  python3 -I -c 'import sys
+b = bytearray(512 * 64)
+b[0:3] = b"\xeb\x3c\x90"; b[510:512] = b"\x55\xaa"
+for i in range(512, len(b)): b[i] = i % 251
+open(sys.argv[1], "wb").write(b)' "$P/dev/sde34"
+  cp "$P/dev/sde34" "$P/dev/sde33"
+  echo 8192 > "$P/sys/class/block/sda1/size"
+  echo 64 > "$P/sys/class/block/sde34/size"
+  echo 64 > "$P/sys/class/block/sde33/size"
+  echo 8 > "$P/sys/class/block/sda20/size"
+}
+tree_state() { (cd "$P" && find . -printf '%p %m %T@\n' | sort && find . -type f -exec sha256sum {} + | sort); }
+
+mkdir -p "$t/bin"
+cat > "$t/bin/systemctl" <<'EOF'
+#!/bin/bash
+# the unit's state is in $UNIT_STATE (default inactive)
+s=${UNIT_STATE:-inactive}
+[[ $1 == is-active ]] || { echo "systemctl: unexpected $*" >&2; exit 1; }
+[[ $2 == --quiet ]] || echo "$s"
+[[ $s == active ]]
+EOF
+cat > "$t/phone-ssh" <<EOF
+#!/bin/bash
+printf '%s\n---\n' "\$*" >> "\$PHONE_LOG"
+cd "$t" && PATH="$t/bin:\$PATH" exec bash -c "\$*"
+EOF
+chmod +x "$t/bin/systemctl" "$t/phone-ssh"
+export PHONE_SSH=$t/phone-ssh PHONE_LOG=$t/phone.log
+export OMAMOBILE_INGOT_FP_TEST=1 INGOT_FP_PHONE_ROOT=$P INGOT_FP_RETRY_DELAY=0
+
+run() { : > "$PHONE_LOG"; "$SRC/tools/ingot-fp-provision" "$@" 2>&1; }
+
+# --- --dry-run -------------------------------------------------------------------
+make_phone
+chmod -R a-w "$P"
+before=$(tree_state)
+out=$(run --dry-run --work "$t/work") || fail "--dry-run on a good stand-in phone: $out"
+for want in 'super: /dev/sda1, read-only, not mounted, 4 MiB' \
+            'modem_b: /dev/sde34, read-only, not mounted, 1 MiB' \
+            'lp 10.2 slot=1 logical_block_size=4096 super_bytes=4194304' \
+            'vendor_b: 2 extent(s), 40 sectors (1 MiB): 4096,24 3000,16' \
+            'system_b: 1 extent(s), 40 sectors (1 MiB): 6000,40' \
+            'vendor_b: ext4' 'system_b: ext4' 'modem_b: FAT boot sector' \
+            'would copy vendor_b from super (/dev/sda1) extent by extent into img/vendor.img' \
+            'would copy modem_b (/dev/sde34) whole into img/modem.img' \
+            'would run: tools/extract-fingerprint-vendor-ingot -o OUT -w RUN RUN/img' \
+            'would push root, MANIFEST and SOURCE to /usr/lib/omamobile-fp-ingot'; do
+  grep -qF -- "$want" <<<"$out" || fail "--dry-run's plan says '$want': $out"
+done
+[[ $(tree_state) == "$before" ]] || fail "--dry-run leaves the stand-in phone's tree unchanged"
+[[ ! -e $t/work ]] || fail "--dry-run writes nothing on the laptop (no $t/work)"
+! grep -qE 'of=|tar |mktemp|mv |rm ' "$PHONE_LOG" || fail "--dry-run sends no writing command: $(cat "$PHONE_LOG")"
+out=$(run --dry-run --force-device) || fail "--dry-run --force-device: $out"
+grep -qF 'would run: tools/extract-fingerprint-vendor-ingot -f -o OUT' <<<"$out" || fail "--force-device passes -f: $out"
+pass "--dry-run reads super's metadata and the magics, prints the plan, and writes nothing"
+
+# --- Refusals -------------------------------------------------------------------
+refuse() { # $1 what, $2 text of the reason; the stand-in phone as it is
+  local got
+  if got=$(run --dry-run); then fail "the tool refuses $1: it ran: $got"; fi
+  grep -qF -- "$2" <<<"$got" || fail "the tool refuses $1 with '$2': $got"
+}
+make_phone; echo 0 > "$P/sys/class/block/sda1/ro"
+refuse "a writable super" 'super: /dev/sda1 is writable (ro=0)'
+make_phone; echo '/dev/sde34 /mnt vfat ro 0 0' >> "$P/proc/mounts"
+refuse "a mounted modem_b" 'modem_b: /dev/sde34 is mounted'
+make_phone; sed -i 's/PARTNAME=modem_a/PARTNAME=super/' "$P/sys/class/block/sde33/uevent"
+refuse "two partitions named super" 'super: more than one partition has this PARTNAME'
+make_phone; rm -r "$P/sys/class/block/sde34"
+refuse "no modem_b" 'modem_b: not found by PARTNAME'
+make_phone; printf 'google,cheetah\0' > "$P/proc/device-tree/compatible"
+refuse "another phone" "the phone is 'google,cheetah', not a Saga"
+make_phone; rm "$P/usr/lib/omamobile-fp-ingot/ingot-fp-stage"
+refuse "a phone without omamobile-fingerprint" 'install omamobile-fingerprint first'
+make_phone; cp "$t/super-tables.img" "$P/dev/sda1"
+refuse "a damaged super" 'tables checksum mismatch'
+make_phone
+UNIT_STATE=active refuse "the unit active" "Run 'systemctl stop omamobile-fp-ingot' on the phone first"
+export UNIT_STATE=active
+if got=$(run --work "$t/work"); then fail "a real run refuses while the unit is active: $got"; fi
+grep -qF 'is active on the phone' <<<"$got" || fail "a real run refuses while the unit is active: $got"
+[[ ! -e $t/work ]] || fail "nothing is copied while the unit is active"
+unset UNIT_STATE
+if got=$(OMAMOBILE_INGOT_FP_TEST='' "$SRC/tools/ingot-fp-provision" --dry-run 2>&1); then
+  fail "the test seams are refused without OMAMOBILE_INGOT_FP_TEST=1: $got"
+fi
+grep -qF 'INGOT_FP_PHONE_ROOT is a test seam' <<<"$got" || fail "the seams' refusal names the seam: $got"
+pass "refused: super writable, modem_b mounted or missing, a PARTNAME twice, another phone, no package, damaged metadata, the unit active, the seams outside a test"
+
+# --- A full run, with a stand-in extractor -------------------------------------
+make_phone
+cat > "$t/extract" <<EOF
+#!/bin/bash
+# records its arguments and the images, writes a small tree into -o
+echo "\$*" > "$t/extract.args"
+while getopts "o:w:f" o; do case \$o in o) out=\$OPTARG ;; *) ;; esac; done
+shift \$((OPTIND - 1))
+cp "\$1"/vendor.img "\$1"/system.img "\$1"/modem.img "$t/"
+mkdir -p "\$out/root/vendor/bin"
+echo hal > "\$out/root/vendor/bin/hal"
+(cd "\$out/root" && sha256sum vendor/bin/hal | awk '{print \$1, "644", \$2}') > "\$out/MANIFEST"
+echo 'made/up/fingerprint:1' > "\$out/SOURCE"
+EOF
+chmod +x "$t/extract"
+out=$(INGOT_FP_EXTRACT=$t/extract INGOT_FP_CHUNK_BYTES=4096 run --work "$t/work" --out "$t/out") || fail "a full run with a stand-in extractor: $out"
+sectors() { dd if="$S" bs=512 skip="$1" count="$2" status=none; }
+cmp -s "$t/vendor.img" <(sectors 4096 24; sectors 3000 16) || fail "vendor.img is vendor_b's two extents, in order"
+cmp -s "$t/system.img" <(sectors 6000 40) || fail "system.img is system_b's extent"
+cmp -s "$t/modem.img" "$P/dev/sde34" || fail "modem.img is modem_b"
+grep -qx -- "-o $t/out -w $t/work/run\.[A-Za-z0-9]* $t/work/run\.[A-Za-z0-9]*/img" "$t/extract.args" ||
+  fail "the extractor runs on the run directory's img/: $(cat "$t/extract.args")"
+D=$P/usr/lib/omamobile-fp-ingot
+[[ $(cat "$D/root/vendor/bin/hal") == hal && ! -e $D/root/old ]] || fail "the push replaces root"
+[[ $(cat "$D/SOURCE") == made/up/fingerprint:1 && -s $D/MANIFEST ]] || fail "the push replaces SOURCE and MANIFEST"
+[[ -f $D/ingot-fp-stage && -f $D/bin/librpmb.so ]] || fail "the push leaves the package's files alone"
+[[ -z $(find "$D" -name '.provision.*') ]] || fail "the push leaves no temporary directory"
+[[ -z $(ls -A "$t/work") ]] || fail "the run directory is removed at exit: $(ls -A "$t/work")"
+[[ -d $t/out/root ]] || fail "--out keeps the extracted tree"
+# the extractor runs under umask 022 (the tree is read by uid 1000 in the
+# chroot), whatever this shell's umask: the run directory's 077 is for the images
+[[ $(stat -c %a "$t/out/root/vendor/bin") == 755 && $(stat -c %a "$t/out/root/vendor/bin/hal") == 644 &&
+   $(stat -c %a "$D/root/vendor/bin/hal") == 644 ]] ||
+  fail "the extracted and pushed tree keeps 755/644 modes: $(stat -c '%a %n' "$t/out/root/vendor/bin" "$t/out/root/vendor/bin/hal" "$D/root/vendor/bin/hal")"
+grep -qF 'systemctl start omamobile-fp-ingot' <<<"$out" || fail "the run says what to do next: $out"
+grep -qF 'pushed 3 files to /usr/lib/omamobile-fp-ingot, verified' <<<"$out" || fail "the push is verified: $out"
+grep -c '^dd if=.*sda1.*skip=' "$PHONE_LOG" >/dev/null || fail "super is read with dd"
+! grep -qE 'of=/' "$PHONE_LOG" || fail "nothing is written with dd on the phone"
+pass "a full run copies the extents in order, verifies them, runs the extractor on img/ and pushes root, MANIFEST and SOURCE"
+
+# The run stops when the extractor fails, and pushes nothing
+make_phone
+printf '#!/bin/bash\necho "error: no build.prop" >&2\nexit 1\n' > "$t/extract-fail"
+chmod +x "$t/extract-fail"
+if got=$(INGOT_FP_EXTRACT=$t/extract-fail run --work "$t/work"); then fail "a failed extraction stops the run: $got"; fi
+grep -qF 'step 4: tools/extract-fingerprint-vendor-ingot failed' <<<"$got" || fail "a failed extraction names step 4: $got"
+[[ $(cat "$P/usr/lib/omamobile-fp-ingot/SOURCE") == old ]] || fail "a failed extraction pushes nothing"
+pass "a failed extraction stops before the push"
