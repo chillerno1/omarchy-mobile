@@ -616,16 +616,28 @@ section "$hifi" False SectionVerb | grep -q 'VA[ _]' && fail "the False branch s
 grep -q 'SectionDevice."Mic"' <(section "$hifi" False SectionVerb; sed -n '/^\tFalse {/,/^\t}/p' "$hifi") && fail "there is no Mic without the VA macro"
 pass "the sound profile is staged, balanced, sets only controls the card has, and sets both back ends in the verb"
 
-# No speaker protection in the kernel: the gains are fixed at their lowest
-# and nothing in the profile lets the desktop raise them.
+# No speaker protection in the kernel: the gains never go above the vendor's
+# own for media on the speakers (0.1.11): amplifiers at -3 dB (PA Volume 15,
+# the vendor driver's fixed register value 16), the top speaker's digital
+# gain at the vendor's -14 dB (70), the bottom one's at -3 dB (81, 3 dB under
+# the vendor's 0 dB and the kernel's cap). Speaker and Earpiece set them on
+# every enable, because alsactl restores a saved state over BootSequence.
 for amp in SpkrLeft SpkrRight; do
-  grep -q "cset \"name='$amp PA Volume' 12\"" "$card" || fail "$amp's analog gain starts at 12 (-3 dB, the minimum)"
+  grep -q "cset \"name='$amp PA Volume' 15\"" "$card" || fail "the boot sequence sets $amp's analog gain to 15 (-3 dB, the vendor's)"
 done
-[[ -z $(cat "$card" "$hifi" | sed -n "s/.*cset \"name='Spkr[A-Za-z]* PA Volume' \([0-9]*\)\".*/\1/p" | awk '$1 > 12') ]] \
-  || fail "no sequence raises an amplifier's analog gain above 12"
-[[ -z $(cat "$card" "$hifi" | sed -n "s/.*cset \"name='WSA_RX[01] Digital Volume' \([0-9]*\)\".*/\1/p" | awk '$1 > 70') ]] \
-  || fail "the WSA digital gain stays at or below 70 (-14 dB)"
+[[ -z $(cat "$card" "$hifi" | sed -n "s/.*cset \"name='Spkr[A-Za-z]* PA Volume' \([0-9]*\)\".*/\1/p" | awk '$1 > 15') ]] \
+  || fail "no sequence raises an amplifier's analog gain above 15 (the vendor's -3 dB)"
+[[ -z $(cat "$card" "$hifi" | sed -n "s/.*cset \"name='WSA_RX0 Digital Volume' \([0-9]*\)\".*/\1/p" | awk '$1 > 70') ]] \
+  || fail "the top speaker's digital gain stays at or below 70 (-14 dB, the vendor's)"
+[[ -z $(cat "$card" "$hifi" | sed -n "s/.*cset \"name='WSA_RX1 Digital Volume' \([0-9]*\)\".*/\1/p" | awk '$1 > 81') ]] \
+  || fail "the bottom speaker's digital gain stays at or below 81 (-3 dB)"
 [[ $(grep -c "cset \"name='WSA_RX[01] Digital Volume' " "$card") == 2 ]] || fail "the boot sequence sets both WSA digital gains"
+for c in "SpkrLeft PA Volume' 15" "SpkrRight PA Volume' 15" "WSA_RX0 Digital Volume' 70" "WSA_RX1 Digital Volume' 81"; do
+  sed -n '/^SectionDevice."Speaker"/,/^}/p' "$hifi" | grep -q "cset \"name='$c\"" || fail "Speaker sets $c on enable"
+done
+for c in "SpkrLeft PA Volume' 15" "WSA_RX0 Digital Volume' 70"; do
+  sed -n '/^SectionDevice."Earpiece"/,/^}/p' "$hifi" | grep -q "cset \"name='$c\"" || fail "Earpiece sets $c on enable"
+done
 grep -qE "cset \"name='WSA_COMP[12] Switch' 1\"|VISENSE Switch' 1\"" "$card" "$hifi" && fail "the macro's compander and the unused V/I sense stay off"
 grep -qE 'PlaybackMixerElem|PlaybackVolume|PlaybackMasterElem|PlaybackSwitch' "$card" "$hifi" \
   && fail "the profile names no playback mixer element: the desktop's volume is software only"
@@ -644,7 +656,7 @@ for dec in VA_DEC0 VA_DEC1; do
 done
 [[ -z $(sed -n "s/.*cset \"name='VA_DEC[01] Volume' \([0-9]*\)\".*/\1/p" "$hifi" | awk '$1 > 100') ]] \
   || fail "no capture gain above 100 (+16 dB): louder speech would clip"
-pass "the amplifiers start at their lowest gain and the desktop cannot raise them"
+pass "the speaker gains stay at or under the vendor's media values, are set on every enable, and the desktop cannot raise them"
 
 tplg=$r/usr/lib/firmware/updates/qcom/sm8475/SM8475-Solana-Saga-tplg.bin
 [[ -L $tplg && $(readlink "$tplg") == /usr/lib/firmware/qcom/sm8450/SM8450-HDK-tplg.bin ]] \
