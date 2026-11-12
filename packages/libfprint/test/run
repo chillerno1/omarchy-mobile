@@ -11,7 +11,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 tag=${1:-v$(sed -n 's/^pkgver=//p' "$here/PKGBUILD")}
 
 docker run --rm -v "$here:/pkg:ro" archlinux:latest bash -euo pipefail -c "
-  pacman -Sy --noconfirm --needed git patch meson ninja gcc pkgconf glib2 glib2-devel \
+  pacman -Syu --noconfirm --needed git patch meson ninja gcc pkgconf glib2 glib2-devel \
     libgusb gobject-introspection cairo pixman python-gobject >/dev/null
   git -c advice.detachedHead=false clone -q --depth 1 --branch '$tag' \
     https://gitlab.freedesktop.org/libfprint/libfprint.git /b

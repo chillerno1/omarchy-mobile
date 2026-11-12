@@ -9,7 +9,8 @@ Starts a fake omamobile-fp-bridge on a Unix socket that speaks the bridge's
 line protocol with scripted HAL answers, points the driver at it
 (FP_OMAMOBILE_UDFPS), and runs enroll, list, verify (match and no match),
 identify, cancel, a lockout, system sleep mid-verify and mid-enrollment,
-delete and a bridge that goes away. No phone, no HAL: this checks the
+delete and a bridge that goes away; then a bridge for a sensor that is not
+under the display (READY 0 0 0 with a stage count, the Solana Saga's). No phone, no HAL: this checks the
 driver's side of the protocol only.
 """
 import os
@@ -45,6 +46,10 @@ class FakeBridge(threading.Thread):
         self.conn = None
         self.drop_next = False
         self.mute_cancel = False
+        self.ready = "READY 720 2360 120"
+        # None: the Pixel's G7 (40 down by 2); else the PROGRESS remaining
+        # values of one enrollment
+        self.enroll_remaining = None
 
     def send(self, *lines):
         for line in lines:
@@ -56,7 +61,7 @@ class FakeBridge(threading.Thread):
                 self.conn, _ = self.sock.accept()
             except OSError:
                 return
-            self.send("READY 720 2360 120")
+            self.send(self.ready)
             buf = b""
             while True:
                 data = self.conn.recv(256)
@@ -77,6 +82,12 @@ class FakeBridge(threading.Thread):
             if self.hold_enroll:
                 self.send("FINGER NEEDED")
                 return  # wait for CANCEL
+            if self.enroll_remaining is not None:
+                for remaining in self.enroll_remaining:
+                    self.send("ACQUIRED 1 0", f"PROGRESS {ENROLL_ID} {remaining}")
+                self.enrolled.append(ENROLL_ID)
+                self.send(f"ENROLLED {ENROLL_ID}")
+                return
             self.send("FINGER NEEDED", "FINGER DOWN", "ACQUIRED 1 0",
                       f"PROGRESS {ENROLL_ID} 38", "FINGER UP", "FINGER DOWN",
                       "ACQUIRED 2 0", "FINGER UP")
@@ -322,6 +333,48 @@ def main():
         print(f"     ({e.message})")
 
     dev.close_sync()
+
+    # a rear sensor (the Saga): no circle, READY gives the stage count; the
+    # HAL counts down by 1 from 11 (12 touches)
+    bridge.drop_next = False
+    bridge.hold_auth = False
+    bridge.ready = "READY 0 0 0 12"
+    bridge.enroll_remaining = list(range(11, -1, -1))
+    dev.open_sync()
+    check("READY 0 0 0 12: 12 enroll stages", dev.get_nr_enroll_stages() == 12)
+    stages.clear()
+    template = FPrint.Print.new(dev)
+    template.set_finger(FPrint.Finger.RIGHT_INDEX)
+    template.set_username("tester")
+    enrolled = dev.enroll_sync(template, None, progress, None)
+    check("12 stages: enroll completes", enrolled is not None)
+    done_stages = [c for c, e in stages if e is None]
+    check("12 stages: progress 1..11, then 12", done_stages == list(range(1, 13)))
+    bridge.auth_answers = [f"MATCH {ENROLL_ID}"]
+    check("12 stages: verify matches", dev.verify_sync(enrolled)[0])
+    dev.close_sync()
+
+    # more touches than announced: progress stays below the count until
+    # ENROLLED
+    bridge.ready = "READY 0 0 0 4"
+    bridge.enroll_remaining = [5, 4, 3, 2, 1, 0]
+    dev.open_sync()
+    stages.clear()
+    template = FPrint.Print.new(dev)
+    template.set_finger(FPrint.Finger.RIGHT_INDEX)
+    template.set_username("tester")
+    enrolled = dev.enroll_sync(template, None, progress, None)
+    done_stages = [c for c, e in stages if e is None]
+    check("4 stages, 6 touches: 1 2 3 3 3, then 4", done_stages == [1, 2, 3, 3, 3, 4])
+    dev.close_sync()
+
+    # a count out of range, and none: the Pixels' 20 again
+    for ready in ("READY 0 0 0 0", "READY 720 2360 120"):
+        bridge.ready = ready
+        dev.open_sync()
+        check(f"{ready}: 20 enroll stages", dev.get_nr_enroll_stages() == 20)
+        dev.close_sync()
+
     bridge.sock.close()
     print(f"{failures} failure(s)")
     return 1 if failures else 0

@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""bridge-test: drive the Saga's bridge (omamobile-fp-bridge-ingot) with our
+fake HAL (fingerprint.fake.so, test/fakehal.c) on the build computer, under
+qemu-aarch64 user emulation, through its socket.
+
+    test/bridge-test OUT CHROOT      (make check NDK=... CHROOT=...)
+
+OUT holds the bionic builds (make test), CHROOT is the vendor tree they were
+linked against: its linker and bionic libraries are copied into a temporary
+tree (qemu's -L does not follow the tree's absolute links), never anywhere
+else, and removed afterwards. Without qemu-aarch64(-static) it skips.
+
+Covers the protocol engine: LIST/DELETE end on the HAL's word, on CANCEL, on
+the client going away and at the --list-timeout deadline (a HAL that never
+ends an enumerate or a remove must not leave the bridge busy); ENROLL's
+--enroll-timeout reaching the HAL; an error and a disconnect in the middle
+of an ENROLL.
+"""
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+FAILS = []
+
+
+def ok(cond, what):
+    print(("ok - " if cond else "not ok - ") + what)
+    if not cond:
+        FAILS.append(what)
+
+
+BRIDGES = []
+
+
+class Bridge:
+    def __init__(self, t, args=(), env=None):
+        BRIDGES.append(self)
+        self.t, self.sock = t, os.path.join(t.dir, "s")
+        self.logpath = os.path.join(t.dir, "bridge.log")
+        if os.path.exists(self.sock):
+            os.unlink(self.sock)
+        e = {"PATH": os.environ.get("PATH", "/usr/bin"), "LD_LIBRARY_PATH": "/system/lib64",
+             "FAKEHAL_STEP_MS": "100"}
+        e.update(env or {})
+        self.log = open(self.logpath, "w")
+        self.p = subprocess.Popen(
+            [t.qemu, "-L", t.root, os.path.join(t.out, "omamobile-fp-bridge-ingot"),
+             "--socket", self.sock, "--state", os.path.join(t.dir, "state"),
+             "--module", os.path.join(t.out, "fingerprint.fake.so"), *args],
+            stdin=subprocess.DEVNULL, stdout=self.log, stderr=subprocess.STDOUT, env=e)
+        for _ in range(200):
+            if os.path.exists(self.sock) or self.p.poll() is not None:
+                break
+            time.sleep(0.05)
+
+    def text(self):
+        with open(self.logpath) as f:
+            return f.read()
+
+    def close(self):
+        if self.log.closed:
+            return
+        if self.p.poll() is None:
+            self.p.terminate()
+            try:
+                self.p.wait(5)
+            except subprocess.TimeoutExpired:
+                self.p.kill()
+                self.p.wait()
+        self.log.close()
+
+
+class Client:
+    def __init__(self, b):
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.s.connect(b.sock)
+        self.buf = b""
+        self.ready = self.line(5)
+
+    def send(self, text):
+        self.s.sendall(text.encode() + b"\n")
+
+    def line(self, timeout):
+        """The next line, or None after TIMEOUT s (or at EOF)."""
+        end = time.monotonic() + timeout
+        while b"\n" not in self.buf:
+            left = end - time.monotonic()
+            if left <= 0:
+                return None
+            self.s.settimeout(left)
+            try:
+                chunk = self.s.recv(4096)
+            except (socket.timeout, TimeoutError):
+                return None
+            if not chunk:
+                return None
+            self.buf += chunk
+        l, self.buf = self.buf.split(b"\n", 1)
+        return l.decode()
+
+    def until(self, words, timeout):
+        """Lines up to the first whose first word is in WORDS; (lines, last)."""
+        seen = []
+        end = time.monotonic() + timeout
+        while True:
+            l = self.line(max(0.0, end - time.monotonic()))
+            if l is None:
+                return seen, None
+            seen.append(l)
+            if l.split(" ", 1)[0] in words:
+                return seen, l
+
+    def close(self):
+        self.s.close()
+
+
+FINAL = ("ENROLLED", "MATCH", "NOMATCH", "LIST", "DELETED", "LOCKOUT", "ERROR", "OK")
+
+
+def idle(b, what):
+    """A new client gets READY, and STATUS answers READY and OK (not ERROR 2)."""
+    c = Client(b)
+    c.send("STATUS")
+    lines, last = c.until(FINAL, 5)
+    c.close()
+    ok(c.ready == "READY 0 0 0" and last == "OK", f"{what}: the bridge is idle again (STATUS: {lines})")
+
+
+SECTIONS = []
+
+
+def section(fn):
+    SECTIONS.append(fn)
+    return fn
+
+
+@section
+def t0(t):
+    """The HAL's own end, and the enroll timeout's default."""
+    b = Bridge(t, env={"FAKEHAL_LIST": "7 9"})
+    c = Client(b)
+    c.send("LIST")
+    _, last = c.until(FINAL, 5)
+    ok(last == "LIST 7 9", f"LIST ended by the HAL: {last}")
+    c.send("DELETE 9")
+    _, last = c.until(FINAL, 5)
+    ok(last == "DELETED 9", f"DELETE answered by the HAL: {last}")
+    c.send("ENROLL")
+    _, last = c.until(FINAL, 5)
+    ok(last == "ENROLLED 7", f"ENROLL: {last}")
+    c.close()
+    b.close()
+    log = b.text()
+    ok("fakehal: error:" not in log,
+       "the enrol token passes the Saga HAL's checks (a non-zero timestamp, the challenge, version 0)")
+    ok("fakehal: enroll timeout_sec 60" in log, "the default enroll timeout (60 s) reaches the HAL")
+    ok("enroll timeout 60 s, LIST/DELETE deadline 5 s" in log, "the bridge logs its timeouts at start")
+
+
+@section
+def t1(t):
+    """--enroll-timeout reaches the HAL."""
+    b = Bridge(t, ["--enroll-timeout", "240"])
+    c = Client(b)
+    c.send("ENROLL")
+    _, last = c.until(FINAL, 5)
+    c.close()
+    b.close()
+    ok(last == "ENROLLED 7" and "fakehal: enroll timeout_sec 240" in b.text(),
+       "--enroll-timeout 240 reaches the HAL's enroll()")
+
+
+@section
+def t2(t):
+    """An enumerate that never ends, no templates: the deadline answers LIST."""
+    b = Bridge(t, ["--list-timeout", "1"], {"FAKEHAL_ENUM_HANG": "1", "FAKEHAL_LIST": " "})
+    c = Client(b)
+    t0 = time.monotonic()
+    c.send("LIST")
+    _, last = c.until(FINAL, 5)
+    dt = time.monotonic() - t0
+    ok(last == "LIST" and 0.9 <= dt < 3, f"LIST with no end from the HAL: '{last}' after {dt:.1f} s (deadline 1 s)")
+    c.send("STATUS")
+    _, last = c.until(FINAL, 5)
+    ok(last == "OK", f"after the deadline the same client is served: {last}")
+    c.close()
+    # ... with templates: what was enumerated.
+    b.close()
+    b = Bridge(t, ["--list-timeout", "1"], {"FAKEHAL_ENUM_HANG": "1", "FAKEHAL_LIST": "7 9"})
+    c = Client(b)
+    c.send("LIST")
+    _, last = c.until(FINAL, 5)
+    ok(last == "LIST 7 9", f"LIST, no end from the HAL, two ids: '{last}' at the deadline")
+    c.close()
+    b.close()
+    ok("LIST: no end from the HAL (timeout); 2 id(s) so far" in b.text(), "the deadline is logged")
+
+
+@section
+def t3(t):
+    """CANCEL and the client going away end a LIST before the deadline."""
+    b = Bridge(t, ["--list-timeout", "60"], {"FAKEHAL_ENUM_HANG": "1", "FAKEHAL_LIST": "7 9"})
+    c = Client(b)
+    c.send("LIST")
+    time.sleep(0.5)		# the two enumerated ids arrive
+    t0 = time.monotonic()
+    c.send("CANCEL")
+    _, last = c.until(FINAL, 5)
+    ok(last == "LIST 7 9" and time.monotonic() - t0 < 1, f"CANCEL during LIST: '{last}' (what was enumerated)")
+    c.send("LIST")
+    time.sleep(0.3)
+    c.close()			# gone in the middle of a LIST
+    idle(b, "a client gone during LIST")
+    c = Client(b)
+    c.send("LIST")
+    time.sleep(0.3)
+    c2 = Client(b)		# a new client replaces one in the middle of a LIST
+    c2.send("STATUS")
+    _, last = c2.until(FINAL, 5)
+    ok(last == "OK", f"a new client during LIST is served: {last}")
+    c2.close()
+    c.close()
+    b.close()
+    ok("LIST: no end from the HAL (client gone)" in b.text(), "the abandoned LIST is logged")
+
+
+@section
+def t4(t):
+    """A remove that never answers: never DELETED."""
+    b = Bridge(t, ["--list-timeout", "1"], {"FAKEHAL_REMOVE_HANG": "1"})
+    c = Client(b)
+    c.send("DELETE 7")
+    lines, last = c.until(FINAL, 5)
+    ok(last == "ERROR 3" and not any(l.startswith("DELETED") for l in lines),
+       f"DELETE with no answer from the HAL: '{last}' at the deadline (3: timeout)")
+    c.send("STATUS")
+    _, last = c.until(FINAL, 5)
+    ok(last == "OK", f"after the DELETE deadline: {last}")
+    c.close()
+    b.close()
+    ok("DELETE 7: no answer from the HAL (timeout); not confirmed" in b.text(), "the DELETE deadline is logged")
+    b = Bridge(t, ["--list-timeout", "60"], {"FAKEHAL_REMOVE_HANG": "1"})
+    c = Client(b)
+    c.send("DELETE 7")
+    time.sleep(0.3)
+    c.send("CANCEL")
+    lines, last = c.until(FINAL, 5)
+    ok(last == "ERROR 5" and not any(l.startswith("DELETED") for l in lines), f"CANCEL during DELETE: '{last}'")
+    c.send("DELETE 7")
+    time.sleep(0.3)
+    c.close()
+    idle(b, "a client gone during DELETE")
+    b.close()
+    b = Bridge(t, ["--list-timeout", "1"], {"FAKEHAL_REMOVE_ID": "9"})
+    c = Client(b)
+    c.send("DELETE 7")
+    lines, last = c.until(FINAL, 5)
+    c.close()
+    b.close()
+    ok(last == "ERROR 3" and "removed 9 (remaining 0), not the 7 asked: ignored" in b.text(),
+       f"DELETE 7 answered with another id's removal is not confirmed: '{last}'")
+
+
+@section
+def t5(t):
+    """An error in the middle of ENROLL: one ERROR line, FINGER UP, then idle."""
+    b = Bridge(t, env={"FAKEHAL_ENROLL_ERROR": "3"})
+    c = Client(b)
+    c.send("ENROLL")
+    lines, last = c.until(FINAL, 5)
+    ok(last == "ERROR 3", f"a HAL error during ENROLL: {last}")
+    l = c.line(1)
+    ok(l == "FINGER UP", f"FINGER UP after it: {l}")
+    c.send("STATUS")
+    _, last = c.until(FINAL, 5)
+    ok(last == "OK", f"idle after the HAL's error: {last}")
+    c.close()
+    b.close()
+
+
+@section
+def t6(t):
+    """The client gone in the middle of ENROLL: the HAL's enrolment is cancelled."""
+    b = Bridge(t, env={"FAKEHAL_ENROLL_STEPS": "40"})
+    c = Client(b)
+    c.send("ENROLL")
+    c.until(("PROGRESS",), 5)
+    c.close()
+    time.sleep(0.5)
+    idle(b, "a client gone during ENROLL")
+    b.close()
+    log = b.text()
+    ok("bridge: cancel()" in log and "HAL error 5 (CANCELED)" in log,
+       "a client gone during ENROLL cancels the HAL's enrolment")
+
+
+def tests(t):
+    for fn in SECTIONS:
+        try:
+            fn(t)
+        except Exception as e:		# a bridge that would not start, a hang
+            ok(False, f"{fn.__doc__} {type(e).__name__}: {e}")
+        for b in BRIDGES:
+            b.close()
+        BRIDGES.clear()
+
+
+def main(argv):
+    if len(argv) != 2:
+        sys.exit("usage: bridge-test OUT CHROOT")
+    out, chroot = (os.path.abspath(a) for a in argv)
+    qemu = shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")
+    if not qemu:
+        print("skip - no qemu-aarch64(-static): the bridge's host test needs it")
+        return 0
+    for f in ("omamobile-fp-bridge-ingot", "fingerprint.fake.so"):
+        if not os.path.isfile(os.path.join(out, f)):
+            sys.exit(f"bridge-test: no {out}/{f} (make test first)")
+
+    class T:
+        pass
+    t = T()
+    t.out, t.qemu = out, qemu
+    t.dir = tempfile.mkdtemp(prefix="ingot-bridge-test.")
+    try:
+        t.root = os.path.join(t.dir, "root")
+        os.makedirs(os.path.join(t.root, "system/bin"))
+        os.makedirs(os.path.join(t.root, "system/lib64"))
+        shutil.copy(os.path.join(chroot, "apex/com.android.runtime/bin/linker64"),
+                    os.path.join(t.root, "system/bin/linker64"))
+        for lib in ("bionic/libc.so", "bionic/libdl.so", "bionic/libm.so", "bionic/libdl_android.so"):
+            shutil.copy(os.path.join(chroot, "apex/com.android.runtime/lib64", lib),
+                        os.path.join(t.root, "system/lib64"))
+        for lib in ("ld-android.so", "liblog.so"):
+            shutil.copy(os.path.join(chroot, "system/lib64", lib), os.path.join(t.root, "system/lib64"))
+        tests(t)
+    finally:
+        shutil.rmtree(t.dir, ignore_errors=True)
+    if FAILS:
+        print(f"{len(FAILS)} failed")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

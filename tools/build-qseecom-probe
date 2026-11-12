@@ -1,0 +1,51 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Build tools/qseecom-probe.c into a static aarch64 binary (musl) for the
+# phone's Arch Linux ARM userland. Never connects to a phone.
+#
+# Usage: tools/build-qseecom-probe --out DIR [--qseecom-h PATH]
+#
+# --qseecom-h is the phone kernel's include/uapi/linux/qseecom.h: given, the
+# build also checks every struct size, field offset and ioctl number the
+# probe re-declares against it (-DQSEECOM_REF_HEADER).
+# Docker runs an aarch64 Alpine builder, as tools/build-ingot-probe does;
+# x86 hosts need a binfmt handler.
+set -euo pipefail
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+out="" ref=""
+die() { echo "error: $*" >&2; exit 1; }
+while (($#)); do
+  case $1 in
+    --out) out=${2:?}; shift ;;
+    --qseecom-h) ref=${2:?}; shift ;;
+    -h|--help) sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+  shift
+done
+[[ -n $out ]] || die "--out DIR is required"
+command -v docker >/dev/null || die 'Docker is required'
+mkdir -p "$out"
+out=$(cd -- "$out" && pwd)
+mounts=(--mount "type=bind,source=$ROOT/tools/qseecom-probe.c,target=/src/qseecom-probe.c,readonly"
+        --mount "type=bind,source=$out,target=/out")
+check=""
+if [[ -n $ref ]]; then
+  [[ -f $ref ]] || die "no such file: $ref"
+  ref=$(cd -- "$(dirname -- "$ref")" && pwd)/$(basename -- "$ref")
+  [[ $ref != *,* ]] || die 'Docker bind paths cannot contain commas'
+  mounts+=(--mount "type=bind,source=$ref,target=/ref/qseecom.h,readonly")
+  check='-DQSEECOM_REF_HEADER="/ref/qseecom.h"'
+fi
+
+docker run --rm --platform linux/arm64 "${mounts[@]}" -e CHECK="$check" -e UID_GID="$(id -u):$(id -g)" \
+  alpine:3.22 sh -euc '
+    apk add -q --no-progress gcc musl-dev linux-headers >/dev/null
+    # shellcheck disable=SC2086
+    gcc -std=gnu11 -O2 -Wall -Wextra -Werror -static -s $CHECK \
+      -o /out/qseecom-probe /src/qseecom-probe.c
+    chown "$UID_GID" /out/qseecom-probe
+    gcc --version | head -1'
+[[ -n $ref ]] && echo "Checked against $ref"
+file "$out/qseecom-probe" 2>/dev/null || true
+sha256sum "$out/qseecom-probe"

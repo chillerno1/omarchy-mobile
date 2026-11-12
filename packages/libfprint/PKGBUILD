@@ -4,6 +4,8 @@
 # one more driver, omamobile_udfps (omamobile-udfps.c), which reaches the
 # phone's under-display sensor through omamobile-fp-bridge
 # (packages/omamobile-fingerprint, device/cheetah/FINGERPRINT-PLAN.md).
+# The same driver serves the Solana Saga's rear sensor through its bridge,
+# which announces its enrollment's stage count in READY.
 # The driver is a "virtual" type device: it appears only when fprintd's
 # environment names the bridge's socket (FP_OMAMOBILE_UDFPS, set by
 # omamobile-fingerprint's fprintd drop-in), so this build behaves exactly
@@ -15,7 +17,7 @@
 
 pkgname=libfprint
 pkgver=1.94.100
-pkgrel=1.7
+pkgrel=1.8
 _tag=v$pkgver
 pkgdesc="Library for fingerprint readers (Omarchy Mobile: Pixel under-display sensors)"
 arch=(aarch64)
@@ -29,7 +31,7 @@ source=("git+https://gitlab.freedesktop.org/libfprint/libfprint.git#tag=$_tag"
         omamobile-udfps.c)
 sha256sums=('SKIP'
             '931c2e1aa2164f704a9d5e629460938d89e33567ac2a340c848b6c109ea6beff'
-            'ea0560ba96bdb9231917d81b3098d84525e6fa57b9a4743d462c6e67dc47548e')
+            '13a342a75617ddd0d7f726b353a39ed3645c6cba4638487130139750d812116d')
 
 prepare() {
   cd libfprint

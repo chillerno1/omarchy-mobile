@@ -26,12 +26,17 @@
  * that serves a line protocol on a Unix socket (root only):
  *
  *   -> ENROLL | AUTH | LIST | DELETE <id> | CANCEL
- *   <- READY <x> <y> <r>                    once, on connect
+ *   <- READY <x> <y> <r> [<stages>]         once, on connect
  *      FINGER NEEDED | FINGER DOWN | FINGER UP
  *      ACQUIRED <code> <vendor>
  *      PROGRESS <id> <remaining>
  *      ENROLLED <id> | MATCH <id> | NOMATCH | LIST <id>... | DELETED <id>
  *      LOCKOUT <ms> | ERROR <code>          (5: canceled)
+ *
+ * READY's sensor circle is 0 0 0 for a sensor that is not under the
+ * display (the Solana Saga's, on the back); this driver doesn't use it.
+ * <stages>, when given, is the number of good touches an enrollment takes
+ * (the HAL's PROGRESS count); without it, 20 (the Pixels').
  *
  * The device appears when FP_OMAMOBILE_UDFPS names the socket (fprintd's
  * environment). A print's data is the HAL's enrollment id; the templates
@@ -46,8 +51,11 @@
 
 #include <gio/gunixsocketaddress.h>
 
-/* Goodix's G7 counts an enrollment down by 2 per good touch from 40. */
+/* Goodix's G7 counts an enrollment down by 2 per good touch from 40: the
+ * stage count when READY gives none. */
 #define OMAMOBILE_UDFPS_ENROLL_STAGES 20
+/* A sane bound for READY's count */
+#define OMAMOBILE_UDFPS_MAX_STAGES 100
 
 /* android.hardware.biometrics.fingerprint Error and AcquiredInfo */
 enum {
@@ -215,6 +223,7 @@ handle_enroll (FpiDeviceOmamobileUdfps *self, gchar **argv)
   FpDevice *dev = FP_DEVICE (self);
   FpPrint *print = NULL;
   gint32 id, remaining;
+  gint stages = fp_device_get_nr_enroll_stages (dev);
 
   fpi_device_get_enroll_data (dev, &print);
 
@@ -228,7 +237,7 @@ handle_enroll (FpiDeviceOmamobileUdfps *self, gchar **argv)
   else if (g_str_equal (argv[0], "PROGRESS") && argv[1] && argv[2])
     {
       remaining = atoi (argv[2]);
-      if (remaining > 0 && self->enroll_stages < OMAMOBILE_UDFPS_ENROLL_STAGES - 1)
+      if (remaining > 0 && self->enroll_stages < stages - 1)
         self->enroll_stages++;
       if (remaining > 0)
         fpi_device_enroll_progress (dev, self->enroll_stages, NULL, NULL);
@@ -239,7 +248,7 @@ handle_enroll (FpiDeviceOmamobileUdfps *self, gchar **argv)
       fpi_print_set_type (print, FPI_PRINT_RAW);
       fpi_print_set_device_stored (print, TRUE);
       g_object_set (print, "fpi-data", g_variant_new ("(i)", id), NULL);
-      fpi_device_enroll_progress (dev, OMAMOBILE_UDFPS_ENROLL_STAGES, NULL, NULL);
+      fpi_device_enroll_progress (dev, stages, NULL, NULL);
       fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
     }
   else if (g_str_equal (argv[0], "LOCKOUT"))
@@ -449,6 +458,52 @@ read_next_line (FpiDeviceOmamobileUdfps *self)
                                        self->cancellable, line_read_cb, self);
 }
 
+/* READY <x> <y> <r> [<stages>]: the stage count, set before the open
+ * completes, so fprintd's num-enroll-stages is right once a client has
+ * claimed the device. */
+static void
+ready_read_cb (GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  FpiDeviceOmamobileUdfps *self = user_data;
+  g_autoptr(GError) error = NULL;
+  g_autofree char *line = NULL;
+  g_auto(GStrv) argv = NULL;
+  gint stages = OMAMOBILE_UDFPS_ENROLL_STAGES;
+
+  line = g_data_input_stream_read_line_finish (G_DATA_INPUT_STREAM (source), res, NULL, &error);
+  if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+    return;		/* closing; self may be going away */
+  if (!line)
+    {
+      g_clear_object (&self->input);
+      self->output = NULL;
+      g_clear_object (&self->connection);
+      fpi_device_open_complete (FP_DEVICE (self),
+                                error ? g_steal_pointer (&error) :
+                                fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                                          "The fingerprint service closed the connection"));
+      return;
+    }
+  fp_dbg ("<- %s", line);
+  argv = g_strsplit (line, " ", -1);
+  if (g_str_equal (argv[0], "READY") && g_strv_length (argv) >= 5)
+    {
+      gint n = atoi (argv[4]);
+
+      if (n > 0 && n <= OMAMOBILE_UDFPS_MAX_STAGES)
+        stages = n;
+      else
+        fp_warn ("ignoring READY's stage count %s", argv[4]);
+    }
+  else if (!g_str_equal (argv[0], "READY"))
+    fp_warn ("expected READY, got: %s", line);
+  if (stages != fp_device_get_nr_enroll_stages (FP_DEVICE (self)))
+    fpi_device_set_nr_enroll_stages (FP_DEVICE (self), stages);
+
+  read_next_line (self);
+  fpi_device_open_complete (FP_DEVICE (self), NULL);
+}
+
 static void
 connect_cb (GObject *source, GAsyncResult *res, gpointer user_data)
 {
@@ -467,8 +522,8 @@ connect_cb (GObject *source, GAsyncResult *res, gpointer user_data)
     g_io_stream_get_input_stream (G_IO_STREAM (connection)));
   g_data_input_stream_set_newline_type (self->input, G_DATA_STREAM_NEWLINE_TYPE_LF);
   self->output = g_io_stream_get_output_stream (G_IO_STREAM (connection));
-  read_next_line (self);
-  fpi_device_open_complete (FP_DEVICE (self), NULL);
+  g_data_input_stream_read_line_async (self->input, G_PRIORITY_DEFAULT,
+                                       self->cancellable, ready_read_cb, self);
 }
 
 /* --- device operations --- */

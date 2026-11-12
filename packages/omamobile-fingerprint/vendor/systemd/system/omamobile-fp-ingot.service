@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: MIT
+# The Solana Saga's (ingot) fingerprint stack: the vendor's qseecomd with
+# our stub RPMB and SSD listener libraries, and omamobile-fp-bridge-ingot,
+# which hosts the vendor fingerprint HAL and serves fprintd's omamobile_udfps
+# driver at /run/omamobile-fp/sock/bridge.sock (the runner's "bridge" stage;
+# ingot-fp-stage's header lists what it allows the chroot).
+#
+# Opt-in: the package does not enable it (systemctl enable --now
+# omamobile-fp-ingot). Neither the vendor's files nor the bionic programs
+# are part of the package, so it is skipped (logged as an unmet condition)
+# until both are in place:
+#   /usr/lib/omamobile-fp-ingot/root   tools/extract-fingerprint-vendor-ingot
+#                                      (the user's own files)
+#   /usr/lib/omamobile-fp-ingot/bin    librpmb.so, libssd.so,
+#                                      omamobile-fp-bridge-ingot and
+#                                      omamobile-fp-shim.so (fingerprint/ingot)
+# and the runner refuses, with its reasons in the journal, if they are not
+# what it expects. Everything persistent lives in /var/lib/omamobile-fp-ingot
+# on the root file system: no partition, no RPMB, no block device.
+[Unit]
+Description=Omarchy Mobile fingerprint for the Solana Saga (vendor HAL and bridge)
+After=systemd-modules-load.service
+ConditionPathIsDirectory=/usr/lib/omamobile-fp-ingot/root
+ConditionPathExists=/usr/lib/omamobile-fp-ingot/bin/omamobile-fp-bridge-ingot
+ConditionPathExists=/usr/lib/omamobile-fp-ingot/bin/librpmb.so
+ConditionPathExists=/usr/lib/omamobile-fp-ingot/bin/libssd.so
+
+[Service]
+ExecStart=/usr/lib/omamobile-fp-ingot/ingot-fp-stage bridge --image /usr/lib/omamobile-fp-ingot/root --bin /usr/lib/omamobile-fp-ingot/bin --state /var/lib/omamobile-fp-ingot
+# TERM to the runner only: it stops the bridge first (the HAL closes, the
+# trusted app unloads), then qseecomd; whatever is left after the timeout
+# gets KILL.
+KillMode=mixed
+TimeoutStopSec=30
+# Until S4 has shown how the trusted app takes a restart: a failed stack
+# stays failed, and the lock screen uses the password.
+Restart=no
+# No ExecStopPost cleanup of the socket directory: it is the Pixel runner's
+# path too. A stale socket refuses connections (fprintd lists no device), and
+# the next start replaces it.
+
+[Install]
+WantedBy=multi-user.target

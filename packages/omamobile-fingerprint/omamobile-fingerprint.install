@@ -3,6 +3,8 @@ post_install() {
   echo "omamobile-fingerprint: omamobile-fp starts at boot once Google's files are in"
   echo "  /usr/lib/omamobile-fp/root (tools/phone-provision). Its first start copies"
   echo "  mfg_data and persist:/ss read-only and writes Trusty's secure storage."
+  echo "  On the Solana Saga: omamobile-fp-ingot (off by default) runs once the vendor's"
+  echo "  files are in /usr/lib/omamobile-fp-ingot/root and our programs in .../bin."
 }
 post_upgrade() {
   systemctl daemon-reload 2>/dev/null || true
@@ -16,4 +18,5 @@ post_upgrade() {
 }
 pre_remove() {
   systemctl disable --now omamobile-fp.service 2>/dev/null || true
+  systemctl disable --now omamobile-fp-ingot.service 2>/dev/null || true
 }

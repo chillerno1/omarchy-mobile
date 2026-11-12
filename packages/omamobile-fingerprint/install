@@ -27,6 +27,15 @@ install -Dm644 vendor/systemd/system/omamobile-fp.service "$d/usr/lib/systemd/sy
 # inert until tools/phone-provision has pushed Google's files.
 install -d "$d/usr/lib/systemd/system/multi-user.target.wants"
 ln -sfn ../omamobile-fp.service "$d/usr/lib/systemd/system/multi-user.target.wants/omamobile-fp.service"
+# The Solana Saga (ingot): its runner and its unit, NOT enabled (opt-in,
+# systemctl enable --now omamobile-fp-ingot). The vendor's files
+# (tools/extract-fingerprint-vendor-ingot) go to /usr/lib/omamobile-fp-ingot/root
+# and the bionic programs (fingerprint/ingot) to /usr/lib/omamobile-fp-ingot/bin,
+# by hand; until then the unit is skipped. fprintd's drop-in and the PAM file
+# below serve both phones.
+install -Dm755 lib/ingot-fp-stage "$d/usr/lib/omamobile-fp-ingot/ingot-fp-stage"
+install -Dm644 vendor/systemd/system/omamobile-fp-ingot.service \
+  "$d/usr/lib/systemd/system/omamobile-fp-ingot.service"
 install -Dm644 vendor/pam.d/omarchy-lock-fingerprint "$d/etc/pam.d/omarchy-lock-fingerprint"
 install -Dm644 vendor/systemd/system/fprintd.service.d/omamobile-udfps.conf \
   "$d/usr/lib/systemd/system/fprintd.service.d/omamobile-udfps.conf"
