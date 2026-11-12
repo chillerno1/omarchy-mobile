@@ -638,7 +638,17 @@ done
 for c in "SpkrLeft PA Volume' 15" "WSA_RX0 Digital Volume' 70"; do
   sed -n '/^SectionDevice."Earpiece"/,/^}/p' "$hifi" | grep -q "cset \"name='$c\"" || fail "Earpiece sets $c on enable"
 done
-grep -qE "cset \"name='WSA_COMP[12] Switch' 1\"|VISENSE Switch' 1\"" "$card" "$hifi" && fail "the macro's compander and the unused V/I sense stay off"
+grep -qE "VISENSE Switch' 1\"" "$card" "$hifi" && fail "the unused V/I sense stays off"
+# The macro's compander: on with the Speaker device and off again when it is
+# disabled, as the vendor's speaker path sets it; off at boot and nowhere else.
+for c in 1 2; do
+  sed -n '/^SectionDevice."Speaker"/,/^}/p' "$hifi" | sed -n '/EnableSequence/,/\]/p' \
+    | grep -q "cset \"name='WSA_COMP$c Switch' 1\"" || fail "Speaker turns WSA_COMP$c on when enabled"
+  sed -n '/^SectionDevice."Speaker"/,/^}/p' "$hifi" | sed -n '/DisableSequence/,/\]/p' \
+    | grep -q "cset \"name='WSA_COMP$c Switch' 0\"" || fail "Speaker turns WSA_COMP$c off when disabled"
+done
+grep -q "cset \"name='WSA_COMP[12] Switch' 1\"" "$card" && fail "the boot sequence leaves the compander off"
+sed -n '/^SectionDevice."Earpiece"/,/^}/p' "$hifi" | grep -q "WSA_COMP[12] Switch' 1" && fail "the Earpiece leaves the compander off"
 grep -qE 'PlaybackMixerElem|PlaybackVolume|PlaybackMasterElem|PlaybackSwitch' "$card" "$hifi" \
   && fail "the profile names no playback mixer element: the desktop's volume is software only"
 for dev in Speaker Earpiece Mic; do grep -q "^[[:space:]]*SectionDevice.\"$dev\"" "$hifi" || fail "the profile has the $dev device"; done
