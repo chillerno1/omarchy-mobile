@@ -10,11 +10,14 @@ line protocol with scripted HAL answers, points the driver at it
 (FP_OMAMOBILE_UDFPS), and runs enroll, list, verify (match and no match),
 identify, cancel, a lockout, system sleep mid-verify and mid-enrollment,
 delete and a bridge that goes away; then a bridge for a sensor that is not
-under the display (READY 0 0 0 with a stage count, the Solana Saga's). No phone, no HAL: this checks the
-driver's side of the protocol only.
+under the display (READY 0 0 0 with a stage count, the Solana Saga's); then
+the device's name, from a fake device tree (FP_OMAMOBILE_UDFPS_DT), one
+process per name since a context makes its devices once. No phone, no HAL:
+this checks the driver's side of the protocol only.
 """
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -125,6 +128,55 @@ def check(what, ok):
     print(f"{'ok  ' if ok else 'FAIL'} {what}")
     if not ok:
         failures += 1
+
+
+FALLBACK_NAME = "Fingerprint sensor (Omarchy Mobile)"
+NAME_CASES = [
+    # (model, compatible, expected name)
+    (b"Solana Mobile Saga\0", b"osom,ingot\0qcom,sm8475\0",
+     "Solana Mobile Saga rear fingerprint sensor (Omarchy Mobile)"),
+    (b"Google Pixel 7 Pro\0", b"google,gs201-cheetah\0google,gs201\0",
+     "Google Pixel 7 Pro under-display fingerprint sensor (Omarchy Mobile)"),
+    (b"Some Board\0", b"vendor,some-board\0vendor,soc\0",
+     "Some Board fingerprint sensor (Omarchy Mobile)"),
+    (b"  Some Board \n\0", None, "Some Board fingerprint sensor (Omarchy Mobile)"),
+    (b"\0", b"osom,ingot\0", FALLBACK_NAME),
+    (None, b"google,gs201\0", FALLBACK_NAME),
+]
+
+
+def print_name():
+    """--name: the device's name in a fresh process (and context)"""
+    devices = [d for d in FPrint.Context().get_devices()
+               if d.get_driver() == "omamobile_udfps"]
+    print("\n".join(d.get_name() for d in devices))
+    return 0
+
+
+def name_in_process(dt_dir):
+    env = dict(os.environ)
+    env.pop("FP_OMAMOBILE_UDFPS_DT", None)
+    if dt_dir is not None:
+        env["FP_OMAMOBILE_UDFPS_DT"] = dt_dir
+    out = subprocess.run([sys.executable, os.path.abspath(__file__), "--name"],
+                         env=env, capture_output=True, text=True, timeout=30)
+    return out.stdout.strip()
+
+
+def check_names(tmp):
+    for i, (model, compatible, expected) in enumerate(NAME_CASES):
+        dt_dir = os.path.join(tmp, f"dt{i}")
+        os.mkdir(dt_dir)
+        for name, data in (("model", model), ("compatible", compatible)):
+            if data is not None:
+                with open(os.path.join(dt_dir, name), "wb") as f:
+                    f.write(data)
+        got = name_in_process(dt_dir)
+        check(f"name for {model!r} {compatible!r}: {got!r}", got == expected)
+    got = name_in_process(None)
+    check(f"name without FP_OMAMOBILE_UDFPS_DT: {got!r}",
+          got == FALLBACK_NAME or (os.path.exists("/proc/device-tree/model")
+                                   and got.endswith(" (Omarchy Mobile)")))
 
 
 def main():
@@ -375,10 +427,12 @@ def main():
         check(f"{ready}: 20 enroll stages", dev.get_nr_enroll_stages() == 20)
         dev.close_sync()
 
+    check_names(tmp)
+
     bridge.sock.close()
     print(f"{failures} failure(s)")
     return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(print_name() if sys.argv[1:] == ["--name"] else main())

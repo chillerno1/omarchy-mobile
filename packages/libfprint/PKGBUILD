@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: 0BSD
 #
-# Omarchy Mobile build of libfprint for the Pixel 7 Pro and 9a: upstream libfprint with
-# one more driver, omamobile_udfps (omamobile-udfps.c), which reaches the
-# phone's under-display sensor through omamobile-fp-bridge
-# (packages/omamobile-fingerprint, device/cheetah/FINGERPRINT-PLAN.md).
-# The same driver serves the Solana Saga's rear sensor through its bridge,
-# which announces its enrollment's stage count in READY.
+# Omarchy Mobile build of libfprint for the Pixel 7 Pro, 7 and 9a and the
+# Solana Saga: upstream libfprint with one more driver, omamobile_udfps
+# (omamobile-udfps.c), which reaches the Pixels' under-display sensor through
+# omamobile-fp-bridge (packages/omamobile-fingerprint,
+# device/cheetah/FINGERPRINT-PLAN.md) and the Saga's rear sensor through its
+# bridge, which announces its enrollment's stage count in READY. The device
+# is named for the phone from its device tree ("Solana Mobile Saga rear
+# fingerprint sensor (Omarchy Mobile)").
 # The driver is a "virtual" type device: it appears only when fprintd's
 # environment names the bridge's socket (FP_OMAMOBILE_UDFPS, set by
 # omamobile-fingerprint's fprintd drop-in), so this build behaves exactly
@@ -17,9 +19,9 @@
 
 pkgname=libfprint
 pkgver=1.94.100
-pkgrel=1.8
+pkgrel=1.9
 _tag=v$pkgver
-pkgdesc="Library for fingerprint readers (Omarchy Mobile: Pixel under-display sensors)"
+pkgdesc="Library for fingerprint readers (Omarchy Mobile: Pixel under-display and Saga rear sensors)"
 arch=(aarch64)
 url="https://fprint.freedesktop.org/"
 license=(LGPL-2.1-or-later)
@@ -30,8 +32,8 @@ source=("git+https://gitlab.freedesktop.org/libfprint/libfprint.git#tag=$_tag"
         0001-add-the-omamobile_udfps-driver.patch
         omamobile-udfps.c)
 sha256sums=('SKIP'
-            '931c2e1aa2164f704a9d5e629460938d89e33567ac2a340c848b6c109ea6beff'
-            '13a342a75617ddd0d7f726b353a39ed3645c6cba4638487130139750d812116d')
+            '0cc68494adac7512fa8e9eca6b810db196fe2932e4b072bdbb2a992e4c0f09e0'
+            '8f3ed01186e61504b8c125b962db4ad8e0d66a60402b29af773ec7c540cd5228')
 
 prepare() {
   cd libfprint

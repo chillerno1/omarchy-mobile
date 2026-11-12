@@ -1,5 +1,7 @@
 /*
- * Omarchy Mobile under-display fingerprint sensor (Google Pixel 7 Pro and 9a)
+ * Omarchy Mobile fingerprint sensor through the phone vendor's HAL: the
+ * under-display sensors of the Google Pixel 7 Pro, 7 and 9a, and the Solana
+ * Mobile Saga's rear sensor
  *
  * Copyright (C) 2026 Derek Ross <derekross@gmail.com>
  *
@@ -41,6 +43,14 @@
  * The device appears when FP_OMAMOBILE_UDFPS names the socket (fprintd's
  * environment). A print's data is the HAL's enrollment id; the templates
  * themselves never leave the secure world.
+ *
+ * Its name comes from the phone's device tree at probe time, without the
+ * bridge: "<model> <kind> fingerprint sensor (Omarchy Mobile)", from
+ * /proc/device-tree/model, with kind "rear" for the Saga (compatible
+ * "osom,ingot"), "under-display" for a Pixel (a "google," compatible), and
+ * none for any other board. Without a model (not a phone), the class's
+ * "Fingerprint sensor (Omarchy Mobile)". FP_OMAMOBILE_UDFPS_DT, when set,
+ * names a directory to read model and compatible from instead (tests).
  */
 
 #define FP_COMPONENT "omamobile_udfps"
@@ -56,6 +66,12 @@
 #define OMAMOBILE_UDFPS_ENROLL_STAGES 20
 /* A sane bound for READY's count */
 #define OMAMOBILE_UDFPS_MAX_STAGES 100
+
+#define OMAMOBILE_UDFPS_NAME "Fingerprint sensor (Omarchy Mobile)"
+#define OMAMOBILE_UDFPS_DT_DIR "/proc/device-tree"
+/* Sane bounds for the device tree's model and compatible files */
+#define OMAMOBILE_UDFPS_DT_MAX_FILE 4096
+#define OMAMOBILE_UDFPS_MAX_MODEL 64
 
 /* android.hardware.biometrics.fingerprint Error and AcquiredInfo */
 enum {
@@ -526,13 +542,119 @@ connect_cb (GObject *source, GAsyncResult *res, gpointer user_data)
                                        self->cancellable, ready_read_cb, self);
 }
 
+/* --- the device's name --- */
+
+/* A device tree property's raw bytes, or NULL when it is missing or too big */
+static gchar *
+dt_read (const char *dir, const char *name, gsize *length)
+{
+  g_autofree gchar *path = g_build_filename (dir, name, NULL);
+  g_autoptr(GError) error = NULL;
+  gchar *contents = NULL;
+
+  if (!g_file_get_contents (path, &contents, length, &error))
+    {
+      fp_dbg ("no device tree %s: %s", name, error->message);
+      return NULL;
+    }
+  if (*length > OMAMOBILE_UDFPS_DT_MAX_FILE)
+    {
+      fp_warn ("ignoring device tree %s: %" G_GSIZE_FORMAT " bytes", name, *length);
+      g_free (contents);
+      return NULL;
+    }
+  return contents;
+}
+
+/* The model, up to its NUL, trimmed and bounded; NULL when unusable */
+static gchar *
+dt_model (const char *dir)
+{
+  gsize length = 0;
+  g_autofree gchar *raw = dt_read (dir, "model", &length);
+  g_autofree gchar *model = NULL;
+  const gchar *p;
+
+  if (!raw)
+    return NULL;
+  model = g_strndup (raw, length);
+  if (!g_utf8_validate (model, -1, NULL))
+    {
+      fp_warn ("ignoring a device tree model that is not UTF-8");
+      return NULL;
+    }
+  g_strstrip (model);
+  for (p = model; *p; p++)
+    if (g_ascii_iscntrl (*p))
+      {
+        fp_warn ("ignoring a device tree model with control characters");
+        return NULL;
+      }
+  if (g_utf8_strlen (model, -1) > OMAMOBILE_UDFPS_MAX_MODEL)
+    {
+      gchar *cut = g_utf8_substring (model, 0, OMAMOBILE_UDFPS_MAX_MODEL);
+
+      g_free (model);
+      model = g_strstrip (cut);
+    }
+  if (*model == '\0')
+    return NULL;
+  return g_steal_pointer (&model);
+}
+
+/* "rear", "under-display" or NULL, from the NUL-separated compatible list */
+static const char *
+dt_sensor_kind (const char *dir)
+{
+  gsize length = 0;
+  g_autofree gchar *raw = dt_read (dir, "compatible", &length);
+  const char *kind = NULL;
+  gsize i = 0;
+
+  if (!raw)
+    return NULL;
+  while (i < length)
+    {
+      g_autofree gchar *entry = g_strndup (raw + i, length - i);
+
+      i += strlen (entry) + 1;
+      g_strstrip (entry);
+      if (g_str_equal (entry, "osom,ingot"))
+        return "rear";
+      if (g_str_has_prefix (entry, "google,"))
+        kind = "under-display";
+    }
+  return kind;
+}
+
+static gchar *
+device_name (void)
+{
+  const char *dir = g_getenv ("FP_OMAMOBILE_UDFPS_DT");
+  g_autofree gchar *model = NULL;
+  const char *kind;
+
+  if (!dir || !*dir)
+    dir = OMAMOBILE_UDFPS_DT_DIR;
+  model = dt_model (dir);
+  if (!model)
+    return g_strdup (OMAMOBILE_UDFPS_NAME);
+  kind = dt_sensor_kind (dir);
+  if (kind)
+    return g_strdup_printf ("%s %s fingerprint sensor (Omarchy Mobile)", model, kind);
+  return g_strdup_printf ("%s fingerprint sensor (Omarchy Mobile)", model);
+}
+
 /* --- device operations --- */
 
 static void
 dev_probe (FpDevice *dev)
 {
+  g_autofree gchar *name = device_name ();
+
+  fp_dbg ("name: %s", name);
   /* one sensor per phone; a print is only valid on the HAL that made it */
-  fpi_device_probe_complete (dev, "omamobile-udfps", NULL, NULL);
+  fpi_device_probe_complete (dev, "omamobile-udfps", name, NULL);
 }
 
 static void
@@ -783,7 +905,7 @@ fpi_device_omamobile_udfps_class_init (FpiDeviceOmamobileUdfpsClass *klass)
   object_class->finalize = fpi_device_omamobile_udfps_finalize;
 
   dev_class->id = FP_COMPONENT;
-  dev_class->full_name = "Under-display fingerprint sensor (Omarchy Mobile)";
+  dev_class->full_name = OMAMOBILE_UDFPS_NAME;
   dev_class->type = FP_DEVICE_TYPE_VIRTUAL;
   dev_class->id_table = id_table;
   dev_class->nr_enroll_stages = OMAMOBILE_UDFPS_ENROLL_STAGES;

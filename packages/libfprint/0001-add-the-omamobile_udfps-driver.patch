@@ -14,12 +14,13 @@ diff --git a/meson.build b/meson.build
 index ab09dc1..f530a49 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -147,6 +147,9 @@ drivers_info = {
+@@ -147,6 +147,10 @@ drivers_info = {
      'focaltech_moc': {},
      'mafpmoc': {},
      'secugen': {},
-+    # Pixel 7 Pro and 9a under-display sensors through Omarchy Mobile's HAL bridge;
-+    # appears only when FP_OMAMOBILE_UDFPS names the bridge's socket
++    # Pixel 7 Pro, 7 and 9a under-display and Solana Saga rear sensors through
++    # Omarchy Mobile's HAL bridge; appears only when FP_OMAMOBILE_UDFPS names
++    # the bridge's socket
 +    'omamobile_udfps': {},
  
      # SPI driver (non-optional if SPI is available)
