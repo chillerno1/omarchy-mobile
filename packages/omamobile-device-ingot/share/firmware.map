@@ -1,21 +1,27 @@
 # SPDX-License-Identifier: MIT
-# What omamobile-ingot-firmware copies from the Saga's own modem_a
-# partition (a FAT file system holding Qualcomm's image/ tree) into the
-# firmware search path. Data, not code: the tool reads it and refuses a
-# line it can't parse. Nothing named here is in the repository or the
-# package; every file comes from the user's own phone.
+# What omamobile-ingot-firmware copies from the Saga's own modem_a and
+# bluetooth_a partitions (FAT file systems holding Qualcomm's image/ tree)
+# into the firmware search path. Data, not code: the tool reads it and
+# refuses a line it can't parse. Nothing named here is in the repository
+# or the package; every file comes from the user's own phone.
 #
 #   source-glob|destination|note
 #
 # source-glob   a path relative to the partition root, matched without
 #               regard to case; * and ? match any characters (also /).
+#               A prefix names the partition: bluetooth_a:image/x.bin is
+#               read from bluetooth_a, and a source without one from
+#               modem_a. Only modem_a: and bluetooth_a: are accepted; any
+#               other prefix stops the run. A glob only ever matches
+#               files of its own partition.
 #               It must match exactly one file: none is "missing", two or
 #               more is "ambiguous", and either is reported and skipped
-#               without stopping the others.
+#               without stopping the others. A phone with no bluetooth_a
+#               has its lines reported missing.
 # destination   the absolute path to install to, directly inside
-#               /usr/lib/firmware/qcom/sm8475/osom/ingot/ or
-#               /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/. Anything
-#               else is refused.
+#               /usr/lib/firmware/qcom/sm8475/osom/ingot/,
+#               /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/ or
+#               /usr/lib/firmware/updates/qca/. Anything else is refused.
 # note          free text, shown by `plan`.
 #
 # Several lines may name the same destination: they are alternatives, and
@@ -26,8 +32,9 @@
 # board-2.bin is not a copy: the source (the board data file) is wrapped
 # in ath11k's board container under the name wifi_board_name.
 #
-# The source names are unconfirmed: they are the names Qualcomm images of
-# this generation use, not yet read from a Saga. Run
+# The modem_a source names are unconfirmed: they are the names Qualcomm
+# images of this generation use, not yet read from a Saga (the Bluetooth
+# line below was read from one). Run
 # `omamobile-ingot-firmware plan` on the phone, which lists what it finds
 # under image/, and correct the lines here (and drop this note) once the
 # owner has confirmed them.
@@ -69,3 +76,23 @@ image/*/bdwlang.elf|/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/board-2.bin|W
 # which an update of this package leaves alone and which wins over this
 # line.
 wifi_board_name=
+
+# Bluetooth: the NVM file (the controller's configuration and this
+# board's radio settings) for the WCN6855's Bluetooth side, from
+# bluetooth_a. The controller reports board id 0 ("qca_read_fw_board_id:
+# bid = 0"), and btqca (qca_get_nvm_name_by_board) asks for the file
+# without a board suffix, qca/wcnhpnv21g.bin; the "g" is the variant for
+# chips made by GlobalFoundries, which btqca reads from the SoC id.
+# linux-firmware's copy of that file does not suit the Saga: an LE
+# connection to a device completes and then drops with HCI status 0x3e
+# (Connection Failed to be Established), every time. With the phone's own
+# hpnv21g.bin from bluetooth_a in its place, LE connections succeed (3 of
+# 3, GATT services resolved, 2026-11-12). Read from a Saga: the file is
+# image/hpnv21g.bin. It loads at the next probe: 'modprobe -r hci_uart &&
+# modprobe hci_uart', or a reboot.
+# Not copied: hpbtfw21.tlv (the patch firmware) is older than
+# linux-firmware's qca/hpbtfw21.tlv, which works with this NVM, so
+# linux-firmware's stays; hpnv21.bin is the variant for chips not made by
+# GlobalFoundries, and the hpnv21g.bNN files are for non-zero board ids,
+# neither of which btqca asks for on this phone.
+bluetooth_a:image/hpnv21g.bin|/usr/lib/firmware/updates/qca/wcnhpnv21g.bin|Bluetooth NVM (the vendor's hpnv21g.bin, as wcnhpnv21g.bin; replaces linux-firmware's, which drops LE connections)

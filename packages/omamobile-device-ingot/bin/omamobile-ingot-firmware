@@ -1,8 +1,10 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
-# Install the Solana Saga's own firmware from its modem_a partition: the
-# GPU zap shader, the ADSP firmware, and the Wi-Fi firmware and board file
-# (WCN6855 hw2.1, as overrides in firmware/updates/). The files are the
+# Install the Solana Saga's own firmware from its modem_a and bluetooth_a
+# partitions: from modem_a the GPU zap shader, the ADSP firmware, and the
+# Wi-Fi firmware and board file (WCN6855 hw2.1, as overrides in
+# firmware/updates/); from bluetooth_a the Bluetooth NVM file (as an
+# override of linux-firmware's qca/wcnhpnv21g.bin). The files are the
 # phone's own; nothing is in the package. Run it by hand, as root, on the
 # phone.
 #
@@ -11,11 +13,16 @@
 #   omamobile-ingot-firmware status                     what is installed, against the record
 #   omamobile-ingot-firmware --help
 #
-# What it copies is in /usr/share/omamobile/ingot/firmware.map. modem_a is
-# found by PARTNAME in /sys/class/block/*/uevent (exactly one), must read
+# What it copies is in /usr/share/omamobile/ingot/firmware.map; a source
+# there names its partition as a prefix (bluetooth_a:image/...), and no
+# prefix means modem_a. Only modem_a and bluetooth_a are accepted. Each
+# partition is found by PARTNAME in /sys/class/block/*/uevent, must read
 # ro 1 (the storage guard keeps it read-only) and must not be mounted, and
-# is mounted read-only (vfat, ro,nodev,nosuid,noexec) on a private folder
-# under /run for the run, then unmounted. No other partition is read.
+# is mounted read-only (vfat, ro,nodev,nosuid,noexec) on its own private
+# folder under /run for the run, then unmounted. modem_a must exist
+# exactly once. bluetooth_a is read only when the map names it, and only
+# if there is at most one: with none, its entries are reported missing.
+# No other partition is read.
 #
 # Files are installed 0644 root, each through a temporary file and a
 # rename, and recorded with their sha256 in
@@ -25,24 +32,33 @@
 # name ath11k looks for (wifi_board_name, set in
 # /etc/omamobile/ingot-firmware.conf); without it, it is skipped.
 #
-# After an install, reboot (or start omamobile-adsp.service) to use it.
+# After an install, reboot (or start omamobile-adsp.service) to use it; a
+# new Bluetooth NVM file loads after 'modprobe -r hci_uart && modprobe
+# hci_uart' or a reboot.
 set -euo pipefail
 
 # Test hooks: a fake root for everything written and read on the root
-# file system, stand-ins for /sys and mountinfo, a folder in place of the
-# mounted partition (the mount is then skipped; the partition checks still
-# run), and a kernel log in place of dmesg.
+# file system, stand-ins for /sys and mountinfo, a folder in place of each
+# mounted partition (modem_a, bluetooth_a; that partition's mount is then
+# skipped, its checks still run), and a kernel log in place of dmesg.
 root=${OMAMOBILE_INGOT_FW_ROOT:-}
 sysfs=${OMAMOBILE_INGOT_FW_SYSFS:-/sys}
 mountinfo=${OMAMOBILE_INGOT_FW_MOUNTINFO:-/proc/self/mountinfo}
-source_dir=${OMAMOBILE_INGOT_FW_SOURCE:-}
 klog_file=${OMAMOBILE_INGOT_FW_KLOG:-}
 map=${OMAMOBILE_INGOT_FW_MAP:-$root/usr/share/omamobile/ingot/firmware.map}
 conf=$root/etc/omamobile/ingot-firmware.conf
 state=$root/var/lib/omamobile/ingot-firmware
 record=$state/installed.sha256
 
-allowed_dirs=(/usr/lib/firmware/qcom/sm8475/osom/ingot /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1)
+# The partitions a map line may read, in the order they are opened.
+# modem_a is always checked; bluetooth_a only when a map line names it.
+parts=(modem_a bluetooth_a)
+declare -A part_hook=([modem_a]=${OMAMOBILE_INGOT_FW_SOURCE:-} [bluetooth_a]=${OMAMOBILE_INGOT_FW_SOURCE_BLUETOOTH:-})
+declare -A part_used=([modem_a]=1) part_dev=() part_majmin=() part_src=()
+
+allowed_dirs=(/usr/lib/firmware/qcom/sm8475/osom/ingot /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1
+              /usr/lib/firmware/updates/qca)
+bt_dir=/usr/lib/firmware/updates/qca
 board_magic=QCA-ATH11K-BOARD
 
 die() { echo "omamobile-ingot-firmware: $*" >&2; exit 1; }
@@ -53,8 +69,8 @@ usage() {
 }
 
 # ------------------------------------------------------------------ map
-# entries: "glob|dest|note" in file order; board_name from the map, then
-# the local conf.
+# entries: "partition:glob|dest|note" in file order (a source without a
+# prefix is modem_a's); board_name from the map, then the local conf.
 entries=()
 board_name=
 read_key() { # FILE: sets board_name from a wifi_board_name= line
@@ -75,7 +91,7 @@ valid_dest() {
 
 load_map() {
   [[ -f $map ]] || die "no map at $map"
-  local line n=0 glob dest note rest
+  local line n=0 glob dest note rest part p known
   while IFS= read -r line || [[ -n $line ]]; do
     n=$((n + 1))
     [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
@@ -84,9 +100,16 @@ load_map() {
     fi
     [[ $line == *'|'*'|'* ]] || die "$map line $n: not source-glob|destination|note"
     glob=${line%%|*}; rest=${line#*|}; dest=${rest%%|*}; note=${rest#*|}
-    [[ -n $glob && $glob != /* && /$glob/ != */../* ]] || die "$map line $n: bad source $glob"
+    part=modem_a
+    if [[ $glob == *:* ]]; then
+      part=${glob%%:*}; glob=${glob#*:} known=0
+      for p in "${parts[@]}"; do [[ $part == "$p" ]] && known=1; done
+      ((known)) || die "$map line $n: unknown partition '$part' (a source's prefix is modem_a: or bluetooth_a:, none means modem_a)"
+    fi
+    [[ -n $glob && $glob != /* && $glob != *:* && /$glob/ != */../* ]] || die "$map line $n: bad source $glob"
     valid_dest "$dest" || die "$map line $n: destination $dest is outside ${allowed_dirs[*]}"
-    entries+=("$glob|$dest|$note")
+    part_used[$part]=1
+    entries+=("$part:$glob|$dest|$note")
   done < "$map"
   if [[ -f $conf ]]; then read_key "$conf"; fi
   if [[ -n $board_name ]]; then
@@ -95,17 +118,24 @@ load_map() {
   fi
 }
 
-# ------------------------------------------------------------------ modem_a
-part_dev='' part_majmin=''
+# ------------------------------------------------------------------ partitions
+# check_partition NAME: sets part_dev[NAME] and part_majmin[NAME], or
+# leaves them unset when an optional partition (anything but modem_a) does
+# not exist. Refuses two of a name, a writable one and a mounted one.
 check_partition() {
-  local u matches=() kv devname='' major='' minor=''
+  local name=$1 u matches=() kv devname='' major='' minor=''
   for u in "$sysfs"/class/block/*/uevent; do
     [[ -f $u ]] || continue
     while IFS= read -r kv; do
-      [[ $kv == PARTNAME=modem_a ]] && matches+=("${u%/uevent}")
+      [[ $kv == "PARTNAME=$name" ]] && matches+=("${u%/uevent}")
     done < "$u"
   done
-  ((${#matches[@]} == 1)) || die "expected exactly one partition named modem_a, found ${#matches[@]}: refusing"
+  if [[ $name == modem_a ]]; then
+    ((${#matches[@]} == 1)) || die "expected exactly one partition named modem_a, found ${#matches[@]}: refusing"
+  else
+    if ((${#matches[@]} == 0)); then return 0; fi
+    ((${#matches[@]} == 1)) || die "expected at most one partition named $name, found ${#matches[@]}: refusing"
+  fi
   while IFS= read -r kv; do
     case $kv in
       DEVNAME=*) devname=${kv#DEVNAME=} ;;
@@ -114,50 +144,67 @@ check_partition() {
     esac
   done < "${matches[0]}/uevent"
   [[ $devname =~ ^[a-z0-9]+$ && $major =~ ^[0-9]+$ && $minor =~ ^[0-9]+$ ]] \
-    || die "modem_a's uevent has no usable DEVNAME, MAJOR and MINOR: refusing"
+    || die "$name's uevent has no usable DEVNAME, MAJOR and MINOR: refusing"
   [[ $(< "${matches[0]}/ro") == 1 ]] \
-    || die "modem_a ($devname) is not read-only (ro is not 1): refusing. The storage guard keeps it read-only; this tool never changes that"
+    || die "$name ($devname) is not read-only (ro is not 1): refusing. The storage guard keeps it read-only; this tool never changes that"
   local _a _b mm _rest
   while read -r _a _b mm _rest; do
-    [[ $mm == "$major:$minor" ]] && die "modem_a ($devname) is mounted already: refusing (unmount it first)"
+    [[ $mm == "$major:$minor" ]] && die "$name ($devname) is mounted already: refusing (unmount it first)"
   done < "$mountinfo"
-  part_dev=$devname part_majmin=$major:$minor
+  part_dev[$name]=$devname part_majmin[$name]=$major:$minor
 }
 
-mnt=
+mnts=()
 cleanup() {
-  if [[ -n $mnt ]]; then
-    umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || echo "omamobile-ingot-firmware: could not unmount $mnt" >&2
-    rmdir "$mnt" 2>/dev/null || true
-  fi
+  local m
+  for m in "${mnts[@]}"; do
+    umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || echo "omamobile-ingot-firmware: could not unmount $m" >&2
+    rmdir "$m" 2>/dev/null || true
+  done
+  mnts=()
 }
 
-open_source() {
-  check_partition
-  if [[ -n $source_dir ]]; then
-    [[ -d $source_dir ]] || die "no folder $source_dir"
-    src=$source_dir
-    return
-  fi
-  ((EUID == 0)) || die "run as root (it mounts modem_a read-only)"
-  local node=/dev/$part_dev
-  [[ -b $node ]] || die "$node is not a block device"
-  local mm
-  mm=$(stat -c '%t:%T' "$node")
-  [[ $((16#${mm%:*})):$((16#${mm#*:})) == "$part_majmin" ]] || die "$node is not modem_a ($part_majmin): refusing"
-  trap cleanup EXIT
-  mnt=$(mktemp -d /run/omamobile-ingot-firmware.XXXXXX)
-  chmod 700 "$mnt"
-  mount -t vfat -o ro,nodev,nosuid,noexec "$node" "$mnt" || { rmdir "$mnt"; mnt=; die "could not mount $node read-only"; }
-  src=$mnt
+# open_sources: checks every partition the map uses before mounting any,
+# then mounts each present one (or takes its test folder): part_src[NAME].
+open_sources() {
+  local p node mm m
+  for p in "${parts[@]}"; do
+    if [[ -n ${part_used[$p]:-} ]]; then check_partition "$p"; fi
+  done
+  for p in "${parts[@]}"; do
+    [[ -n ${part_used[$p]:-} && -n ${part_dev[$p]:-} ]] || continue
+    if [[ -n ${part_hook[$p]} ]]; then
+      [[ -d ${part_hook[$p]} ]] || die "no folder ${part_hook[$p]}"
+      part_src[$p]=${part_hook[$p]}
+      continue
+    fi
+    ((EUID == 0)) || die "run as root (it mounts $p read-only)"
+    node=/dev/${part_dev[$p]}
+    [[ -b $node ]] || die "$node is not a block device"
+    mm=$(stat -c '%t:%T' "$node")
+    [[ $((16#${mm%:*})):$((16#${mm#*:})) == "${part_majmin[$p]}" ]] || die "$node is not $p (${part_majmin[$p]}): refusing"
+    trap cleanup EXIT
+    m=$(mktemp -d /run/omamobile-ingot-firmware.XXXXXX)
+    chmod 700 "$m"
+    mount -t vfat -o ro,nodev,nosuid,noexec "$node" "$m" || { rmdir "$m"; die "could not mount $node read-only"; }
+    mnts+=("$m")
+    part_src[$p]=$m
+  done
 }
 
 # ------------------------------------------------------------------ sources
+# files: every file of every open partition as "partition:relative/path",
+# so a glob (always "partition:...") only ever matches its own partition.
+# On screen modem_a's files keep their bare paths (${f#modem_a:}).
 files=()
 index_source() {
-  local f
-  while IFS= read -r -d '' f; do files+=("$f"); done < <(cd "$src" && find . -type f -printf '%P\0' | sort -z)
+  local p f
+  for p in "${parts[@]}"; do
+    [[ -n ${part_src[$p]:-} ]] || continue
+    while IFS= read -r -d '' f; do files+=("$p:$f"); done < <(cd "${part_src[$p]}" && find . -type f -printf '%P\0' | sort -z)
+  done
 }
+at() { printf '%s/%s' "${part_src[${1%%:*}]}" "${1#*:}"; } # the file "partition:path" on disk
 
 # match GLOB: sets hits=() of relative paths, case-insensitively
 match() {
@@ -170,17 +217,18 @@ match() {
   return 0
 }
 
-# segments MDT: sets segs=() of the .bNN files beside a split image
+# segments MDT: sets segs=() of the .bNN files beside a split image (the
+# same folder of the same partition)
 segments() {
-  local dir='' stem f fdir
-  [[ $1 == */* ]] && dir=${1%/*}
-  stem=${1##*/}; stem=${stem%.*}; stem=${stem,,}
+  local dir stem f fdir base
+  dir=${1%%:*}:; [[ $1 == */* ]] && dir=${1%/*}
+  stem=${1##*/}; stem=${stem#*:}; stem=${stem%.*}; stem=${stem,,}
   segs=()
   for f in "${files[@]}"; do
-    fdir=
-    [[ $f == */* ]] && fdir=${f%/*}
+    fdir=${f%%:*}:; [[ $f == */* ]] && fdir=${f%/*}
     [[ $fdir == "$dir" ]] || continue
-    [[ ${f##*/} =~ ^(.*)\.[bB]([0-9][0-9])$ && ${BASH_REMATCH[1],,} == "$stem" ]] && segs+=("$f")
+    base=${f##*/}; base=${base#*:}
+    [[ $base =~ ^(.*)\.[bB]([0-9][0-9])$ && ${BASH_REMATCH[1],,} == "$stem" ]] && segs+=("$f")
   done
   return 0
 }
@@ -237,7 +285,7 @@ note_used=''
 
 plan_entries() {
   local -A seen=()
-  local dests=() e glob dest note d f s n tried first_note
+  local dests=() e glob dest note d f s n tried first_note path
   for e in "${entries[@]}"; do
     IFS='|' read -r glob dest note <<< "$e"
     [[ -n ${seen[$dest]:-} ]] || { seen[$dest]=1; dests+=("$dest"); }
@@ -248,10 +296,11 @@ plan_entries() {
       IFS='|' read -r glob dest note <<< "$e"
       [[ $dest == "$d" ]] || continue
       [[ -n $first_note ]] || first_note=$note
-      tried+=" $glob"
+      tried+=" ${glob#modem_a:}"
       match "$glob"
       if ((${#hits[@]} > 1)); then
-        say "  ambiguous $glob matches ${#hits[@]} files (${hits[*]}): $d skipped"
+        local shown=("${hits[@]#modem_a:}")
+        say "  ambiguous ${glob#modem_a:} matches ${#hits[@]} files (${shown[*]}): $d skipped"
         problems=$((problems + 1)); f=-; break
       fi
       if ((${#hits[@]} == 1)); then f=${hits[0]}; note_used=$note; break; fi
@@ -261,25 +310,26 @@ plan_entries() {
       say "  missing   $d  ($first_note; looked for:$tried)"
       continue
     fi
+    path=$(at "$f")
     if [[ ${d##*/} == board-2.bin ]]; then
-      if ! is_elf "$src/$f"; then
-        say "  found     $f, but it is not an ELF board data file: $d skipped"
+      if ! is_elf "$path"; then
+        say "  found     ${f#modem_a:}, but it is not an ELF board data file: $d skipped"
         problems=$((problems + 1)); continue
       fi
       if [[ -z $board_name ]]; then
-        say "  found     $f -> $d: skipped, no wifi_board_name set ('plan' shows how to read it)"
+        say "  found     ${f#modem_a:} -> $d: skipped, no wifi_board_name set ('plan' shows how to read it)"
         board_hint=1; continue
       fi
-      build_board "$src/$f" "$board_name" "$work/board-2.bin"
-      say "  found     $f -> $d (board data for '$board_name')"
+      build_board "$path" "$board_name" "$work/board-2.bin"
+      say "  found     ${f#modem_a:} -> $d (board data for '$board_name')"
       items+=("board|$d|$work/board-2.bin|$d")
       continue
     fi
-    if [[ ${f,,} == *.mdt || ${f,,} == *.mbn ]] && ! is_elf "$src/$f"; then
-      say "  found     $f, but it is not an ELF image: $d skipped"
+    if [[ ${f,,} == *.mdt || ${f,,} == *.mbn ]] && ! is_elf "$path"; then
+      say "  found     ${f#modem_a:}, but it is not an ELF image: $d skipped"
       problems=$((problems + 1)); continue
     fi
-    items+=("copy|$d|$src/$f|$d")
+    items+=("copy|$d|$path|$d")
     if [[ ${f,,} == *.mdt ]]; then
       segments "$f"
       n=0
@@ -287,12 +337,12 @@ plan_entries() {
         local nn=${s##*.}; nn=${nn,,}
         local sd=${d%.*}.$nn
         valid_dest "$sd" || die "segment destination $sd is not allowed"
-        items+=("copy|$sd|$src/$s|$d")
+        items+=("copy|$sd|$(at "$s")|$d")
         n=$((n + 1))
       done
-      say "  found     $f (+ $n segments) -> $d  ($note_used)"
+      say "  found     ${f#modem_a:} (+ $n segments) -> $d  ($note_used)"
     else
-      say "  found     $f -> $d  ($note_used)"
+      say "  found     ${f#modem_a:} -> $d  ($note_used)"
     fi
   done
 }
@@ -320,7 +370,7 @@ install_file() { # FILE DEST
 }
 
 act() { # MODE: plan, dry-run or install
-  local mode=$1 it dest file set new what changed=0 kept=0 i
+  local mode=$1 it dest file set new what changed=0 kept=0 bt=0 i
   local -a whats=() news=()
   local -A held=()
   # A split image is one set: if any part of it is kept, all of it is,
@@ -355,12 +405,16 @@ act() { # MODE: plan, dry-run or install
     install_file "$file" "$dest"
     [[ $(sha "$root$dest") == "$new" ]] || die "$dest does not read back as written"
     rec[$dest]=$new; changed=$((changed + 1))
+    if [[ ${dest%/*} == "$bt_dir" ]]; then bt=1; fi
   done
   ((${#items[@]})) || say "  nothing to install"
   if [[ $mode == install ]]; then
     save_record
     say "Installed $changed file(s); record: $record"
     if ((changed)); then say "Reboot, or 'systemctl start omamobile-adsp' for the ADSP, to use them."; fi
+    if ((bt)); then
+      say "The Bluetooth NVM file changed: 'modprobe -r hci_uart && modprobe hci_uart' (Bluetooth drops for a moment) or a reboot loads it."
+    fi
   fi
   ((kept == 0))
 }
@@ -451,15 +505,30 @@ case $cmd in
       exec 9> "$state/lock"
       flock -n 9 || die "another run holds $state/lock"
     fi
-    open_source
+    open_sources
     work=$(mktemp -d)
     trap 'rm -rf "$work"; cleanup' EXIT
     index_source
     load_record
-    say "modem_a: /dev/$part_dev (read-only), ${#files[@]} files"
+    for p in "${parts[@]}"; do
+      [[ -n ${part_used[$p]:-} ]] || continue
+      if [[ -z ${part_dev[$p]:-} ]]; then
+        say "$p: no partition of that name, so its entries are missing"
+        continue
+      fi
+      n=0
+      for f in "${files[@]}"; do [[ $f == "$p:"* ]] && n=$((n + 1)); done
+      say "$p: /dev/${part_dev[$p]} (read-only), $n files"
+    done
     if [[ $cmd == plan ]]; then
-      say "Under image/:"
-      for f in "${files[@]}"; do [[ ${f,,} == image/* ]] && say "  $f"; done
+      for p in "${parts[@]}"; do
+        [[ -n ${part_src[$p]:-} ]] || continue
+        say "Under $p's image/:"
+        for f in "${files[@]}"; do
+          rel=${f#"$p:"}
+          [[ $f == "$p:"* && ${rel,,} == image/* ]] && say "  ${f#modem_a:}"
+        done
+      done
     fi
     say "Map: $map"
     plan_entries

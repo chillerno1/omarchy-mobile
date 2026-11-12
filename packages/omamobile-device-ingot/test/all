@@ -201,6 +201,8 @@ head -c 300 /dev/urandom > "$s/IMAGE/wlan/amss20.bin"
 head -c 30 /dev/urandom > "$s/IMAGE/wlan/m3.bin"
 elf "$s/IMAGE/wlan/bdwlang.elf" 1001
 head -c 10 /dev/urandom > "$s/verinfo/ver_info.txt"
+# A decoy: bluetooth_a's file name on modem_a, which a bluetooth_a line must never pick up.
+head -c 50 /dev/urandom > "$s/IMAGE/hpnv21g.bin"
 fr=$f/root; mkdir -p "$fr/usr/share/omamobile/ingot"
 cp share/firmware.map "$fr/usr/share/omamobile/ingot/"
 klog=$f/klog; : > "$klog"
@@ -227,6 +229,10 @@ grep -q "failed to fetch board data" "$f/out" || fail "plan explains how to read
 grep -q '  IMAGE/wlan/bdwlang.elf' "$f/out" || fail "plan lists what is under image/"
 grep -q 'ver_info' "$f/out" && fail "plan lists only image/"
 pass "plan: found, missing and skipped entries, and nothing written"
+grep -q '^bluetooth_a: no partition of that name' "$f/out" || fail "plan says there is no bluetooth_a"
+grep -q 'missing   /usr/lib/firmware/updates/qca/wcnhpnv21g.bin  (.*looked for: bluetooth_a:image/hpnv21g.bin)' "$f/out" \
+  || fail "without bluetooth_a its entry is missing, even with a file of that name on modem_a"
+pass "no bluetooth_a: its entry is reported missing, not fatal, and modem_a's files never stand in"
 
 before=$(snapshot)
 ingot_fw install --dry-run || { cat "$f/out" >&2; fail "install --dry-run runs"; }
@@ -235,6 +241,8 @@ grep -q '  new       /usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.b03' "$f/out"
 pass "install --dry-run writes nothing"
 
 ingot_fw install || { cat "$f/out" >&2; fail "install runs"; }
+grep -q hci_uart "$f/out" && fail "no Bluetooth reload hint when no Bluetooth file changed"
+[[ ! -e $fr/usr/lib/firmware/updates/qca ]] || fail "nothing is installed for Bluetooth without bluetooth_a"
 q=$fr/usr/lib/firmware/qcom/sm8475/osom/ingot w=$fr/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1
 cmp -s "$s/IMAGE/ADSP.MDT" "$q/adsp.mdt" && cmp -s "$s/IMAGE/ADSP.B03" "$q/adsp.b03" || fail "the ADSP set is copied"
 cmp -s "$s/IMAGE/a730_zap.mdt" "$q/a730_zap.mbn" && cmp -s "$s/IMAGE/a730_zap.b02" "$q/a730_zap.b02" \
@@ -389,7 +397,95 @@ if ((EUID != 0)); then
   OMAMOBILE_INGOT_FW_ROOT='' OMAMOBILE_INGOT_FW_MAP=$m OMAMOBILE_INGOT_FW_SOURCE='' refuses "a real mount without root" "run as root" plan
 fi
 pass "omamobile-ingot-firmware refuses a missing, doubled, writable or mounted modem_a, a bad map line and bad options"
-unset OMAMOBILE_INGOT_FW_ROOT OMAMOBILE_INGOT_FW_SYSFS OMAMOBILE_INGOT_FW_MOUNTINFO OMAMOBILE_INGOT_FW_SOURCE OMAMOBILE_INGOT_FW_KLOG
+
+# --- 0.1.8: the Bluetooth NVM from bluetooth_a ------------------------------
+# A stand-in bluetooth_a beside modem_a, with made-up files under the
+# vendor's names (random bytes, nothing from a phone).
+mkdir -p "$f/sys/class/block/sda7"
+printf 'MAJOR=8\nMINOR=7\nDEVNAME=sda7\nDEVTYPE=partition\nPARTN=7\nPARTNAME=bluetooth_a\n' > "$f/sys/class/block/sda7/uevent"
+echo 1 > "$f/sys/class/block/sda7/ro"
+bs=$f/btsrc; mkdir -p "$bs/image" "$bs/verinfo"
+head -c 6442 /dev/urandom > "$bs/image/hpnv21g.bin"
+head -c 6442 /dev/urandom > "$bs/image/hpnv21.bin"
+for i in 01 02 0a; do head -c 6000 /dev/urandom > "$bs/image/hpnv21g.b$i"; done
+head -c 2000 /dev/urandom > "$bs/image/hpbtfw21.tlv"
+# modem_a's regdb.bin line must not find this one.
+head -c 20 /dev/urandom > "$bs/image/regdb.bin"
+head -c 10 /dev/urandom > "$bs/verinfo/ver_info.txt"
+fr3=$f/root3; mkdir -p "$fr3/usr/share/omamobile/ingot"
+cp share/firmware.map "$fr3/usr/share/omamobile/ingot/"
+m3=$fr3/usr/share/omamobile/ingot/firmware.map
+export OMAMOBILE_INGOT_FW_ROOT=$fr3 OMAMOBILE_INGOT_FW_SOURCE_BLUETOOTH=$bs
+qca=$fr3/usr/lib/firmware/updates/qca
+
+before=$(cd "$fr3" && find . -printf '%p %s %m\n' | sort)
+ingot_fw plan || { cat "$f/out" >&2; fail "plan runs with bluetooth_a"; }
+[[ $(cd "$fr3" && find . -printf '%p %s %m\n' | sort) == "$before" ]] || fail "plan writes nothing"
+grep -q '^modem_a: /dev/sda5 (read-only), ' "$f/out" && grep -q '^bluetooth_a: /dev/sda7 (read-only), 8 files$' "$f/out" \
+  || fail "plan names both partitions and counts each one's files"
+grep -q '^Under bluetooth_a.s image/:$' "$f/out" && grep -q '^  bluetooth_a:image/hpbtfw21.tlv$' "$f/out" \
+  || fail "plan lists what bluetooth_a has under image/"
+grep -q '^  IMAGE/wlan/bdwlang.elf$' "$f/out" || fail "plan still lists modem_a's image/"
+grep -q 'bluetooth_a:verinfo' "$f/out" && fail "plan lists only bluetooth_a's image/"
+grep -q 'found     bluetooth_a:image/hpnv21g.bin -> /usr/lib/firmware/updates/qca/wcnhpnv21g.bin' "$f/out" \
+  || fail "plan finds the NVM file on bluetooth_a, and only there (modem_a's decoy makes no ambiguity)"
+grep -q 'missing   /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/regdb.bin' "$f/out" \
+  || fail "a modem_a line never matches a bluetooth_a file"
+pass "plan: bluetooth_a is read beside modem_a, each glob only within its own partition"
+
+ingot_fw install || { cat "$f/out" >&2; fail "install runs with bluetooth_a"; }
+cmp -s "$bs/image/hpnv21g.bin" "$qca/wcnhpnv21g.bin" || fail "the phone's hpnv21g.bin is installed as wcnhpnv21g.bin"
+cmp -s "$s/IMAGE/ADSP.MDT" "$fr3/usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.mdt" || fail "modem_a's files are installed in the same run"
+[[ $(ls -A "$qca") == wcnhpnv21g.bin ]] || fail "only the NVM file goes to updates/qca (no patch firmware, no board files)"
+[[ $(stat -c %a "$qca/wcnhpnv21g.bin") == 644 ]] || fail "the NVM file is 0644"
+grep -q "modprobe -r hci_uart && modprobe hci_uart" "$f/out" || fail "install says how to load the new NVM file"
+grep -q "^$(sha256sum < "$bs/image/hpnv21g.bin" | cut -d' ' -f1)  /usr/lib/firmware/updates/qca/wcnhpnv21g.bin$" \
+  "$fr3/var/lib/omamobile/ingot-firmware/installed.sha256" || fail "the NVM file is recorded"
+ingot_fw status || { cat "$f/out" >&2; fail "status is clean after the install"; }
+grep -q 'ok        /usr/lib/firmware/updates/qca/wcnhpnv21g.bin' "$f/out" || fail "status checks the NVM file"
+ingot_fw install || fail "a second install runs"
+grep -q 'Installed 0 file' "$f/out" && ! grep -q hci_uart "$f/out" || fail "a second install changes nothing and asks for no reload"
+echo hand > "$qca/wcnhpnv21g.bin"
+if ingot_fw install; then fail "install reports a kept hand-made NVM file"; fi
+grep -qx hand "$qca/wcnhpnv21g.bin" || fail "a hand-made NVM file is kept without --replace"
+ingot_fw install --replace || fail "install --replace runs"
+cmp -s "$bs/image/hpnv21g.bin" "$qca/wcnhpnv21g.bin" && grep -q hci_uart "$f/out" || fail "--replace installs it and says to reload"
+pass "install: the NVM file from bluetooth_a, recorded, kept if hand-made, with the reload hint only when it changed"
+
+# bluetooth_a refusals, as for modem_a.
+mkdir -p "$f/sys/class/block/sdb9"; cp "$f/sys/class/block/sda7/uevent" "$f/sys/class/block/sdb9/uevent"
+refuses "two partitions named bluetooth_a" "at most one partition named bluetooth_a, found 2" plan
+sed '/^bluetooth_a:/d' "$m3" > "$f/map-nobt"
+OMAMOBILE_INGOT_FW_MAP=$f/map-nobt ingot_fw plan || { cat "$f/out" >&2; fail "a map without bluetooth_a lines never looks at bluetooth_a"; }
+grep -q bluetooth_a "$f/out" && fail "a map without bluetooth_a lines never mentions it"
+rm -r "$f/sys/class/block/sdb9"
+echo 0 > "$f/sys/class/block/sda7/ro"
+refuses "a writable bluetooth_a" "bluetooth_a (sda7) is not read-only" install
+echo 1 > "$f/sys/class/block/sda7/ro"
+echo '41 22 8:7 / /mnt ro,relatime - vfat /dev/sda7 ro' >> "$f/mountinfo"
+refuses "a mounted bluetooth_a" "bluetooth_a (sda7) is mounted already" plan
+echo '22 1 259:3 / / rw,relatime - ext4 /dev/sda20 rw' > "$f/mountinfo"
+mv "$f/sys/class/block/sda5/uevent" "$f/uevent.saved"
+refuses "no modem_a, even with bluetooth_a" "exactly one partition named modem_a, found 0" plan
+mv "$f/uevent.saved" "$f/sys/class/block/sda5/uevent"
+cp "$m3" "$f/map3.saved"
+echo 'persist:image/x.bin|/usr/lib/firmware/updates/qca/x.bin|another partition' >> "$m3"
+refuses "a source on a partition other than modem_a and bluetooth_a" "unknown partition 'persist'" plan
+cp "$f/map3.saved" "$m3"; echo 'bluetooth_b:image/x.bin|/usr/lib/firmware/updates/qca/x.bin|slot b' >> "$m3"
+refuses "bluetooth_b" "unknown partition 'bluetooth_b'" plan
+cp "$f/map3.saved" "$m3"; echo 'bluetooth_a:|/usr/lib/firmware/updates/qca/x.bin|empty' >> "$m3"
+refuses "an empty source after the prefix" "bad source" plan
+cp "$f/map3.saved" "$m3"; echo 'bluetooth_a:../x.bin|/usr/lib/firmware/updates/qca/x.bin|up' >> "$m3"
+refuses "a bluetooth_a source outside the partition" "bad source" plan
+cp "$f/map3.saved" "$m3"; echo 'bluetooth_a:image/x.bin|/usr/lib/firmware/qca/x.bin|outside' >> "$m3"
+refuses "a destination outside updates/qca" "is outside" plan
+cp "$f/map3.saved" "$m3"
+if ((EUID != 0)); then
+  OMAMOBILE_INGOT_FW_SOURCE_BLUETOOTH='' refuses "a real bluetooth_a mount without root" "it mounts bluetooth_a read-only" plan
+fi
+pass "omamobile-ingot-firmware refuses a doubled, writable or mounted bluetooth_a and any other partition prefix"
+unset OMAMOBILE_INGOT_FW_ROOT OMAMOBILE_INGOT_FW_SYSFS OMAMOBILE_INGOT_FW_MOUNTINFO OMAMOBILE_INGOT_FW_SOURCE OMAMOBILE_INGOT_FW_KLOG \
+  OMAMOBILE_INGOT_FW_SOURCE_BLUETOOTH
 
 # --- omamobile-adsp-start against a stand-in remoteproc ---------------------
 a=$tmp/adsp; mkdir -p "$a/sys/class/remoteproc/remoteproc0" "$a/sys/class/remoteproc/remoteproc1"

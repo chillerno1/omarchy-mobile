@@ -1,6 +1,6 @@
 # omamobile-device-ingot
 
-Omarchy Mobile's userspace package for the Solana Mobile Saga (codename ingot, SM8475). It hides the Android partitions from desktop tools, holds the USB link to the host, keeps a short power press from powering the phone off, and, from 0.1.4, carries what the bring-up system had installed by hand (and, from 0.1.5, sound): the tool that installs the phone's own firmware from its `modem_a` partition, the ADSP start, a stable Bluetooth address, and the Wi-Fi and camera policy.
+Omarchy Mobile's userspace package for the Solana Mobile Saga (codename ingot, SM8475). It hides the Android partitions from desktop tools, holds the USB link to the host, keeps a short power press from powering the phone off, and, from 0.1.4, carries what the bring-up system had installed by hand (and, from 0.1.5, sound): the tool that installs the phone's own firmware from its `modem_a` partition (and, from 0.1.8, the Bluetooth NVM file from `bluetooth_a`), the ADSP start, a stable Bluetooth address, and the Wi-Fi and camera policy.
 
 | Path | Installs to | What it does |
 | --- | --- | --- |
@@ -16,7 +16,7 @@ Omarchy Mobile's userspace package for the Solana Mobile Saga (codename ingot, S
 | `vendor/modprobe.d/omamobile-wifi.conf` | `/usr/lib/modprobe.d` | The three ath11k debug options the mobile WCN6855 firmware needs for now, each with its reason: `dbg_wcn_cbc=1` (the vendor-style cold boot calibration), `dbg_skip_wmm=1` (no WMM parameters), `dbg_no_p2p=1` (no P2P interface). They exist only on the `omamobile-ingot` kernel branch; another kernel logs "unknown parameter" and ignores them. MSIs on the controller's own block is a device tree change, not an option |
 | `vendor/NetworkManager/conf.d/20-omamobile-wifi-mac.conf` | `/usr/lib/NetworkManager/conf.d` | The chip reports no permanent MAC, so ath11k makes one up at each load; Wi-Fi connections use a stable generated address (`wifi.cloned-mac-address=stable`) instead |
 | `vendor/environment.d/50-omamobile-libcamera.conf` | `/usr/lib/environment.d` | `LIBCAMERA_SOFTISP_MODE=cpu` for the session (WirePlumber's libcamera plugin, omacam): the software ISP's GPU debayer faults on this GPU. environment.d can't unset a variable, so to try the GPU set `LIBCAMERA_SOFTISP_MODE=gpu` in `~/.config/environment.d/` |
-| `bin/omamobile-ingot-firmware` | `/usr/bin` | Run by hand as root: installs the phone's own firmware from `modem_a` (see below). `plan`, `install [--dry-run] [--replace]`, `status`, `--help` |
+| `bin/omamobile-ingot-firmware` | `/usr/bin` | Run by hand as root: installs the phone's own firmware from `modem_a` and `bluetooth_a` (see below). `plan`, `install [--dry-run] [--replace]`, `status`, `--help` |
 | `share/firmware.map` | `/usr/share/omamobile/ingot/firmware.map` | What it copies (data, not code): `source-glob\|destination\|note` lines, and `wifi_board_name=` |
 | `vendor/systemd/network/20-usb-gadget.network` | `/usr/lib/systemd/network` | Sets usb0 to 172.16.42.1/24 after handover. Same file as the Pixel 7 package |
 | `vendor/systemd/logind.conf.d/10-omamobile-power-key.conf` | `/usr/lib/systemd/logind.conf.d` | A short power press does not power the phone off. Same drop-in as the Pixel 7 Pro package |
@@ -33,9 +33,9 @@ Omarchy Mobile's userspace package for the Solana Mobile Saga (codename ingot, S
 
 ## The phone's own firmware: `omamobile-ingot-firmware`
 
-The package ships no firmware. The GPU zap shader, the ADSP firmware and the Wi-Fi firmware and board data are the phone's own, on its `modem_a` partition (a FAT file system with Qualcomm's `image/` tree), and the tool copies them from there on the phone. SQE and GMU firmware and the Bluetooth firmware come from linux-firmware.
+The package ships no firmware. The GPU zap shader, the ADSP firmware and the Wi-Fi firmware and board data are the phone's own, on its `modem_a` partition (a FAT file system with Qualcomm's `image/` tree), and from 0.1.8 so is the Bluetooth NVM file, on its `bluetooth_a` partition (the same kind of file system); the tool copies them from there on the phone. SQE and GMU firmware and the Bluetooth patch firmware (`qca/hpbtfw21.tlv`) come from linux-firmware.
 
-| Destination | From `modem_a` (unconfirmed names) | Used by |
+| Destination | From the partition (`modem_a`'s names unconfirmed) | Used by |
 | --- | --- | --- |
 | `/usr/lib/firmware/qcom/sm8475/osom/ingot/a730_zap.mbn` (+ `a730_zap.bNN`) | `image/a730_zap.mdt` and its segments, or `image/a730_zap.mbn` | msm (the DT's `firmware-name`) |
 | `/usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.mdt` (+ `adsp.bNN`) | `image/adsp.mdt` and its segments, or `image/adsp.mbn` | the ADSP remoteproc |
@@ -43,14 +43,17 @@ The package ships no firmware. The GPU zap shader, the ADSP firmware and the Wi-
 | `/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/m3.bin` | `image/m3.bin` (or one folder down) | ath11k |
 | `/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/regdb.bin` | `image/regdb.bin` (or one folder down) | ath11k |
 | `/usr/lib/firmware/updates/ath11k/WCN6855/hw2.1/board-2.bin` | built from `image/bdwlang.elf` (or one folder down) and `wifi_board_name` | ath11k |
+| `/usr/lib/firmware/updates/qca/wcnhpnv21g.bin` | `bluetooth_a`: `image/hpnv21g.bin` (read from a Saga) | btqca (hci_uart) |
 
 How it works, and what it refuses:
 
-- It finds `modem_a` by `PARTNAME` in `/sys/class/block/*/uevent` and refuses unless there is exactly one, its `ro` reads 1 (the storage guard's; the tool never changes it) and it is not mounted. It checks that `/dev/<name>` is that partition's device number, mounts it read-only (`vfat`, `ro,nodev,nosuid,noexec`) on a private folder under `/run`, and always unmounts it. No other partition is read.
-- Sources are matched without regard to case; each must match exactly one file. A missing or ambiguous source is reported and skipped; the others are still installed. A `.mdt` is copied with its `.bNN` segments, named after the destination (`a730_zap.mbn` gets `a730_zap.b00`, the name the kernel's loader asks for).
-- Destinations must sit directly in the two firmware folders above; any other path in the map, `..` included, stops the run before anything is read.
+- It finds `modem_a` by `PARTNAME` in `/sys/class/block/*/uevent` and refuses unless there is exactly one, its `ro` reads 1 (the storage guard's; the tool never changes it) and it is not mounted. It checks that `/dev/<name>` is that partition's device number, mounts it read-only (`vfat`, `ro,nodev,nosuid,noexec`) on a private folder under `/run`, and always unmounts it.
+- A map source may name its partition (`bluetooth_a:image/hpnv21g.bin`); no prefix means `modem_a`. Only `modem_a` and `bluetooth_a` are accepted, and any other prefix stops the run before anything is read. `bluetooth_a` is checked exactly as `modem_a` (two of them, a writable or a mounted one is refused) and mounted the same way on its own folder, but only when the map names it, and a phone without one just has its entries reported missing. Both partitions are checked before either is mounted, and both are unmounted at the end. No other partition is read.
+- Sources are matched without regard to case, each only against its own partition's files; each must match exactly one file. A missing or ambiguous source is reported and skipped; the others are still installed. A `.mdt` is copied with its `.bNN` segments, named after the destination (`a730_zap.mbn` gets `a730_zap.b00`, the name the kernel's loader asks for).
+- Destinations must sit directly in the three firmware folders above (the zap and ADSP folder, `updates/ath11k/WCN6855/hw2.1` and `updates/qca`); any other path in the map, `..` included, stops the run before anything is read.
 - Files are installed 0644 root through a temporary file and a rename, read back, and recorded with their sha256 in `/var/lib/omamobile/ingot-firmware/installed.sha256`. A file already there that differs and is not in the record (a hand-installed copy), or that changed since this tool installed it, is kept and reported, and `install` exits 1; `--replace` overwrites it. `status` checks every recorded file.
 - `board-2.bin` is ath11k's board container (`QCA-ATH11K-BOARD`, then one board element holding a name element and a data element, each 4-byte aligned, as `ath11k_core_fetch_board_data_api_n` reads it) around the phone's `bdwlang.elf`. The name is the one ath11k looks for, built from the bus, the PCI vendor, device and subsystem ids, the QMI chip and board ids and the DT's `qcom,calibration-variant`, so it can't be known offline: set `wifi_board_name=` in `/etc/omamobile/ingot-firmware.conf` (kept across updates; it wins over the map's empty default). Without it the board file is skipped. `plan` prints the name from this boot's `failed to fetch board data for <name>` lines, and builds the same name from the `chip_id ... board_id` line, the PCI device and the device tree, to compare. Note that the installed file hides linux-firmware's `board-2.bin`, so a wrong name leaves Wi-Fi without board data.
+- The Bluetooth NVM file (0.1.8): the controller reports board id 0 (`qca_read_fw_board_id: bid = 0`), so btqca (`qca_get_nvm_name_by_board`) asks for `qca/wcnhpnv21g.bin`, the file without a board suffix; the `g` marks a chip made by GlobalFoundries, read from the SoC id. linux-firmware's copy of that file does not suit the Saga: every LE connection completed and then dropped with HCI status 0x3e (Connection Failed to be Established). The phone's own `hpnv21g.bin`, installed as an override in `updates/qca/`, fixed that (2026-11-12). The partition's `hpbtfw21.tlv` is older than linux-firmware's patch firmware, which works with this NVM, so it is not copied, nor are `hpnv21.bin` and the `hpnv21g.bNN` board files, which btqca does not ask for here. The file is read when the controller is probed: after an install that changed it, the tool says to run `modprobe -r hci_uart && modprobe hci_uart` (Bluetooth drops for a moment) or reboot.
 
 ## Sound (0.1.5)
 
@@ -73,6 +76,7 @@ Held awake, the buses' clocks never stop at run time. That costs idle power. A s
 The bring-up system had these by hand. A file in `/etc` with the same name as a package file wins over it (`/etc/systemd/system` over `/usr/lib/systemd/system`, `/etc/modprobe.d` over `/usr/lib/modprobe.d`, `/etc/udev/rules.d` over `/usr/lib/udev/rules.d`), so the package's versions never apply while a copy is there. On the phone, after the update:
 
 1. `omamobile-ingot-firmware plan`, then `omamobile-ingot-firmware install`. It keeps the hand-copied firmware that differs from `modem_a` and says so; files that match are adopted into the record. Once `plan` shows the same files, `install --replace` makes the record cover everything. Then `status`.
+   From 0.1.8 the same goes for a hand-copied `/usr/lib/firmware/updates/qca/wcnhpnv21g.bin`: a copy of `bluetooth_a`'s `hpnv21g.bin` is adopted, anything else is kept until `--replace`.
 2. Remove the hand-written units for the ADSP start and the Bluetooth address from `/etc/systemd/system` (and their `*.wants/` links: `systemctl disable <unit>` first), then `systemctl daemon-reload`. Use `systemctl list-unit-files | grep -i -e adsp -e bt` to find them.
 3. Remove the ath11k options file from `/etc/modprobe.d` (`grep -l ath11k /etc/modprobe.d/*`), and any `omamobile-*-bringup.conf` there.
 4. Remove the hand-edited `.desktop` override that set `LIBCAMERA_SOFTISP_MODE=cpu` (in `~/.local/share/applications/`), so the session's environment applies.
@@ -92,6 +96,7 @@ What could not be verified offline (the tests run every script against stand-ins
 - The zap shader under the `.mbn` name with `.bNN` segments loads (`dmesg | grep -i zap`), if the source turns out to be split.
 - `omamobile-adsp.service` starts the ADSP at boot (`systemctl status omamobile-adsp`, `cat /sys/class/remoteproc/*/state`), the battery reads (`upower -d`) and the boot is not slower; that the remoteproc's `firmware` reads `qcom/sm8475/osom/ingot/adsp.mdt`.
 - The Bluetooth unit runs for the controller (`systemctl status 'omamobile-bt-addr@*'`; the udev rule's `DRIVERS=="hci_uart_qca"` and `DEVTYPE` match), the controller leaves the unconfigured state (`btmgmt info`), keeps the same address across reboots, powers on and scans.
+- The Bluetooth NVM file, from 0.1.8: `plan` lists `bluetooth_a`'s `image/` and finds `image/hpnv21g.bin`; after `install` and a reload of `hci_uart`, `dmesg | grep QCA` shows `QCA Downloading qca/wcnhpnv21g.bin` and no `QCA Failed to request file` (the name is the same whether `updates/` or linux-firmware's copy is read, so the proof is that LE connections hold), and `findmnt` shows neither partition left mounted.
 - `modinfo ath11k | grep dbg_` lists the three options on the running kernel, `cat /sys/module/ath11k/parameters/dbg_*` reads Y after boot, and Wi-Fi connects as before.
 - NetworkManager applies the stable address (`nmcli -f GENERAL.HWADDR device show <ifname>` stays the same across reboots for a connection) and the `driver:ath11k_pci` match takes.
 - `systemctl --user show-environment | grep LIBCAMERA` in the session, and omacam and PipeWire's camera node still stream (on the CPU).
@@ -102,8 +107,8 @@ What could not be verified offline (the tests run every script against stand-ins
 
 - **Louder sound**: the amplifiers stay at their lowest gain until the kernel has speaker protection; see "Sound".
 - **Fingerprint**: its trusted-app files live outside `modem_a` and have no Linux path yet.
-- **Firmware from any partition but `modem_a`**: `modem_b`, `persist`, `modemst*`, `fsg`, `efs*` and `bluetooth_*` hold the phone's identity and calibration (or another slot's copy) and are never read by a package; a file that only exists there stays a hand step, with the owner's backup first.
+- **Firmware from any partition but `modem_a` and `bluetooth_a`**: `modem_b`, `bluetooth_b`, `persist`, `modemst*`, `fsg` and `efs*` hold the phone's identity and calibration (or another slot's copy) and are never read by a package; a file that only exists there stays a hand step, with the owner's backup first. `bluetooth_a` is read (read-only, as `modem_a`) from 0.1.8 for its NVM file alone.
 - **The Wi-Fi board name**: set once per phone in `/etc/omamobile/ingot-firmware.conf`, because it can only be read on the phone.
-- **Running `omamobile-ingot-firmware` itself**: by hand, as root, after an install or a stock update that changed `modem_a`; a package hook would mount a modem partition on every upgrade.
+- **Running `omamobile-ingot-firmware` itself**: by hand, as root, after an install or a stock update that changed `modem_a` or `bluetooth_a`; a package hook would mount those partitions on every upgrade.
 
 Not in this package: the boot-success marker, the modem, the charger guard and the cameras' bring-up. Those stay out until each one has its own runbook.
