@@ -52,7 +52,10 @@
 #   tools/ingot-fp-s4-test   -> its steps (but fprintd and lock) against the
 #                               fakes, in order, each PASS; one FAIL that
 #                               prints the stack's log; the stubs' requests
-#                               counted once (not their liblog copies)
+#                               counted once (not their liblog copies); the
+#                               pass-through's banner, log, results and
+#                               REFUSED requests (not an audit failure);
+#                               --rpmb-writes passed on
 #   ingot-fp-s4-test nofinger, morning (no terminal: setsid, stdin /dev/null,
 #                               output into a pipe)
 #                            -> nofinger: every part PASS, fprintd SKIP, the
@@ -425,12 +428,15 @@ int main(int argc, char **argv)
 		/* its liblog copy, as the shim prints it: not a second request */
 		printf("I omamobile-rpmb-stub[%d]: listener 0x2000 request 1: command 0x101, failing it; 00000101\n",
 		       (int)getpid());
-		/* the pass-through's: a read, and a write if enabled */
+		/* the pass-through's: a read, and a write (refused unless enabled) */
 		pt("listener 0x2000 request 2: command 0x102, frames 6 (248 per tx): tx1 auth-read addr 0x00a6 k 6 "
 		   "nonce=a7b36b67.. spo 512 ok, spi 3072 ok, resp 0x0400 addr 0x00a6 count 6 counter 0 -> result 0x0007");
 		if (writes)
 			pt("listener 0x2000 request 3: command 0x103, frames 1 (1 per tx): tx1 auth-write addr 0x0010 k 1 "
 			   "counter 5 spo 512 ok, spo result-read ok, spi 512 ok, resp 0x0300 addr 0x0010 counter 6 -> result 0x0000");
+		else
+			pt("listener 0x2000 request 3: command 0x103, frames 1 (1 per tx): REFUSED writes disabled "
+			   "(type 0x0003 addr 0x0010 k 1 counter 5) -> status -1");
 		fflush(stdout);
 		while (!done)
 			pause();
@@ -605,8 +611,10 @@ MP
       grep -q 'stage hal running' "$H/run/omamobile-fp-ingot/stage.log" 2>/dev/null && break; sleep 0.1
     done; echo 9 > "$H/sys/devices/platform/fingerprint/irq_count" ) &
   : > "$H/run/omamobile-fp-ingot/stage.log"
-  s4ok irq
+  s4ok irq --rpmb-writes
   grep -q 'irq_count rose by 6' "$out" || fail "s4 irq: the count"
+  grep -q 'writes ENABLED (OMAMOBILE_RPMB_WRITES=1)' "$S4LOGS/irq-stack.out" || fail "s4 irq --rpmb-writes: not passed to the stage"
+  grep -q '^ingot-fp-s4-test irq, .*; RPMB writes: ENABLED' "$out" || fail "s4 irq --rpmb-writes: not printed"
   grep -q 'netlink: irq event, finger down' "$out" || fail "s4 irq: the HAL's line"
   s4ok bridge
   grep -q 'READY gives no stage count' "$out" || fail "s4 bridge: READY's stage count"
@@ -615,10 +623,16 @@ MP
   [[ $(cat "$S4LOGS/enrolled-id") == 7 ]] || fail "s4 enrol: the saved id"
   s4ok verify
   s4ok storage
-  # ingot-fp-s4-test does not read the pass-through's lines yet: the old
-  # stub's only
-  grep -q 'rpmb: 2 requests, by command: 0x101 init x2' "$out" ||
-    fail "s4 storage: the listener's requests (one per start: irq, bridge)"
+  grep -q 'rpmb: 6 requests, by command: 0x101 init x2  0x102 read x2  0x103 write x2' "$out" ||
+    fail "s4 storage: the listener's requests, both shapes (three per start: irq, bridge)"
+  grep -q 'TrustZone asked for RPMB; the listener answered: 0x0007 x2, 0x0000 x1' "$out" || fail "s4 storage: the RPMB verdict"
+  grep -q 'the RPMB pass-through (latest start): device /dev/rpmb-wlu (c 241:1), .*, writes refused' "$out" ||
+    fail "s4 storage: the pass-through's banner"
+  grep -q "the listener's REFUSED requests: 1" "$out" || fail "s4 storage: the listener's refusals not counted"
+  grep -q 'REFUSED lines from the audit: 0' "$out" || fail "s4 storage: the listener's refusals counted as the audit's"
+  { grep -q "the RPMB pass-through's directory $STATE/data/vendor/omamobile-rpmb" "$out" && grep -q ' passthrough.log$' "$out" &&
+    grep -q '^      2026-01-01T00:00:00 omamobile-rpmb-pt\[[0-9]*\]: listener 0x2000 request 3: .*REFUSED writes disabled' "$out"; } ||
+    fail "s4 storage: the pass-through's directory listing and log"
   grep -q ' data/vendor_de/0/fpdata/7$' "$out" || fail "s4 storage: the template file in the listing"
   s4ok persist
   grep -q 'MATCH 7 after the restart' "$out" || fail "s4 persist: AUTH after the restart"
@@ -631,7 +645,7 @@ MP
   { grep -q '^S4 verify: FAIL (no stack running' "$out" && grep -q -- '--- the stack: last 40 lines' "$out"; } ||
     fail "s4 verify without a stack: no FAIL with the stack's log"
   (($(find "$S4LOGS" -name '*.log' | wc -l) == 9)) || fail "s4: a log per step run"
-  pass "ingot-fp-s4-test: irq, bridge, enrol, verify, storage, persist, delete, stop against the fakes; a failure shows the stack's log"
+  pass "ingot-fp-s4-test: irq (--rpmb-writes), bridge, enrol, verify, storage (the pass-through's banner, log, results, refusals), persist, delete, stop against the fakes; a failure shows the stack's log"
 
   # --- the aggregates, as over "ssh phone cmd": no terminal, stdin /dev/null,
   # output into a pipe that must close although the stack runs on ---

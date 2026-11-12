@@ -14,8 +14,11 @@
 #   ingot-fp-s4-test verify    AUTH with that finger (MATCH), then with another
 #                              finger (NOMATCH)
 #   ingot-fp-s4-test storage   what the stack wrote under the state directory
-#                              (names, sizes, owners), the stubs' RPMB/SSD
-#                              requests, and that no block device was opened
+#                              (names, sizes, owners), the RPMB pass-through's
+#                              log (its last 40 lines: requests, results,
+#                              refusals; no data blocks), the RPMB/SSD
+#                              listeners' requests, and that no block device
+#                              was opened (and the RPMB node only by qseecomd)
 #   ingot-fp-s4-test persist   stop the stack, start it again, LIST and AUTH
 #   ingot-fp-s4-test fprintd   fprintd-list/-enroll/-verify for your user
 #   ingot-fp-s4-test lock      S5: the Omarchy lock screen with the finger
@@ -52,6 +55,11 @@
 #   --yes        [INGOT_FP_YES=1]  never wait for Enter (and answer the lock
 #                                  step's questions "unanswered")
 #   --leave-running                nofinger: leave the stack running at the end
+#   --rpmb-writes [INGOT_FP_RPMB_WRITES=1]  passed to the stage when this
+#                                  script starts it (irq, bridge, nofinger's
+#                                  hal, any restart): the RPMB listener
+#                                  forwards TrustZone's authenticated writes to
+#                                  the chip; without it, it refuses them
 #   INGOT_FP_SECONDS (irq, default 30; nofinger's hal run, default 8),
 #   INGOT_FP_GAP (seconds to switch fingers where no Enter can be read:
 #   morning, or no terminal; default 8), INGOT_FP_ENROL_TRIES (morning:
@@ -95,6 +103,7 @@ GAP=${INGOT_FP_GAP:-8}
 ENROLL_TO=${INGOT_FP_ENROLL_TIMEOUT:-240}
 FINGER=${INGOT_FP_FINGER:-right-index-finger}
 ID_ARG='' LEAVE=0
+RPMB_WRITES=${INGOT_FP_RPMB_WRITES:-0}
 # an aggregate (nofinger, morning): never waits for Enter
 AGG=0
 [[ $STEP == nofinger || $STEP == morning ]] && AGG=1
@@ -107,6 +116,7 @@ while (($#)); do
     --user) USERNAME=${2:?}; shift ;;
     --yes) YES=1 ;;
     --leave-running) LEAVE=1 ;;
+    --rpmb-writes) RPMB_WRITES=1 ;;
     -[0-9]*|[0-9]*) ID_ARG=$1 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -130,6 +140,10 @@ usage() { sed -n '/^#   ingot-fp-s4-test irq/,/^#   .*right-index-finger)$/p' "$
 [[ $SECS =~ ^[0-9]+$ && $GAP =~ ^[0-9]+$ && ${INGOT_FP_ENROL_TRIES:-2} =~ ^[1-9][0-9]*$ &&
    $ENROLL_TO =~ ^[1-9][0-9]{0,4}$ ]] ||
   { echo "INGOT_FP_SECONDS, INGOT_FP_GAP, INGOT_FP_ENROL_TRIES and INGOT_FP_ENROLL_TIMEOUT take a number" >&2; exit 2; }
+[[ $RPMB_WRITES == 0 || $RPMB_WRITES == 1 ]] || { echo "INGOT_FP_RPMB_WRITES takes 0 or 1" >&2; exit 2; }
+# the stage's option for it, when this script starts the stack
+WARG=()
+((RPMB_WRITES)) && WARG=(--rpmb-writes)
 # omamobile-fp-ctl's own ENROLL timeout: after the HAL's, so its error is seen
 CTL_ENROLL=$((ENROLL_TO + 60))
 
@@ -247,11 +261,11 @@ start_stack() {
   else
     [[ -d $IMAGE ]] || { fail "no vendor tree $IMAGE (--image)"; return 1; }
     [[ -d $BIN ]] || { fail "no bin directory $BIN (--bin)"; return 1; }
-    does "starting: $STAGE bridge $(stage_args) --enroll-timeout $ENROLL_TO (in the background; output in $LOGS/stack.out)"
+    does "starting: $STAGE bridge $(stage_args) --enroll-timeout $ENROLL_TO${WARG[*]:+ ${WARG[*]}} (in the background; output in $LOGS/stack.out)"
     # no stack runs: an old run's log and socket must not read as this one's
     rm -f "$STAGELOG" "$SOCK"
     # shellcheck disable=SC2046
-    setsid "${WRAP[@]}" "$STAGE" bridge $(stage_args) --enroll-timeout "$ENROLL_TO" >> "$LOGS/stack.out" 2>&1 < /dev/null &
+    setsid "${WRAP[@]}" "$STAGE" bridge $(stage_args) --enroll-timeout "$ENROLL_TO" "${WARG[@]}" >> "$LOGS/stack.out" 2>&1 < /dev/null &
     p=$!
     echo "$p" > "$LOGS/stack.runner-pid"
     for ((i = 0; i < 1800; i++)); do
@@ -313,6 +327,16 @@ all_logs() {
   return 0
 }
 
+# The last line matching ERE $1 in the runner's output of the latest start
+# that logged one (the newest of the logs all_logs reads, then stage.log).
+latest_line() {
+  local f
+  while IFS= read -r f; do
+    grep -E -- "$1" "${f#* }" | tail -1 | grep . && return 0
+  done < <(stat -c '%.9Y %n' -- "$LOGS"/stack.out "$LOGS"/irq-stack.out 2>/dev/null | sort -rn)
+  grep -E -- "$1" "$STAGELOG" 2>/dev/null | tail -1
+}
+
 # The stack's log lines since MARK (a line count of stage.log) that look like
 # trouble: the HAL's E/F lines, errors, refusals, exits, RPMB.
 log_mark() { if [[ -f $STAGELOG ]]; then wc -l < "$STAGELOG"; else echo 0; fi; }
@@ -325,13 +349,14 @@ log_trouble() { # mark
   printf '      %s\n' "${t//$'\n'/$'\n'      }"
 }
 # One RPMB request, as the listener logs it on its stderr (not its liblog
-# copy, which would count twice): the old stub's ("..., failing it; <hex>")
-# or the emulator's ("... -> result 0x....").
-RPMB_RE='\] omamobile-rpmb-(stub|emu)\[[0-9]+\]: listener 0x[0-9a-f]+ request [0-9]+: command 0x[0-9a-f]+'
+# copy, which would count twice): the old stub's ("..., failing it; <hex>"),
+# the emulator's or the pass-through's ("... -> result 0x...." or, refused
+# by the pass-through, "... -> status -1").
+RPMB_RE='\] omamobile-rpmb-(stub|emu|pt)\[[0-9]+\]: listener 0x[0-9a-f]+ request [0-9]+: command 0x[0-9a-f]+'
 rpmb_since() { # mark -> the RPMB requests since then
   tail -n +"$(($1 + 1))" "$STAGELOG" 2>/dev/null | grep -cE "$RPMB_RE"
 }
-rpmb_results() { # request lines on stdin -> what the emulator answered, "0x0007 x12, 0x0000 x3" (empty: the stub's)
+rpmb_results() { # request lines on stdin -> what the listener answered, "0x0007 x12, 0x0000 x3" (empty: the stub's)
   sed -n 's/.* -> result \(0x[0-9a-fA-F]*\)$/\1/p' | sort | uniq -c | sort -k1,1nr -k2 |
     awk '{printf "%s%s x%s", (NR > 1 ? ", " : ""), $2, $1}'
 }
@@ -352,7 +377,7 @@ s_irq() {
   : > "$LOGS/irq-stack.out"
   rm -f "$STAGELOG"
   # shellcheck disable=SC2046
-  "${WRAP[@]}" "$STAGE" hal $(stage_args) --seconds "$SECS" >> "$LOGS/irq-stack.out" 2>&1 < /dev/null &
+  "${WRAP[@]}" "$STAGE" hal $(stage_args) --seconds "$SECS" "${WARG[@]}" >> "$LOGS/irq-stack.out" 2>&1 < /dev/null &
   p=$!
   for ((n = 0; n < 1200; n++)); do
     grep -q 'stage hal running' "$STAGELOG" 2>/dev/null && break
@@ -390,7 +415,7 @@ s_bridge() {
   info "Starts the bridge stage in the background if it isn't running:"
   info "qseecomd, then omamobile-fp-bridge-ingot as uid 1000, which opens the HAL"
   info "and serves fprintd's socket. Leave it running for the next steps."
-  info "(In a second terminal instead: $STAGE bridge $(stage_args) --enroll-timeout $ENROLL_TO)"
+  info "(In a second terminal instead: $STAGE bridge $(stage_args) --enroll-timeout $ENROLL_TO${WARG[*]:+ ${WARG[*]}})"
   criteria "the socket appears, STATUS answers READY ... and OK, LIST answers LIST"
   no_touch
   start_stack || return
@@ -446,9 +471,9 @@ s_storage() {
   local logs pids p c fd t bad=0 rpmb ssd
   step "what option (a) wrote, and what TrustZone asked for"
   info "Lists the state directory (names, sizes, owners; never contents), the"
-  info "stubs' logged RPMB and SSD requests, the runner's audit, and the stack's"
-  info "open device files."
-  criteria "the audit passed at every start with no REFUSED line, and no process of the stack has a block device (or any device outside the allowlist) open"
+  info "RPMB pass-through's log, the listeners' logged RPMB and SSD requests,"
+  info "the runner's audit, and the stack's open device files."
+  criteria "the audit passed at every start with no REFUSED line of its own (the RPMB listener's refusals are expected), and no process of the stack has a block device (or any device outside the allowlist, or the RPMB node unless it is qseecomd) open"
   no_touch
   if [[ -d $STATE ]]; then
     does "the state directory $STATE ($(du -sh "$STATE" 2>/dev/null | cut -f1)):"
@@ -456,17 +481,24 @@ s_storage() {
   else
     fail "no state directory $STATE"
   fi
-  # the RPMB emulator's (root's, 0700: this runs as root)
-  t=$STATE/data/vendor/omamobile-rpmb-emu
+  # the RPMB pass-through's (root's, 0700: this runs as root); its log
+  # holds one line per request, never a data block
+  t=$STATE/data/vendor/omamobile-rpmb
   if [[ -d $t ]]; then
-    does "the RPMB emulator's state $t (names, sizes, owners; never contents):"
+    does "the RPMB pass-through's directory $t (names, sizes, owners):"
     find "$t" -printf '%M %u:%g %10s %TY-%Tm-%Td %TH:%TM %P\n' 2>/dev/null | sort -k6 | sed 's/^/      /'
+    if [[ -f $t/passthrough.log ]]; then
+      does "the last 40 lines of $t/passthrough.log:"
+      tail -n 40 "$t/passthrough.log" | sed 's/^/      /'
+    else
+      info "no passthrough.log in it (no pass-through listener started yet)"
+    fi
   else
-    info "no RPMB emulator state $t (the old stub, or no start yet)"
+    info "no RPMB pass-through directory $t (an older listener, or no start yet)"
   fi
   logs=$(all_logs)
-  does "the stubs' requests (from the runner's output of this test's starts):"
-  # the stub's own stderr line (its liblog copy would count twice)
+  does "the listeners' requests (from the runner's output of this test's starts):"
+  # the listener's own stderr line (its liblog copy would count twice)
   rpmb=$(grep -E "$RPMB_RE" <<<"$logs" || true)
   ssd=$(grep -E '\] omamobile-ssd-stub\[[0-9]+\]: listener 0x[0-9a-f]+ request [0-9]+: command 0x[0-9a-f]+' <<<"$logs" || true)
   for t in rpmb ssd; do
@@ -482,15 +514,20 @@ s_storage() {
     info "  => TrustZone did not ask for RPMB"
   else
     c=$(rpmb_results <<<"$rpmb")
-    info "  => TrustZone asked for RPMB; ${c:+the emulator answered: $c}${c:-the stub answered 'failed'}"
+    if [[ -n $c ]]; then info "  => TrustZone asked for RPMB; the listener answered: $c"
+    else info "  => TrustZone asked for RPMB; the stub answered 'failed'"; fi
   fi
-  # the emulator's own account of its state, at its latest start
-  c=$(grep -E '\] omamobile-rpmb-emu\[[0-9]+\]: rpmb emulator: ' <<<"$logs" | tail -1 | sed 's/.*: rpmb emulator: //')
-  [[ -n $c ]] && info "  the RPMB emulator (latest start): $c"
+  # the pass-through's banner at its latest start, and what it refused
+  # (writes while they are refused, key programming always): expected
+  c=$(latest_line '\] omamobile-rpmb-pt\[[0-9]+\]: rpmb pass-through: ' | sed 's/.*: rpmb pass-through: //')
+  [[ -n $c ]] && info "  the RPMB pass-through (latest start): $c"
+  c=$(grep -cE "$RPMB_RE.*REFUSED" <<<"$logs")
+  info "  the listener's REFUSED requests: $c$( ((c)) && echo ' (writes while refused, or key programming: expected)')"
   does "the runner's audit at each start:"
-  info "  audit passed: $(grep -c 'ingot-fp: audit passed' <<<"$logs") time(s); REFUSED lines: $(grep -c 'REFUSED' <<<"$logs")"
-  grep -q 'ingot-fp: audit passed' <<<"$logs" || fail "no 'audit passed' in the runner's output"
-  grep -q 'REFUSED' <<<"$logs" && fail "the audit refused something"
+  # only the runner's own lines: the listener's refusals are not the audit's
+  info "  audit passed: $(grep -c '^ingot-fp: audit passed' <<<"$logs") time(s); REFUSED lines from the audit: $(grep -c '^ingot-fp: .*REFUSED' <<<"$logs")"
+  grep -q '^ingot-fp: audit passed' <<<"$logs" || fail "no 'audit passed' in the runner's output"
+  grep -q '^ingot-fp: .*REFUSED' <<<"$logs" && fail "the audit refused something"
   grep -E '^ingot-fp:   c [0-9:]+ ' <<<"$logs" | sort -u | sed 's/^/      /'
   if running; then
     does "device files the stack's processes have open now (by device number):"
@@ -499,6 +536,11 @@ s_storage() {
     # also in the tests: the processes' own stdin is the host's /dev/null)
     for t in null zero full random urandom qseecom blfp dma_heap/default_cma_region; do
       [[ -c /dev/$t ]] && allowed[$(stat -c '%t:%T' "/dev/$t")]=$t
+    done
+    # the RPMB W-LU's bsg node (the runner's /dev/rpmb-wlu): qseecomd's only
+    local rpmb_mm=none
+    for t in /dev/bsg/*:*:*:49476; do
+      [[ -c $t ]] && { rpmb_mm=$(stat -c '%t:%T' "$t"); allowed[$rpmb_mm]="rpmb-wlu ($t)"; }
     done
     # every descendant of the namespace's PID 1, from one pass over /proc
     # (builtins only: a sed per process per level took a minute)
@@ -520,7 +562,9 @@ s_storage() {
           "character special file "*)
             [[ -n ${seen[$p:${t##* }]:-} ]] && continue
             seen[$p:${t##* }]=1
-            if [[ -n ${allowed[${t##* }]:-} ]]; then
+            if [[ ${t##* } == "$rpmb_mm" && $(cat "/proc/$p/comm" 2>/dev/null) != qseecomd ]]; then
+              info "  $(cat "/proc/$p/comm" 2>/dev/null) ($p): the RPMB node ${t##* } $(readlink "$fd")  <- NOT ALLOWED (qseecomd's only)"; bad=1
+            elif [[ -n ${allowed[${t##* }]:-} ]]; then
               info "  $(cat "/proc/$p/comm" 2>/dev/null) ($p): ${allowed[${t##* }]} (${t##* })"
             else
               info "  $(cat "/proc/$p/comm" 2>/dev/null) ($p): character device ${t##* } $(readlink "$fd")  <- NOT ALLOWED"; bad=1
@@ -806,9 +850,9 @@ n_hal() {
   before=$(cat "$SYSFP/irq_count" 2>/dev/null) || before=unreadable
   : > "$o"
   rm -f "$STAGELOG"
-  does "$STAGE hal $(stage_args) --seconds $SECS (output in $o; at most $((SECS + 150)) s)"
+  does "$STAGE hal $(stage_args) --seconds $SECS${WARG[*]:+ ${WARG[*]}} (output in $o; at most $((SECS + 150)) s)"
   # shellcheck disable=SC2046
-  "${WRAP[@]}" timeout $((SECS + 150)) "$STAGE" hal $(stage_args) --seconds "$SECS" >> "$o" 2>&1 < /dev/null
+  "${WRAP[@]}" timeout $((SECS + 150)) "$STAGE" hal $(stage_args) --seconds "$SECS" "${WARG[@]}" >> "$o" 2>&1 < /dev/null
   rc=$?
   info "the runner exited with $rc$( ((rc == 124)) && echo ' (timed out)')"
   grep -E 'S3 PASS|S3 FAIL|fingerprint/(chipid|irq_count)|audit (passed|failed)|REFUSED|error:' "$o" | sed 's/^/    /'
@@ -959,7 +1003,7 @@ m_enrol() {
     r=$(rpmb_since "$mark")
     if ((r > 0)); then
       c=$(tail -n +"$((mark + 1))" "$STAGELOG" 2>/dev/null | grep -E "$RPMB_RE" | rpmb_results)
-      info "TrustZone asked for RPMB $r time(s) during this enrolment (${c:+the emulator answered: $c}${c:-the stub answered 'failed'})"
+      info "TrustZone asked for RPMB $r time(s) during this enrolment (the $([[ -n $c ]] && echo "listener answered: $c" || echo "stub answered 'failed'"))"
     fi
     [[ -n $id ]] && break
     r=$(grep -E '^<- (ERROR|LOCKOUT)' "$f" | tail -1 | cut -c4-)
@@ -1063,8 +1107,9 @@ STEPLOG=$LOGS/$STEP-$(date +%Y%m%d-%H%M%S).log
 TEE=(tee -a)
 tee --output-error=warn-nopipe -a /dev/null < /dev/null > /dev/null 2>&1 && TEE=(tee --output-error=warn-nopipe -a)
 exec > >("${TEE[@]}" "$STEPLOG") 2>&1
-printf 'ingot-fp-s4-test %s, %s; runner %s, image %s, bin %s, state %s\n' \
-  "$STEP" "$(date -Is)" "$STAGE" "$IMAGE" "$BIN" "$STATE"
+printf 'ingot-fp-s4-test %s, %s; runner %s, image %s, bin %s, state %s; RPMB writes: %s\n' \
+  "$STEP" "$(date -Is)" "$STAGE" "$IMAGE" "$BIN" "$STATE" \
+  "$( ((RPMB_WRITES)) && echo 'ENABLED (--rpmb-writes, when this script starts the stack)' || echo 'refused by the listener')"
 if ((AGG)); then
   exec < /dev/null
   "a_$STEP"
