@@ -1,0 +1,54 @@
+From 0a58b5965ae3f837050279d938fa176533788dda Mon Sep 17 00:00:00 2001
+From: Agathe Porte <agathe.porte@oss.qualcomm.com>
+Date: Mon, 26 Oct 2026 16:03:08 +0100
+Subject: [PATCH] tqtfp-populate-readwrite: use libexec instead of usrbin
+
+meson currently installs `/usr/bin/populate-readwrite.sh`, which is not
+great in a distro context:
+
+ * The name is too generic as nothing ties it to the tqftpserv package;
+ * The .sh extension should not appear in /usr/bin/
+
+The second point is raised via the script-with-language-extension
+lintian tag.
+
+Move the script to a new `/usr/libexec/tqftpserv/` directory to fix the
+two listed issues.
+
+Closes: #57
+
+Signed-off-by: Agathe Porte <agathe.porte@oss.qualcomm.com>
+---
+ meson.build                             | 2 +-
+ tqftpserv-populate-readwrite.service.in | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index 4979cf0..33ff571 100644
+--- a/meson.build
++++ b/meson.build
+@@ -61,7 +61,7 @@ executable('tqftpserv',
+ configure_file(
+   input : 'populate-readwrite.sh',
+   output : 'populate-readwrite.sh',
+-  install_dir : prefix / 'bin',
++  install_dir : prefix / 'libexec' / 'tqftpserv',
+   copy : true)
+ 
+ if systemd_system_unit_dir != ''
+diff --git a/tqftpserv-populate-readwrite.service.in b/tqftpserv-populate-readwrite.service.in
+index 5da4363..0f6416f 100644
+--- a/tqftpserv-populate-readwrite.service.in
++++ b/tqftpserv-populate-readwrite.service.in
+@@ -6,7 +6,7 @@ Before=tqftpserv.service
+ 
+ [Service]
+ Type=oneshot
+-ExecStart=@prefix@/bin/populate-readwrite.sh
++ExecStart=@prefix@/libexec/tqftpserv/populate-readwrite.sh
+ 
+ [Install]
+ WantedBy=multi-user.target
+-- 
+2.56.0
+

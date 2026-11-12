@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: 0BSD
+#
+# Omarchy Mobile build of lpac, the eSIM LPA (SGP.22 Local Profile
+# Assistant), for the Solana Mobile Saga (ingot), whose eUICC sits behind
+# the Qualcomm modem's UIM service. Neither Arch Linux nor Arch Linux ARM
+# packages it; derived from the AUR's lpac PKGBUILD. Choices:
+#  - APDU backends: qmi_qrtr (QMI UIM over QRTR, the Saga's path: no
+#    /dev/cdc-wdm on this modem), qmi (QMI over a cdc-wdm device), at and
+#    pcsc; HTTP through curl. libqmi and libqrtr-glib come from [extra].
+#  - one package: libeuicc and the drivers are linked in statically
+#    (no LPAC_DYNAMIC_*), so nothing else on the system can pick them up.
+#  - cJSON stays vendored: lpac 2.3.0 has no option to build against a
+#    system cjson (and extends it with its own cJSON_ex).
+#  - `lpac version` is stamped in prepare(), in the version applet's own
+#    fallback string. Upstream generates src/version.h from git at build
+#    time, but the applet that prints it includes "version.h" from its own
+#    folder (src/applet/version.h, a different file), so the generated
+#    header is never seen and a tarball build says v0.0.0-unknown. (A
+#    -DLPAC_VERSION="..." in CMAKE_C_FLAGS loses its quotes under ninja's
+#    shell and fails to compile.)
+
+pkgname=lpac
+pkgver=2.3.0
+pkgrel=1
+pkgdesc='eUICC (eSIM) Local Profile Assistant, with the QMI-over-QRTR backend'
+arch=(aarch64)
+url='https://github.com/estkme-group/lpac'
+license=(AGPL-3.0-only LGPL-2.1-only MIT)
+depends=(curl glib2 glibc libqmi libqrtr-glib pcsclite)
+makedepends=(cmake ninja pkgconf)
+optdepends=('ccid: USB smart card readers, for the pcsc backend')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/estkme-group/lpac/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('661dffbd1e9e5732dab4a0bb0a9837d4906c8c66bd748bda262fe3e8d3e420f6')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  grep -q '"v0.0.0-unknown"' src/applet/version.c
+  sed -i "s/\"v0.0.0-unknown\"/\"v$pkgver\"/" src/applet/version.c
+}
+
+build() {
+  cmake -G Ninja -B build -S "$pkgname-$pkgver" \
+    -DCMAKE_BUILD_TYPE=None \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_SKIP_INSTALL_RPATH=ON \
+    -DLPAC_WITH_APDU_QMI=ON \
+    -DLPAC_WITH_APDU_QMI_QRTR=ON \
+    -DLPAC_WITH_APDU_AT=ON \
+    -DLPAC_WITH_APDU_PCSC=ON \
+    -DLPAC_WITH_HTTP_CURL=ON \
+    -Wno-dev
+  cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+  cd "$pkgname-$pkgver"
+  install -Dm644 docs/{USAGE,ENVVARS,FAQ}.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 LICENSES/{AGPL-3.0-only,LGPL-2.1-only,MIT}.txt -t "$pkgdir/usr/share/licenses/$pkgname"
+}

@@ -1,0 +1,45 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline checks for the lpac package: the PKGBUILD pins one checksum per
+# source, builds the backends the Saga needs (QMI over QRTR, with libqmi and
+# libqrtr-glib as dependencies) and ships the upstream docs and licences it
+# names. (That the tarball builds was checked with tools/build-packages
+# --local ingot; this test has no network and no tarball.)
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")/.."
+fails=0
+fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+pass() { echo "ok: $*"; }
+
+# shellcheck disable=SC1091
+( source ./PKGBUILD
+  [[ $pkgname == lpac ]] || exit 1
+  [[ ${#source[@]} == 1 && ${#sha256sums[@]} == 1 ]] || exit 2
+  [[ ${sha256sums[0]} =~ ^[0-9a-f]{64}$ ]] || exit 3
+  [[ ${source[0]} == *"/v$pkgver.tar.gz" ]] || exit 4
+  [[ ${arch[*]} == aarch64 ]] || exit 5
+) && pass "PKGBUILD: one pinned tarball for v$(sed -n 's/^pkgver=//p' PKGBUILD), aarch64" \
+  || fail "PKGBUILD pins (exit $?): the tarball and its sha256 do not line up"
+
+for opt in LPAC_WITH_APDU_QMI_QRTR=ON LPAC_WITH_APDU_QMI=ON LPAC_WITH_HTTP_CURL=ON; do
+  grep -q -- "-D$opt" PKGBUILD && pass "PKGBUILD builds with $opt" || fail "PKGBUILD lost -D$opt"
+done
+! grep -q -- '-DLPAC_DYNAMIC' PKGBUILD && pass "libeuicc and the drivers are linked in statically (no LPAC_DYNAMIC_*)" \
+  || fail "PKGBUILD sets an LPAC_DYNAMIC_* option: that splits libeuicc.so out, which nothing else uses"
+
+# shellcheck disable=SC1091
+( source ./PKGBUILD
+  for d in curl libqmi libqrtr-glib glib2; do [[ " ${depends[*]} " == *" $d "* ]] || exit 1; done
+) && pass "depends on curl, glib2, libqmi and libqrtr-glib (the QMI-over-QRTR and HTTP backends)" \
+  || fail "depends lost curl, glib2, libqmi or libqrtr-glib"
+
+grep -q 'v0.0.0-unknown.*v\$pkgver.*src/applet/version.c' PKGBUILD && pass "prepare() stamps the release version in the version applet's fallback (it never sees upstream's generated header)" \
+  || fail "prepare() no longer stamps src/applet/version.c: lpac version would say v0.0.0-unknown"
+grep -q 'docs/{USAGE,ENVVARS,FAQ}.md' PKGBUILD && pass "installs upstream USAGE, ENVVARS and FAQ" || fail "the upstream docs are not installed"
+grep -q 'LICENSES/{AGPL-3.0-only,LGPL-2.1-only,MIT}.txt' PKGBUILD && pass "installs the three licences (lpac, libeuicc, cJSON)" \
+  || fail "the licence files are not installed"
+grep -q 'qmi_qrtr' README.md && grep -q 'LPAC_APDU_QMI_UIM_SLOT' README.md \
+  && pass "README names the QRTR backend and the UIM slot variable" || fail "README lost the QRTR backend or the UIM slot variable"
+
+((fails)) && { echo "$fails test(s) failed" >&2; exit 1; }
+echo "lpac: all tests passed"
