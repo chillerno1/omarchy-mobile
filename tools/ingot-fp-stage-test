@@ -224,6 +224,22 @@ done
 st check > "$out" 2>&1 || fail "check after the pass-through faults are undone"
 pass "audit: the RPMB pass-through's directory root's 0700, its files listed; check and audit refuse a 0770 one, a link in it"
 
+# The log is rotated at a start once past its size: .1 moves to .2, the
+# log to .1; a small one stays; rotated files pass the directory audit.
+head -c 1048577 /dev/zero > "$RPMB/passthrough.log" && chmod 0600 "$RPMB/passthrough.log"
+printf 'old' > "$RPMB/passthrough.log.1" && chmod 0600 "$RPMB/passthrough.log.1"
+st audit > "$out" 2>&1 || fail "audit with a log to rotate"
+grep -q 'rotating the RPMB pass-through.s log (1048577 bytes): passthrough.log -> .1 -> .2' "$out" || fail "rotation: not said"
+[[ ! -e $RPMB/passthrough.log && $(stat -c %s "$RPMB/passthrough.log.1") == 1048577 && $(cat "$RPMB/passthrough.log.2") == old ]] ||
+  fail "rotation: .log -> .1 -> .2 ($(ls -l "$RPMB"))"
+grep -q "  $RPMB/passthrough.log.1: root's, 0600, 1048577 bytes" "$out" || fail "rotation: the rotated log not listed by the audit"
+printf 'small' > "$RPMB/passthrough.log" && chmod 0600 "$RPMB/passthrough.log"
+st audit > "$out" 2>&1 || fail "audit with a small log"
+grep -q 'rotating' "$out" && fail "rotation: a small log was rotated"
+[[ $(cat "$RPMB/passthrough.log") == small ]] || fail "rotation: the small log changed"
+rm -f "$RPMB"/passthrough.log*
+pass "audit: the pass-through's log rotated past 1 MiB (.1, .2 kept), a small one left alone"
+
 st audit > "$out" 2>&1 || fail "audit (socket directory)"
 grep -q "  /dev/socket/omamobile-fp: bind of the host's $H/run/omamobile-fp/sock" "$out" || fail "audit: socket directory bind"
 grep -q "  $H/run/omamobile-fp/sock: empty" "$out" || fail "audit: socket directory empty"

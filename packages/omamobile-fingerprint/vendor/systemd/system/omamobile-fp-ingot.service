@@ -1,43 +1,60 @@
 # SPDX-License-Identifier: MIT
 # The Solana Saga's (ingot) fingerprint stack: the vendor's qseecomd with
-# our stub RPMB and SSD listener libraries, and omamobile-fp-bridge-ingot,
-# which hosts the vendor fingerprint HAL and serves fprintd's omamobile_udfps
-# driver at /run/omamobile-fp/sock/bridge.sock (the runner's "bridge" stage;
-# ingot-fp-stage's header lists what it allows the chroot).
+# our RPMB pass-through and SSD listener libraries, and
+# omamobile-fp-bridge-ingot, which hosts the vendor fingerprint HAL and
+# serves fprintd's omamobile_udfps driver at /run/omamobile-fp/sock/bridge.sock
+# (the runner's "bridge" stage; ingot-fp-stage's header lists what it
+# allows the chroot). The runner loads qcom_qseecom_user and betterlife-fp
+# itself when their nodes are missing.
 #
-# Opt-in: the package does not enable it (systemctl enable --now
-# omamobile-fp-ingot). Neither the vendor's files nor the bionic programs
-# are part of the package, so it is skipped (logged as an unmet condition)
-# until both are in place:
-#   /usr/lib/omamobile-fp-ingot/root   tools/extract-fingerprint-vendor-ingot
-#                                      (the user's own files)
-#   /usr/lib/omamobile-fp-ingot/bin    librpmb.so, libssd.so,
-#                                      omamobile-fp-bridge-ingot and
-#                                      omamobile-fp-shim.so (fingerprint/ingot)
+# Enabled by the package (a vendor wants link), like the Pixels'
+# omamobile-fp, and inert until the vendor's files are in place: the unit
+# is skipped (logged as an unmet condition) without
+#   /usr/lib/omamobile-fp-ingot/root   tools/ingot-fp-provision (the phone's
+#                                      own slot B files, never shipped)
+# Our bionic programs ship with the package in /usr/lib/omamobile-fp-ingot/bin
+# (librpmb.so, libssd.so, omamobile-fp-bridge-ingot, omamobile-fp-shim.so),
 # and the runner refuses, with its reasons in the journal, if they are not
 # what it expects. Everything persistent lives in /var/lib/omamobile-fp-ingot
-# on the root file system: no partition, no RPMB, no block device.
+# on the root file system; no partition is mounted or opened.
+#
+# The RPMB: the trusted app keeps its templates in QSEE's secure file
+# system, which needs the phone's real RPMB, so the listener forwards
+# TrustZone's own authenticated reads and writes unchanged (--rpmb-writes;
+# without it the trusted app cannot store a finger). It never builds,
+# changes or replays a frame, always refuses key programming, and logs
+# every request (never a data block) in
+# /var/lib/omamobile-fp-ingot/data/vendor/omamobile-rpmb/passthrough.log,
+# root's, rotated by the runner at a start.
+#
+# A restart is fine on this phone (the trusted app reloads its state from
+# the secure file system; the S4 persist step stops and starts the stack
+# in one boot), so a stack that dies comes back a few times; past the
+# limit it stays down until a reboot or a start by hand, and the lock
+# screen uses the PIN meanwhile. A stop by hand (exit 0) is not restarted.
 [Unit]
 Description=Omarchy Mobile fingerprint for the Solana Saga (vendor HAL and bridge)
-After=systemd-modules-load.service
+After=systemd-modules-load.service systemd-udevd.service
 ConditionPathIsDirectory=/usr/lib/omamobile-fp-ingot/root
 ConditionPathExists=/usr/lib/omamobile-fp-ingot/bin/omamobile-fp-bridge-ingot
 ConditionPathExists=/usr/lib/omamobile-fp-ingot/bin/librpmb.so
 ConditionPathExists=/usr/lib/omamobile-fp-ingot/bin/libssd.so
+StartLimitIntervalSec=600
+StartLimitBurst=3
 
 [Service]
-ExecStart=/usr/lib/omamobile-fp-ingot/ingot-fp-stage bridge --image /usr/lib/omamobile-fp-ingot/root --bin /usr/lib/omamobile-fp-ingot/bin --state /var/lib/omamobile-fp-ingot
+ExecStart=/usr/lib/omamobile-fp-ingot/ingot-fp-stage bridge --image /usr/lib/omamobile-fp-ingot/root --bin /usr/lib/omamobile-fp-ingot/bin --state /var/lib/omamobile-fp-ingot --rpmb-writes
 # TERM to the runner only: it stops the bridge first (the HAL closes, the
 # trusted app unloads), then qseecomd; whatever is left after the timeout
 # gets KILL.
 KillMode=mixed
 TimeoutStopSec=30
-# Until S4 has shown how the trusted app takes a restart: a failed stack
-# stays failed, and the lock screen uses the password.
-Restart=no
+Restart=on-failure
+RestartSec=5
 # No ExecStopPost cleanup of the socket directory: it is the Pixel runner's
-# path too. A stale socket refuses connections (fprintd lists no device), and
-# the next start replaces it.
+# path too, and the runner removes it at its own stop. A stale socket
+# refuses connections (fprintd lists no device), and the next start
+# replaces it.
 
 [Install]
 WantedBy=multi-user.target

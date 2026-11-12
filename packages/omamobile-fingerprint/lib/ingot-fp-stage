@@ -114,7 +114,9 @@
 #     drop too: $STATE/data/vendor/omamobile-rpmb on the host, root's, 0700,
 #     holding only regular files, root's, 0600. check and the audit refuse
 #     it otherwise, never repair it: uid 1000 owns data/vendor and could
-#     leave its own directory or a link there.
+#     leave its own directory or a link there. A start rotates the log
+#     once it is past RPMB_LOG_ROTATE_BYTES (passthrough.log.1, .2; the
+#     oldest dropped), before the listener opens it.
 #   - The fd audit (audit_fds), once the listeners are registered and again
 #     once the HAL host or the bridge's socket is up: every process of the
 #     namespace may hold only sockets, pipes, anonymous inodes, the
@@ -151,12 +153,14 @@
 # qcom_qseecom_user and betterlife-fp.
 #
 # Shipped by omamobile-fingerprint as /usr/lib/omamobile-fp-ingot/ingot-fp-stage
-# (tools/ingot-fp-stage links here); its unit omamobile-fp-ingot.service runs
-# the bridge stage on /usr/lib/omamobile-fp-ingot/{root,bin}, opt-in.
+# (tools/ingot-fp-stage links here); its unit omamobile-fp-ingot.service,
+# on by default once tools/ingot-fp-provision has put the vendor's files in
+# /usr/lib/omamobile-fp-ingot/root, runs the bridge stage on
+# /usr/lib/omamobile-fp-ingot/{root,bin} with --rpmb-writes at every boot.
 #
 # Modules: a start (not check) loads qcom_qseecom_user when /dev/qseecom is
 # missing, and betterlife-fp for hal and bridge when /dev/blfp is, BEFORE
-# its precondition check: nothing loads them at boot.
+# its precondition check: nothing else loads them at boot.
 #
 # Tests: tools/ingot-fp-stage-test. OMAMOBILE_FP_TEST_ROOT (host /dev, /sys
 # and /run under a fake tree; "device nodes" there are regular files
@@ -194,6 +198,9 @@ BRIDGE_STATE=/data/vendor/omamobile-fp
 # The RPMB pass-through's directory, in the chroot, and its one file
 RPMB_DIR=/data/vendor/omamobile-rpmb
 RPMB_LOG=$RPMB_DIR/passthrough.log
+# A start rotates the log past this size (about 5000 requests; a day of
+# unlocking is a few hundred), keeping two old ones
+RPMB_LOG_ROTATE_BYTES=$((1024 * 1024))
 # The RPMB node in the chroot (rpmb_find maps it to the host's)
 RPMB_NODE='rpmb-wlu'
 # The UFS RPMB well-known LU (W-LUN 0xC4) as a SCSI LUN: 0xC144, fixed by
@@ -759,8 +766,26 @@ setup_state() {
   install -d -m 0700 "$STATE$RPMB_DIR"
   chown 0:0 "$STATE$RPMB_DIR"
   chmod 0700 "$STATE$RPMB_DIR"
+  rpmb_log_rotate
   # the audit finds this marker through both persist mount points
   : > "$STATE/persist/.omamobile-fp-ingot"
+}
+
+# The pass-through's log, before the listener opens it (O_APPEND, so a
+# rotation while it runs would be lost): past RPMB_LOG_ROTATE_BYTES, .1 and
+# .2 move up and the oldest goes. Only regular files, never through a link
+# (rpmb_dir_ok refuses the directory otherwise; this is the backstop).
+rpmb_log_rotate() {
+  local f=$STATE$RPMB_LOG s
+  [[ -f $f && ! -L $f ]] || return 0
+  s=$(stat -c %s -- "$f") || return 0
+  ((s > RPMB_LOG_ROTATE_BYTES)) || return 0
+  say "rotating the RPMB pass-through's log ($s bytes): passthrough.log -> .1 -> .2"
+  [[ -L $f.1 || -L $f.2 ]] && die "$f.1 or $f.2 is a link: refusing"
+  rm -f -- "$f.2"
+  [[ -f $f.1 ]] && mv -f -- "$f.1" "$f.2"
+  mv -f -- "$f" "$f.1"
+  return 0
 }
 
 setup() {

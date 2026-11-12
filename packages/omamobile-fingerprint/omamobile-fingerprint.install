@@ -3,8 +3,10 @@ post_install() {
   echo "omamobile-fingerprint: omamobile-fp starts at boot once Google's files are in"
   echo "  /usr/lib/omamobile-fp/root (tools/phone-provision). Its first start copies"
   echo "  mfg_data and persist:/ss read-only and writes Trusty's secure storage."
-  echo "  On the Solana Saga: omamobile-fp-ingot (off by default) runs once the vendor's"
-  echo "  files are in /usr/lib/omamobile-fp-ingot/root and our programs in .../bin."
+  echo "  On the Solana Saga: omamobile-fp-ingot starts at boot once the phone's own"
+  echo "  vendor files are in /usr/lib/omamobile-fp-ingot/root (tools/ingot-fp-provision);"
+  echo "  its RPMB listener forwards TrustZone's own reads and writes to the phone's RPMB"
+  echo "  and logs every request in /var/lib/omamobile-fp-ingot/data/vendor/omamobile-rpmb/."
 }
 post_upgrade() {
   systemctl daemon-reload 2>/dev/null || true

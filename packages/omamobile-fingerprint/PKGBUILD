@@ -12,6 +12,10 @@ depends=(bash python util-linux coreutils diffutils systemd kmod fprintd e2fspro
 optdepends=('fprintd: fingerprint unlock and sudo through PAM'
             'libfprint: the Omarchy Mobile build, with the omamobile_udfps driver')
 install=omamobile-fingerprint.install
+# The bionic programs (prebuilt/, prebuilt/ingot/) ship as built and tested
+# on the computer; makepkg's strip would rewrite them (the Saga's runner
+# checks them by content).
+options=(!strip)
 
 check() {
   "$startdir/test/all"

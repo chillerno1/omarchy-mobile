@@ -3,9 +3,13 @@
 # Stage omamobile-fingerprint into DESTDIR. Google's Android
 # files are not part of the package: tools/extract-fingerprint-vendor makes
 # them from the user's own factory image (/usr/lib/omamobile-fp/root,
-# MANIFEST, SOURCE). The bionic programs are built on the computer first:
+# MANIFEST, SOURCE), and tools/ingot-fp-provision the Solana Saga's from
+# its own slot B (/usr/lib/omamobile-fp-ingot/root). The bionic programs
+# are built on the computer first (the Pixels', then the Saga's):
 #   make -C fingerprint CLANG=... BIONIC=... CHROOT=out/fingerprint-vendor/root \
 #     OUT=$PWD/packages/omamobile-fingerprint/prebuilt
+#   make -C fingerprint/ingot NDK=... CHROOT=out/fingerprint-vendor-ingot/root \
+#     OUT=$PWD/packages/omamobile-fingerprint/prebuilt/ingot
 #   ./install DESTDIR
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
@@ -27,15 +31,22 @@ install -Dm644 vendor/systemd/system/omamobile-fp.service "$d/usr/lib/systemd/sy
 # inert until tools/phone-provision has pushed Google's files.
 install -d "$d/usr/lib/systemd/system/multi-user.target.wants"
 ln -sfn ../omamobile-fp.service "$d/usr/lib/systemd/system/multi-user.target.wants/omamobile-fp.service"
-# The Solana Saga (ingot): its runner and its unit, NOT enabled (opt-in,
-# systemctl enable --now omamobile-fp-ingot). The vendor's files
-# (tools/extract-fingerprint-vendor-ingot) go to /usr/lib/omamobile-fp-ingot/root
-# and the bionic programs (fingerprint/ingot) to /usr/lib/omamobile-fp-ingot/bin,
-# by hand; until then the unit is skipped. fprintd's drop-in and the PAM file
-# below serve both phones.
-install -Dm755 lib/ingot-fp-stage "$d/usr/lib/omamobile-fp-ingot/ingot-fp-stage"
+# The Solana Saga (ingot): its runner, our bionic programs for its chroot
+# (fingerprint/ingot, built on the computer into prebuilt/ingot/: the RPMB
+# pass-through and SSD listener libraries, the bridge and the preload
+# shim; never the vendor's files) and its unit, enabled by a vendor wants
+# link like omamobile-fp and inert until tools/ingot-fp-provision has put
+# the phone's own vendor files in /usr/lib/omamobile-fp-ingot/root.
+# fprintd's drop-in and the PAM file below serve both phones.
+i=$d/usr/lib/omamobile-fp-ingot
+install -Dm755 lib/ingot-fp-stage "$i/ingot-fp-stage"
+for f in librpmb.so libssd.so omamobile-fp-shim.so; do
+  install -Dm644 "prebuilt/ingot/$f" "$i/bin/$f"
+done
+install -Dm755 prebuilt/ingot/omamobile-fp-bridge-ingot "$i/bin/omamobile-fp-bridge-ingot"
 install -Dm644 vendor/systemd/system/omamobile-fp-ingot.service \
   "$d/usr/lib/systemd/system/omamobile-fp-ingot.service"
+ln -sfn ../omamobile-fp-ingot.service "$d/usr/lib/systemd/system/multi-user.target.wants/omamobile-fp-ingot.service"
 install -Dm644 vendor/pam.d/omarchy-lock-fingerprint "$d/etc/pam.d/omarchy-lock-fingerprint"
 install -Dm644 vendor/systemd/system/fprintd.service.d/omamobile-udfps.conf \
   "$d/usr/lib/systemd/system/fprintd.service.d/omamobile-udfps.conf"

@@ -154,21 +154,29 @@ else
 fi
 rm -rf "$nsroot"
 
-# The Solana Saga: its runner and unit ship, the unit opt-in and inert
-# until the vendor's files and our bionic programs are in place; the
-# runner's own test (a fake phone) is tools/ingot-fp-stage-test.
+# The Solana Saga: its runner, our bionic programs and its unit ship; the
+# unit is on by default (a vendor wants link, as omamobile-fp) and inert
+# until tools/ingot-fp-provision has put the vendor's files in place; it
+# forwards TrustZone's RPMB writes (the trusted app stores nothing without
+# them) and restarts a stack that dies, a few times; the runner's own test
+# (a fake phone) is tools/ingot-fp-stage-test.
 bash -n lib/ingot-fp-stage || fail "syntax: lib/ingot-fp-stage"
 u=vendor/systemd/system/omamobile-fp-ingot.service
-grep -qx 'install -Dm755 lib/ingot-fp-stage "$d/usr/lib/omamobile-fp-ingot/ingot-fp-stage"' install ||
+grep -qx 'install -Dm755 lib/ingot-fp-stage "$i/ingot-fp-stage"' install ||
   fail "the Saga's runner is installed"
 grep -q 'omamobile-fp-ingot.service' install || fail "the Saga's unit is installed"
-grep -q 'wants/omamobile-fp-ingot' install && fail "the Saga's unit is enabled by the package"
-grep -qx 'ExecStart=/usr/lib/omamobile-fp-ingot/ingot-fp-stage bridge --image /usr/lib/omamobile-fp-ingot/root --bin /usr/lib/omamobile-fp-ingot/bin --state /var/lib/omamobile-fp-ingot' "$u" ||
-  fail "the Saga's unit runs the bridge stage on the fixed paths"
+grep -qx 'ln -sfn ../omamobile-fp-ingot.service "$d/usr/lib/systemd/system/multi-user.target.wants/omamobile-fp-ingot.service"' install ||
+  fail "the package enables omamobile-fp-ingot itself (vendor wants link)"
+for f in librpmb.so libssd.so omamobile-fp-shim.so omamobile-fp-bridge-ingot; do
+  grep -q "prebuilt/ingot/$f\|prebuilt/ingot/\$f" install || fail "the Saga's $f is installed from prebuilt/ingot"
+done
+grep -qx 'ExecStart=/usr/lib/omamobile-fp-ingot/ingot-fp-stage bridge --image /usr/lib/omamobile-fp-ingot/root --bin /usr/lib/omamobile-fp-ingot/bin --state /var/lib/omamobile-fp-ingot --rpmb-writes' "$u" ||
+  fail "the Saga's unit runs the bridge stage on the fixed paths with the RPMB writes forwarded"
 for c in 'ConditionPathIsDirectory=/usr/lib/omamobile-fp-ingot/root' \
          'ConditionPathExists=/usr/lib/omamobile-fp-ingot/bin/omamobile-fp-bridge-ingot' \
          'ConditionPathExists=/usr/lib/omamobile-fp-ingot/bin/librpmb.so' \
-         'ConditionPathExists=/usr/lib/omamobile-fp-ingot/bin/libssd.so' 'KillMode=mixed' 'Restart=no'; do
+         'ConditionPathExists=/usr/lib/omamobile-fp-ingot/bin/libssd.so' 'KillMode=mixed' \
+         'Restart=on-failure' 'StartLimitBurst=3' 'WantedBy=multi-user.target'; do
   grep -qx "$c" "$u" || fail "the Saga's unit lacks $c"
 done
 grep -q '^ExecStopPost=.*omamobile-fp/sock' "$u" && fail "the Saga's unit removes the socket directory the Pixel runner shares"
@@ -176,12 +184,15 @@ grep -q '^ExecStopPost=.*omamobile-fp/sock' "$u" && fail "the Saga's unit remove
 sock=$(sed -n 's|^Environment=FP_OMAMOBILE_UDFPS=||p' vendor/systemd/system/fprintd.service.d/omamobile-udfps.conf)
 grep -q '^SOCKDIR=$TROOT/run/omamobile-fp/sock$' lib/ingot-fp-stage && [[ $sock == /run/omamobile-fp/sock/bridge.sock ]] ||
   fail "the Saga's runner serves $sock"
+# the pass-through's log is rotated at a start, before the listener opens it
+grep -q '^  rpmb_log_rotate$' lib/ingot-fp-stage || fail "setup_state rotates the pass-through's log"
+grep -q '^RPMB_LOG_ROTATE_BYTES=' lib/ingot-fp-stage || fail "the rotation size"
 if command -v systemd-analyze >/dev/null; then
   out=$(systemd-analyze verify --man=no "$u" 2>&1 || true)
   out=$(grep -v -e 'not executable' -e 'No such file' -e 'is not a regular file' -e '^$' <<<"$out" || true)
   [[ -z $out ]] || fail "unit: $out"
 fi
-echo "ok - the Saga's runner and opt-in unit"
+echo "ok - the Saga's runner, programs and unit (on by default, RPMB writes forwarded, restarts on failure)"
 
 if [[ ! -f prebuilt/omamobile-fp-shim.so ]]; then
   echo "ok - the rest # SKIP no bionic prebuilts in this checkout (built on the computer)"
@@ -222,10 +233,23 @@ done
 # on by default, with this runner: the package itself enables the unit
 [[ $(readlink "$stage/usr/lib/systemd/system/multi-user.target.wants/omamobile-fp.service") == ../omamobile-fp.service ]] ||
   fail "the package enables omamobile-fp (vendor wants link)"
-[[ ! -e $stage/usr/lib/systemd/system/multi-user.target.wants/omamobile-fp-ingot.service ]] ||
-  fail "the package enables omamobile-fp-ingot"
-[[ ! -e $stage/usr/lib/omamobile-fp-ingot/root && ! -e $stage/usr/lib/omamobile-fp-ingot/bin ]] ||
-  fail "the Saga's vendor files or programs staged"
+[[ $(readlink "$stage/usr/lib/systemd/system/multi-user.target.wants/omamobile-fp-ingot.service") == ../omamobile-fp-ingot.service ]] ||
+  fail "the package enables omamobile-fp-ingot (vendor wants link)"
+[[ ! -e $stage/usr/lib/omamobile-fp-ingot/root ]] || fail "the Saga's vendor files staged"
+for f in librpmb.so libssd.so omamobile-fp-shim.so omamobile-fp-bridge-ingot; do
+  [[ -f $stage/usr/lib/omamobile-fp-ingot/bin/$f ]] || fail "not staged: the Saga's $f"
+  [[ $(head -c 20 "$stage/usr/lib/omamobile-fp-ingot/bin/$f" | od -An -tx1 | tr -d ' \n') == 7f454c46020101* ]] || fail "the Saga's $f is not a 64-bit ELF"
+  [[ $(od -An -tx1 -j18 -N2 "$stage/usr/lib/omamobile-fp-ingot/bin/$f" | tr -d ' \n') == b700 ]] || fail "the Saga's $f is not aarch64"
+done
+[[ -x $stage/usr/lib/omamobile-fp-ingot/bin/omamobile-fp-bridge-ingot ]] || fail "the Saga's bridge is not executable"
+grep -c /system/bin/linker64 "$stage/usr/lib/omamobile-fp-ingot/bin/omamobile-fp-bridge-ingot" >/dev/null ||
+  fail "the Saga's bridge is not a bionic executable"
+# the stubs the runner checks for: ours, with no RPMB/SSD device path in them
+for f in librpmb.so libssd.so; do
+  for s in /dev/block ufs-bsg mmcblk /dev/sg /dev/0:0:0 by-name/ssd; do
+    grep -qaF -- "$s" "$stage/usr/lib/omamobile-fp-ingot/bin/$f" && fail "the Saga's $f names a device path ($s)"
+  done
+done
 if command -v systemd-analyze >/dev/null; then
   out=$(systemd-analyze verify --man=no "$stage/usr/lib/systemd/system/omamobile-fp.service" 2>&1 || true)
   out=$(grep -v -e 'not executable' -e 'No such file' -e 'is not a regular file' -e '^$' <<<"$out" || true)
