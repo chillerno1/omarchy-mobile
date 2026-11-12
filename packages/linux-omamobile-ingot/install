@@ -1,0 +1,65 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Stage linux-omamobile-ingot into DESTDIR from a prebuilt/ directory that
+# ./stage filled:
+#
+#   /usr/lib/modules/<release>/kernel/..., modules.order, modules.builtin*
+#                                        the stripped modules, as the tarball has them
+#   /usr/lib/modules/<release>/pkgbase   linux-omamobile-ingot
+#   /usr/lib/omamobile/ingot/boot/       boot_a.img, vendor_boot.img, dtbo.img,
+#                                        RELEASE, SHA256SUMS: what
+#                                        omamobile-ingot-boot writes to slot A
+#   /usr/share/omamobile/linux-ingot/kernel.release, SOURCE, sm8475-osom-ingot.dtb
+#
+# No vmlinuz: the kernel is inside boot_a.img, and nothing else on the
+# phone should build boot images from it. depmod's files (modules.dep,
+# .alias, .symbols, ...) are left out as linux-omamobile leaves them out:
+# kmod's 60-depmod hook makes them on the phone, before
+# omamobile-ingot-boot's hook, which refuses a release without them.
+#
+#   ./install DESTDIR [PREBUILT]     (PREBUILT: default prebuilt/)
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+d=${1:?Usage: ./install DESTDIR [PREBUILT]}
+pre=${2:-prebuilt}
+die() { printf 'linux-omamobile-ingot install: %s\n' "$*" >&2; exit 1; }
+[[ $d == /* && $d != "/" ]] || die "use an absolute staging directory"
+[[ -f $pre/kernel.release && -f $pre/SHA256SUMS ]] \
+  || die "no staged kernel in $pre (run: packages/linux-omamobile-ingot/stage KERNEL_OUT IMAGES_DIR)"
+(cd "$pre" && sha256sum --quiet --strict -c SHA256SUMS) || die "$pre fails its checksums"
+for f in modules.tar.zst kernel.release SOURCE sm8475-osom-ingot.dtb boot/boot_a.img boot/vendor_boot.img boot/dtbo.img boot/RELEASE boot/SHA256SUMS; do
+  grep -cE "  $f$" "$pre/SHA256SUMS" >/dev/null || die "$pre/SHA256SUMS does not cover $f"
+done
+rel=$(cat "$pre/kernel.release")
+./lib/pkgver "$rel" "$(cat "$pre/kernel.commits" 2>/dev/null || true)" >/dev/null || exit 1
+[[ $(cat "$pre/boot/RELEASE") == "$rel" ]] || die "boot/RELEASE is not $rel"
+(cd "$pre/boot" && sha256sum --quiet --strict -c SHA256SUMS) || die "$pre/boot fails its SHA256SUMS"
+# The magics again (./stage --verify checks the whole structure)
+[[ $(head -c 8 "$pre/boot/boot_a.img") == 'ANDROID!' && $(head -c 8 "$pre/boot/vendor_boot.img") == VNDRBOOT \
+   && $(od -An -tx1 -N4 "$pre/boot/dtbo.img" | tr -d ' \n') == d7b7ab1e ]] || die "$pre/boot does not hold the Saga's boot images"
+
+m=$d/usr/lib/modules
+mkdir -p "$m"
+top=$(tar --zstd -tf "$pre/modules.tar.zst" | sed 's|^\./||; s|/.*||' | sort -u)
+[[ $top == "$rel" ]] || die "modules.tar.zst holds '$top', not $rel"
+tar --zstd -xf "$pre/modules.tar.zst" -C "$m" --no-same-owner --no-same-permissions
+r=$m/$rel
+rm -f "$r/build" "$r/source"
+for f in modules.alias modules.alias.bin modules.builtin.alias.bin modules.builtin.bin modules.dep modules.dep.bin \
+         modules.devname modules.softdep modules.symbols modules.symbols.bin modules.weakdep; do
+  rm -f "$r/$f"
+done
+[[ -f $r/modules.order ]] || die "the modules have no modules.order"
+find "$r" -name '*.ko*' -print -quit | grep -c . >/dev/null || die "the modules tarball has no modules"
+find "$r" -type l | grep -c . >/dev/null && die "the module tree holds symlinks"
+[[ ! -e $r/vmlinuz ]] || die "the module tree holds a vmlinuz"
+echo linux-omamobile-ingot > "$r/pkgbase"
+chmod -R u+rwX,go+rX,go-w "$r"
+b=$d/usr/lib/omamobile/ingot/boot
+for f in boot_a.img vendor_boot.img dtbo.img RELEASE SHA256SUMS; do install -Dm644 "$pre/boot/$f" "$b/$f"; done
+s=$d/usr/share/omamobile/linux-ingot
+install -Dm644 "$pre/SOURCE" "$s/SOURCE"
+install -Dm644 "$pre/sm8475-osom-ingot.dtb" "$s/sm8475-osom-ingot.dtb"
+printf '%s\n' "$rel" > "$s/kernel.release"
+chmod 644 "$s/kernel.release"
+install -Dm644 version "$s/version"

@@ -1,7 +1,14 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 # Stage omamobile-device-ingot into DESTDIR. Nothing is enabled that would
-# mark a slot successful or start the radio, the charger, or a camera.
+# mark a slot successful or start the modem or a camera. The one boot-time
+# unit, omamobile-adsp.service (battery, charging and audio, through the
+# ADSP), is enabled by a vendor wants link (as omarchy-mac does) and is
+# inert until the phone's own ADSP firmware is installed. No vendor
+# firmware is staged: the phone's own is installed on the phone by
+# omamobile-ingot-firmware. From 0.1.5 the sound card's use-case profile
+# (speaker amplifiers at their lowest gain) and a link naming the audio
+# topology are staged too.
 #   ./install DESTDIR [BUILDDIR]
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
@@ -9,16 +16,28 @@ destination=${1:?Usage: ./install DESTDIR [BUILDDIR]}
 build=${2:-build}
 [[ $destination == /* && $destination != "/" ]] || { echo "Use an absolute staging directory" >&2; exit 1; }
 install -Dm755 "$build/reboot-to" "$destination/usr/bin/reboot-to"
-install -Dm644 vendor/udev/rules.d/10-omamobile-storage.rules \
-  "$destination/usr/lib/udev/rules.d/10-omamobile-storage.rules"
-install -Dm644 vendor/udev/rules.d/70-omamobile-dma-heap.rules \
-  "$destination/usr/lib/udev/rules.d/70-omamobile-dma-heap.rules"
-install -Dm644 vendor/systemd/network/20-usb-gadget.network \
-  "$destination/usr/lib/systemd/network/20-usb-gadget.network"
-install -Dm644 vendor/systemd/logind.conf.d/10-omamobile-power-key.conf \
-  "$destination/usr/lib/systemd/logind.conf.d/10-omamobile-power-key.conf"
-install -Dm644 vendor/NetworkManager/conf.d/10-omamobile-usb.conf \
-  "$destination/usr/lib/NetworkManager/conf.d/10-omamobile-usb.conf"
+for file in bin/*; do install -Dm755 "$file" "$destination/usr/bin/${file##*/}"; done
+# vendor/X installs to /usr/lib/X: udev rules, systemd units and drop-ins,
+# modprobe.d, NetworkManager conf.d, environment.d.
+while IFS= read -r -d '' file; do
+  install -Dm644 "$file" "$destination/usr/lib/${file#vendor/}"
+done < <(find vendor -type f -print0)
+while IFS= read -r -d '' file; do
+  install -d "$destination/usr/lib/$(dirname "${file#vendor/}")"
+  ln -sfn "$(readlink "$file")" "$destination/usr/lib/${file#vendor/}"
+done < <(find vendor -type l -print0)
+# The audio topology under the name the kernel asks for
+# (qcom/sm8475/<card model>-tplg.bin): a link to linux-firmware-qcom's
+# SM8450 HDK topology, made here so that no .bin is kept in the repository.
+install -d "$destination/usr/lib/firmware/updates/qcom/sm8475"
+ln -sfn /usr/lib/firmware/qcom/sm8450/SM8450-HDK-tplg.bin \
+  "$destination/usr/lib/firmware/updates/qcom/sm8475/SM8475-Solana-Saga-tplg.bin"
+# The sound card's ALSA use-case profile, beside alsa-ucm-conf's own.
+while IFS= read -r -d '' file; do
+  install -Dm644 "$file" "$destination/usr/share/alsa/$file"
+done < <(find ucm2 -type f -print0)
+install -Dm644 share/firmware.map \
+  "$destination/usr/share/omamobile/ingot/firmware.map"
 install -Dm644 device.conf \
   "$destination/usr/share/omamobile/device.conf"
 install -Dm644 etc/omamobile-mirrorlist \

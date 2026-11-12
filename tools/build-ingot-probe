@@ -1,15 +1,27 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
-# Build a RAM-only Saga probe for `fastboot boot`; never connect to or write a phone.
+# Build the Saga's boot images (a RAM-only probe for `fastboot boot` by
+# default); never connect to or write a phone.
 #
 # Usage: tools/build-ingot-probe --kernel Image.gz --dtb sm8475-osom-ingot.dtb \
 #          --ssh-key ~/.ssh/id_ed25519.pub --mkbootimg /path/to/mkbootimg.py \
-#          --mkdtboimg /path/to/mkdtboimg.py --out /path/to/output [--arch]
+#          --mkdtboimg /path/to/mkdtboimg.py --out /path/to/output \
+#          [--arch] [--self-update] [--standalone]
 #
 # --arch packs the shared initramfs/init instead of the RAM-only probe init:
 # it boots Arch from userdata and leaves userdata, and only userdata,
 # writable (device/ingot/device.conf UFS_RW). Never boot it on a phone whose
-# userdata isn't ours to erase.
+# userdata isn't ours to erase. Without a USB host it stays in the
+# initramfs rather than crash: a crash spends one of slot A's boot tries
+# and falls back to LineageOS, which can't use the Arch root.
+# --self-update (needs --arch) also leaves slot A's boot, vendor_boot and
+# dtbo writable (UFS_RW_SELF_UPDATE), so Arch can write its own boot images.
+# --standalone (implies --arch) also makes slot-a/, the set for slot A:
+# boot_a.img (boot.img with the AVB footer that flashing it to boot_a needs,
+# tools/ingot-boot-footer), vendor_boot.img, dtbo.img, RELEASE and their
+# SHA256SUMS (tools/ingot-boot-set). That directory is what the kernel
+# package stages and the phone's writer takes.
+# Every build writes RELEASE, the packed kernel's release.
 #
 # The kernel must have USB DWC3/QCOM, the eUSB2 PHY, RPMh regulators,
 # configfs NCM/ACM and devtmpfs built in (device/ingot/kernel.config).
@@ -22,7 +34,7 @@
 # Docker runs an aarch64 Alpine builder; x86 hosts need a binfmt handler.
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-kernel="" dtb="" key="" mkbootimg="" mkdtboimg="" out="" arch_boot=0
+kernel="" dtb="" key="" mkbootimg="" mkdtboimg="" out="" arch_boot=0 self_update=0 standalone=0
 die() { echo "error: $*" >&2; exit 1; }
 while (($#)); do
   case $1 in
@@ -33,11 +45,15 @@ while (($#)); do
     --mkdtboimg) mkdtboimg=${2:?}; shift ;;
     --out) out=${2:?}; shift ;;
     --arch) arch_boot=1 ;;
+    --self-update) self_update=1 ;;
+    --standalone) standalone=1 arch_boot=1 ;;
     -h|--help) source "$ROOT/tools/lib/usage.sh"; usage_from_header "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
   shift
 done
+# Before anything else, so a wrong combination never reaches Docker
+((self_update == 0 || arch_boot)) || die "--self-update needs --arch: it widens the Arch init's storage allowlist"
 command -v docker >/dev/null || die 'Docker is required'
 command -v python3 >/dev/null || die 'Python 3 is required'
 for path in "$kernel" "$dtb" "$key" "$mkbootimg" "$mkdtboimg"; do
@@ -56,6 +72,10 @@ done
 [[ $(basename "$mkbootimg") == mkbootimg.py ]] || die '--mkbootimg must name AOSP mkbootimg.py'
 [[ $(basename "$mkdtboimg") == mkdtboimg.py ]] || die '--mkdtboimg must name AOSP mkdtboimg.py'
 [[ ! -e $out/boot.img ]] || die "$out/boot.img already exists; choose a fresh output directory"
+[[ ! -e $out/slot-a ]] || die "$out/slot-a already exists; choose a fresh output directory"
+if ((standalone)); then
+  [[ -n ${AVBTOOL:-} ]] || command -v avbtool >/dev/null || die '--standalone needs avbtool (on PATH, or set AVBTOOL)'
+fi
 python3 - "$key" <<'PY'
 import base64, pathlib, struct, sys
 data = pathlib.Path(sys.argv[1]).read_text().split()
@@ -78,10 +98,17 @@ docker run --rm --platform linux/arm64 \
   --mount "type=bind,source=$(dirname "$mkbootimg"),target=/mkbootimg,readonly" \
   --mount "type=bind,source=$(dirname "$mkdtboimg"),target=/mkdtboimg,readonly" \
   --mount "type=bind,source=$out,target=/out" \
-  -e ARCH_BOOT="$arch_boot" \
+  -e ARCH_BOOT="$arch_boot" -e SELF_UPDATE="$self_update" \
   alpine:3.22 sh /src/device/ingot/initramfs/build
+if ((standalone)); then
+  # The container wrote $out's files as root: only create new files here.
+  # A directory of its own, so its SHA256SUMS names the set and nothing else
+  "$ROOT/tools/ingot-boot-set" "$out" "$out/slot-a"
+fi
 if ((arch_boot)); then
   echo "Built Arch boot images in $out (no phone was accessed). Booted, they leave userdata writable"
+  ((self_update == 0)) || echo "Built with --self-update: booted, they also leave boot_a, vendor_boot_a and dtbo_a writable"
+  ((standalone == 0)) || echo "$out/slot-a is the set for slot A: boot_a.img (boot.img with its AVB footer), vendor_boot.img and dtbo.img (kernel $(cat "$out/RELEASE"))"
 else
   echo "Built boot.img, vendor_boot.img and dtbo.img in $out (no phone was accessed)"
 fi

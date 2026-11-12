@@ -1,0 +1,484 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Tests for omamobile-ingot-boot, from a copy of this directory alone, with
+# no root, no phone and no real block device: every partition, and the disk
+# holding a synthetic GPT, is a regular file in a fake root
+# (OMAMOBILE_INGOT_ROOT) with a fake /sys/class/block, /proc, power supply,
+# /usr/lib/modules and /var/lib. Covers every refusal before a write, the
+# deny check, a write with its read-back, skipping what is already there,
+# the saved set and the rollback, a dry run, --boot-only, a failed
+# read-back, the hook's opt-in, and each verdict of `slots`.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+PKG=$PWD
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+
+for f in bin/omamobile-ingot-boot lib/ingot-images.sh install test/all; do bash -n "$f" || fail "$f parses"; done
+pass "scripts parse"
+command -v python3 >/dev/null || { pass "# SKIP no python3"; exit 0; }
+command -v flock >/dev/null || { pass "# SKIP no flock"; exit 0; }
+
+t=$(mktemp -d)
+trap 'rm -rf "$t"' EXIT
+
+# ---------------------------------------------------------------- the package
+./install "$t/stage"
+for f in usr/bin/omamobile-ingot-boot usr/lib/omamobile-ingot-boot/ingot-images.sh \
+         usr/share/libalpm/hooks/90-omamobile-ingot-boot.hook usr/lib/systemd/system/omamobile-ingot-slot-check.service \
+         usr/share/licenses/omamobile-ingot-boot/LICENSE usr/share/omamobile/ingot-boot/version; do
+  [[ -e $t/stage/$f ]] || fail "not staged: $f"
+done
+[[ $(readlink "$t/stage/usr/lib/systemd/system/multi-user.target.wants/omamobile-ingot-slot-check.service") == ../omamobile-ingot-slot-check.service ]] \
+  || fail "the slot check is enabled"
+[[ ! -e $t/stage/etc ]] || fail "the package ships nothing in /etc (no ingot-boot.conf: absent means AUTO_WRITE=no)"
+cmp -s LICENSE ../omamobile-boot-update/LICENSE 2>/dev/null || [[ ! -d ../omamobile-boot-update ]] || fail "the same MIT text as the sibling packages"
+pass "install stages the tool, its library, the hook and the slot check, and no config that turns writes on"
+
+hook=libalpm/90-omamobile-ingot-boot.hook
+for want in 'Operation = Install' 'Operation = Upgrade' 'Type = Path' 'Target = usr/lib/omamobile/ingot/boot/*' \
+            'When = PostTransaction' 'Exec = /usr/bin/omamobile-ingot-boot hook'; do
+  grep -qxF "$want" "$hook" || fail "hook: $want"
+done
+grep -q 'Operation = Remove' "$hook" && fail "hook: nothing to write on removal"
+grep -q AbortOnFail "$hook" && fail "hook: a post-transaction hook cannot abort"
+[[ ${hook##*/} > 60-depmod.hook ]] || fail "hook runs after depmod"
+svc=systemd/omamobile-ingot-slot-check.service
+grep -qxF 'Type=oneshot' "$svc" && grep -qxF 'ExecStart=-/usr/bin/omamobile-ingot-boot slots --service' "$svc" \
+  || fail "the slot check is a oneshot whose failure is ignored"
+pass "the hook runs after depmod when the image set changes; the slot check can't fail a boot"
+
+# Nothing in the tool changes a read-only flag, the GPT, a slot or the
+# power state, and its only write is dd to the checked partition
+B=bin/omamobile-ingot-boot
+grep -nE 'of=' "$B" | grep -v 'of="\$node"' && fail "every dd writes to the checked node"
+code=$(grep -vhE '^\s*#' "$B" lib/ingot-images.sh)
+# (fastboot appears only inside the advice the verdicts print, never as a command)
+grep -nE 'setrw|blockdev --setro|force_ro|> *"?\$[A-Za-z_{}]*/ro"?|sgdisk|sfdisk|parted|gdisk|systemctl (reboot|poweroff|kexec)|reboot-to|(^|[;&|(]|\$\()[[:space:]]*(fastboot|reboot|poweroff|shutdown)\b' <<<"$code" \
+  && fail "no ro change, partition table tool, fastboot or reboot in the code"
+grep -nE "open\([^)]*['\"](r\+b|wb|ab|w)['\"]" "$B" && fail "the GPT is opened read-only"
+grep -qE '^readonly TARGETS="boot_a vendor_boot_a dtbo_a"$' "$B" || fail "the targets are a constant"
+pass "the only write is dd to a checked partition; nothing changes ro, the GPT, a slot or reboots"
+
+# The deny check on its own: everything but the three targets is refused
+sed -n '/^deny_check() {$/,/^}$/p' "$B" > "$t/deny.sh"
+grep -q '^deny_check' "$t/deny.sh" || fail "deny_check is in the tool"
+deny() { bash -c 'readonly TARGETS="boot_a vendor_boot_a dtbo_a"; die() { echo "$*"; exit 1; }; source "$1"; deny_check "$2"' _ "$t/deny.sh" "$1" >/dev/null 2>&1; }
+for ok in boot_a vendor_boot_a dtbo_a; do deny "$ok" || fail "deny_check lets $ok through"; done
+for bad in boot_b vendor_boot_b dtbo_b vbmeta_a vbmeta_b vbmeta_system_a misc devinfo persist modem_a modemst1 modemst2 \
+           efs fsg abl_a xbl_a xbl_config_a userdata super init_boot_a recovery_a sde "" boot; do
+  if deny "$bad"; then fail "deny_check refuses '$bad'"; fi
+done
+pass "the deny check passes only boot_a, vendor_boot_a and dtbo_a"
+
+# ---------------------------------------------------------------- the fake phone
+REL=7.3.0-rc6-omamobile-push1-g837bf17d318a
+NEWREL=7.3.0-rc6-omamobile-push1-g0123456789ab
+SDE_PARTS="xbl_a xbl_b abl_a abl_b boot_a boot_b vendor_boot_a vendor_boot_b dtbo_a dtbo_b vbmeta_a vbmeta_b misc devinfo"
+SDA_PARTS="persist modemst1 modemst2 fsg efs userdata"
+psize() { case $1 in boot_*|vendor_boot_*) echo $((0x40000)) ;; dtbo_*) echo $((0x10000)) ;; *) echo $((0x8000)) ;; esac; }
+
+# attr PRIO ACTIVE TRIES SUCCESSFUL UNBOOTABLE: a GPT attribute word
+attr() { echo $(( ($1 << 48) | ($2 << 50) | ($3 << 51) | ($4 << 54) | ($5 << 55) )); }
+# mkgpt FILE ATTR_A ATTR_B: a disk image with 4096-byte blocks, its GPT
+# header at LBA 1 and 128 entries from LBA 2, with the sde names
+mkgpt() {
+  python3 -I - "$1" "$2" "$3" $SDE_PARTS <<'PY'
+import struct, sys, uuid, zlib
+path, aa, ab, names = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4:]
+bs, count, esize, blocks = 4096, 128, 128, 256
+arr = bytearray(count * esize)
+lba = 6
+for i, n in enumerate(names):
+    attrs = aa if n == "boot_a" else ab if n == "boot_b" else (1 << 60)
+    e = struct.pack("<16s16sQQQ", uuid.UUID(int=0x77 + i).bytes_le, uuid.UUID(int=0x1000 + i).bytes_le, lba, lba + 1, attrs)
+    e += n.encode("utf-16-le").ljust(72, b"\0")
+    arr[i * esize:(i + 1) * esize] = e
+    lba += 2
+hdr = bytearray(struct.pack("<8sIIIIQQQQ16sQIII", b"EFI PART", 0x10000, 92, 0, 0, 1, blocks - 1, 6, blocks - 6,
+                            uuid.UUID(int=0xd15c).bytes_le, 2, count, esize, zlib.crc32(bytes(arr)) & 0xffffffff))
+struct.pack_into("<I", hdr, 16, zlib.crc32(bytes(hdr)) & 0xffffffff)
+img = bytearray(blocks * bs)
+img[510:512] = b"\x55\xaa"
+img[bs:bs + len(hdr)] = hdr
+img[2 * bs:2 * bs + len(arr)] = arr
+open(path, "wb").write(img)
+PY
+}
+
+# mkset DIR RELEASE TAG: an image set as build-ingot-probe --standalone
+# writes it, sized for the fake partitions; TAG makes each set's bytes differ
+mkset() {
+  rm -rf "$1" && mkdir -p "$1"
+  python3 -I - "$1" "$3" "$(psize boot_a)" <<'PY'
+import struct, sys
+d, tag, size = sys.argv[1], sys.argv[2].encode(), int(sys.argv[3])
+kernel = b"\x1f\x8b" + b"KERNEL " + tag + b"\0" * 1000
+hdr = bytearray(4096)
+hdr[0:8] = b"ANDROID!"
+struct.pack_into("<IIIII", hdr, 8, len(kernel), 512, 0, 1580, 0)
+struct.pack_into("<I", hdr, 40, 4)
+body = bytes(hdr) + kernel + b"\0" * (4096 - len(kernel) % 4096) + b"RAMDISK " + tag
+foot = b"AVBf" + b"\0" * 60
+open(f"{d}/boot_a.img", "wb").write(body + b"\0" * (size - len(body) - 64) + foot)
+open(f"{d}/vendor_boot.img", "wb").write(b"VNDRBOOT" + b"\4\0\0\0" + b"DTB " + tag + b"\0" * 3000)
+open(f"{d}/dtbo.img", "wb").write(bytes([0xd7, 0xb7, 0xab, 0x1e]) + b"OVERLAY " + tag + b"\0" * 500)
+PY
+  echo "$2" > "$1/RELEASE"
+  (cd "$1" && sha256sum boot_a.img vendor_boot.img dtbo.img RELEASE > SHA256SUMS)
+}
+resum() { (cd "$1" && sha256sum boot_a.img vendor_boot.img dtbo.img RELEASE > SHA256SUMS); }
+
+mkpart() { # R disk n name
+  local R=$1 d=$2 n=$3 name=$4 s=$1/sys/devices/platform/ufs/$2/$2$3 size
+  size=$(psize "$name")
+  mkdir -p "$s"
+  printf 'MAJOR=8\nMINOR=%d\nDEVNAME=%s%d\nDEVTYPE=partition\nPARTN=%d\nPARTNAME=%s\n' "$n" "$d" "$n" "$n" "$name" > "$s/uevent"
+  case $name in boot_a|vendor_boot_a|dtbo_a|userdata) echo 0 ;; *) echo 1 ;; esac > "$s/ro"
+  echo $((size / 512)) > "$s/size"
+  echo '0 0 0 0 0 0 0 0 0 0 0' > "$s/stat"
+  ln -s "../../devices/platform/ufs/$d/$d$n" "$R/sys/class/block/$d$n"
+  { printf 'OLD %s\n' "$name"; head -c "$size" /dev/zero | tr '\0' o; } | head -c "$size" > "$R/dev/$d$n"
+}
+mkdisk() { # R disk parts...
+  local R=$1 d=$2 n=0 p
+  shift 2
+  mkdir -p "$R/sys/devices/platform/ufs/$d/queue"
+  printf 'MAJOR=8\nDEVNAME=%s\nDEVTYPE=disk\n' "$d" > "$R/sys/devices/platform/ufs/$d/uevent"
+  echo 1 > "$R/sys/devices/platform/ufs/$d/queue/iostats"
+  echo 4096 > "$R/sys/devices/platform/ufs/$d/queue/logical_block_size"
+  echo 1 > "$R/sys/devices/platform/ufs/$d/ro"
+  ln -s "../../devices/platform/ufs/$d" "$R/sys/class/block/$d"
+  for p; do n=$((n + 1)); mkpart "$R" "$d" "$n" "$p"; done
+}
+battery() { # R percent status online
+  rm -rf "$1/sys/class/power_supply"
+  mkdir -p "$1/sys/class/power_supply/battery" "$1/sys/class/power_supply/usb"
+  echo Battery > "$1/sys/class/power_supply/battery/type"; echo 1 > "$1/sys/class/power_supply/battery/present"
+  echo "$2" > "$1/sys/class/power_supply/battery/capacity"; echo "$3" > "$1/sys/class/power_supply/battery/status"
+  echo USB > "$1/sys/class/power_supply/usb/type"; echo "$4" > "$1/sys/class/power_supply/usb/online"
+}
+mkroot() { # R
+  local R=$1
+  rm -rf "$R"
+  mkdir -p "$R/proc/device-tree" "$R/dev" "$R/sys/class/block" "$R/etc/omamobile" "$R/usr/lib/modules/$REL/kernel"
+  printf 'osom,ingot\0qcom,sm8475\0' > "$R/proc/device-tree/compatible"
+  echo 'console=null androidboot.slot_suffix=_a panic=10' > "$R/proc/cmdline"
+  mkdisk "$R" sda $SDA_PARTS
+  mkdisk "$R" sde $SDE_PARTS
+  mkgpt "$R/dev/sde" "$(attr 3 1 0 1 0)" "$(attr 2 0 7 0 0)"
+  echo dep > "$R/usr/lib/modules/$REL/modules.dep"
+  mkset "$R/usr/lib/omamobile/ingot/boot" "$REL" one
+  battery "$R" 64 Discharging 0
+}
+part() { local s; for s in "$1"/sys/class/block/*; do [[ $(sed -n 's/^PARTNAME=//p' "$s/uevent" 2>/dev/null) == "$2" ]] && { echo "$1/dev/${s##*/}"; return; }; done; }
+psys() { local p; p=$(part "$1" "$2"); readlink -f "$1/sys/class/block/${p##*/}"; }
+sums() { (cd "$1/dev" && sha256sum -- *); }
+# sums of every node but the named partitions'
+others() { local R=$1 skip=" ${*:2} " f n; for f in "$R"/dev/*; do n=$(sed -n 's/^PARTNAME=//p' "$R/sys/class/block/${f##*/}/uevent" 2>/dev/null); [[ $skip == *" $n "* ]] || sha256sum "$f"; done; }
+holds() { cmp -s -n "$(stat -c %s "$3")" "$3" "$(part "$1" "$2")"; }
+reboot_counters() { local f; for f in "$1"/sys/devices/platform/ufs/*/*/stat; do echo '0 0 0 0 0 0 0 0 0 0 0' > "$f"; done; }
+
+R=$t/root
+I=$R/usr/lib/omamobile/ingot/boot
+ST=$R/var/lib/omamobile/ingot-boot
+fake=$t/fake && mkdir -p "$fake"
+printf '#!/bin/sh\necho "Filesystem 1-blocks Used Available Capacity Mounted"\necho "fake 1 1 ${FAKE_FREE:-99999999999} 1%% /"\n' > "$fake/df"
+chmod +x "$fake/df"
+export OMAMOBILE_INGOT_ROOT=$R OMAMOBILE_INGOT_UNAME_R=$REL OMAMOBILE_INGOT_BOOT_LIB=$PKG/lib DF=$fake/df
+U=$PKG/bin/omamobile-ingot-boot
+run() { "$U" "$@" > "$t/out" 2>&1 < /dev/null; }
+refused() { # what expected-message command...
+  local what=$1 msg=$2 before; shift 2
+  before=$(sums "$R")
+  if run "$@"; then cat "$t/out"; fail "refused: $what"; fi
+  grep -qF -- "$msg" "$t/out" || { cat "$t/out"; fail "$what: says '$msg'"; }
+  [[ $(sums "$R") == "$before" ]] || fail "$what: no partition changed"
+}
+
+# ---------------------------------------------------------------- dry run
+mkroot "$R"
+before=$(sums "$R")
+run write --dry-run || { cat "$t/out"; fail "a dry run succeeds"; }
+grep -qE 'boot_a\.img +-> boot_a \(sde5\) .* write$' "$t/out" || { cat "$t/out"; fail "the plan names boot_a by its node"; }
+grep -qF 'Dry run: nothing written' "$t/out" || fail "the dry run says so"
+[[ $(sums "$R") == "$before" ]] || fail "a dry run writes no partition"
+[[ ! -e $R/var/lib && ! -e $R/run ]] || fail "a dry run leaves no state, not even a lock"
+pass "write --dry-run prints the plan and writes nothing anywhere"
+
+# ---------------------------------------------------------------- the hook's opt-in
+run hook || fail "the hook without a config exits 0"
+grep -qF 'Slot A left alone' "$t/out" || fail "and says slot A is left alone"
+echo 'AUTO_WRITE=no' > "$R/etc/omamobile/ingot-boot.conf"
+run hook && [[ $(sums "$R") == "$before" ]] || fail "AUTO_WRITE=no writes nothing"
+echo 'AUTO_WRITE=maybe' > "$R/etc/omamobile/ingot-boot.conf"
+refused "a config it can't read" "expected AUTO_WRITE=yes|no" hook
+printf 'AUTO_WRITE=yes\n$(touch %s/pwned)\n' "$t" > "$R/etc/omamobile/ingot-boot.conf"
+refused "a config with shell in it" "expected AUTO_WRITE=yes|no" hook
+[[ ! -e $t/pwned ]] || fail "the config is never sourced"
+rm "$R/etc/omamobile/ingot-boot.conf"
+[[ $(sums "$R") == "$before" && ! -e $R/var/lib ]] || fail "the hook without AUTO_WRITE=yes changes nothing"
+pass "the hook is inert without AUTO_WRITE=yes, and refuses a config it can't read as data"
+
+# ---------------------------------------------------------------- refusals
+printf 'google,gs201-cheetah\0google,gs201\0' > "$R/proc/device-tree/compatible"
+refused "another board" "this board is 'google,gs201-cheetah'" write --yes
+printf 'qcom,sm8475\0osom,ingot\0' > "$R/proc/device-tree/compatible"
+refused "the Saga's compatible not first" "this board is 'qcom,sm8475'" write --yes
+rm "$R/proc/device-tree/compatible"
+refused "no device tree" "cannot read" write --yes
+printf 'osom,ingot\0qcom,sm8475\0' > "$R/proc/device-tree/compatible"
+echo 'androidboot.slot_suffix=_b' > "$R/proc/cmdline"
+refused "a boot from slot B" "from slot B" write --yes
+echo 'console=null panic=10' > "$R/proc/cmdline"
+refused "a boot that names no slot" "says this boot is from slot A" write --yes
+printf 'androidboot.slot_suffix = "_a"\n' > "$R/proc/bootconfig"
+run write --dry-run || { cat "$t/out"; fail "slot A named in /proc/bootconfig, quoted, is enough"; }
+printf 'androidboot.slot_suffix = "_b"\n' > "$R/proc/bootconfig"
+echo 'androidboot.slot_suffix=_a' > "$R/proc/cmdline"
+refused "bootconfig and cmdline disagree" "from slot B" write --yes
+rm "$R/proc/bootconfig"
+pass "refuses another board, a boot from slot B and a boot that names no slot"
+
+vb=$(psys "$R" vendor_boot_a)
+echo 1 > "$vb/ro"
+refused "a read-only partition" "storage guard keeps it read-only (boot an image built with --self-update)" write --yes
+run write --boot-only --dry-run || { cat "$t/out"; fail "--boot-only needs only boot_a writable"; }
+echo 0 > "$vb/ro"
+sed -i 's/^PARTNAME=vendor_boot_a$/PARTNAME=vendor_boot_x/' "$vb/uevent"
+refused "a missing partition" "vendor_boot_a not found" write --yes
+sed -i 's/^PARTNAME=vendor_boot_x$/PARTNAME=vendor_boot_a/' "$vb/uevent"
+ps=$(psys "$R" persist)
+sed -i 's/^PARTNAME=persist$/PARTNAME=dtbo_a/' "$ps/uevent"
+refused "a name found twice (on another LUN)" "dtbo_a appears 2 times" write --yes
+sed -i 's/^PARTNAME=dtbo_a$/PARTNAME=persist/' "$ps/uevent"
+ba=$(psys "$R" boot_a)
+sed -i 's/^DEVTYPE=partition$/DEVTYPE=disk/' "$ba/uevent"
+refused "a name on a whole-disk node" "is not a partition" write --yes
+sed -i 's/^DEVTYPE=disk$/DEVTYPE=partition/' "$ba/uevent"
+pass "refuses a read-only, missing or duplicated partition name, and a disk carrying the name"
+
+cp -a "$I" "$t/good-set"
+reset_set() { rm -rf "$I"; cp -a "$t/good-set" "$I"; }
+echo tampered >> "$I/dtbo.img"
+refused "a set that fails its checksums" "fails its SHA256SUMS" write --yes
+reset_set
+sed -i '/dtbo.img/d' "$I/SHA256SUMS"
+refused "a SHA256SUMS without dtbo.img" "must list boot_a.img, vendor_boot.img, dtbo.img and RELEASE" write --yes
+reset_set
+echo "$(sha256sum < "$I/RELEASE" | cut -d' ' -f1)  ../RELEASE" >> "$I/SHA256SUMS"
+refused "a SHA256SUMS naming a path" "has a line that is not" write --yes
+reset_set
+printf 'XNDROID!' | dd of="$I/boot_a.img" conv=notrunc status=none; resum "$I"
+refused "boot_a.img without ANDROID!" "does not start with ANDROID!" write --yes
+reset_set
+printf '\3' | dd of="$I/boot_a.img" bs=1 seek=40 conv=notrunc status=none; resum "$I"
+refused "a header v3 boot image" "header version 3, not 4" write --yes
+reset_set
+truncate -s $(( $(psize boot_a) - 4096 )) "$I/boot_a.img"; resum "$I"
+refused "boot_a.img not the partition's size" "the AVB footer must be at its end" write --yes
+reset_set
+printf 'XXXX' | dd of="$I/boot_a.img" bs=1 seek=$(( $(psize boot_a) - 64 )) conv=notrunc status=none; resum "$I"
+refused "boot_a.img without its AVB footer" "has no AVB footer" write --yes
+reset_set
+printf 'VNDRBOOX' | dd of="$I/vendor_boot.img" conv=notrunc status=none; resum "$I"
+refused "a vendor_boot.img without VNDRBOOT" "does not start with VNDRBOOT" write --yes
+reset_set
+printf '\xd7\xb7\xab\x1f' | dd of="$I/dtbo.img" conv=notrunc status=none; resum "$I"
+refused "a dtbo.img without its magic" "does not start with d7 b7 ab 1e" write --yes
+reset_set
+head -c $(( $(psize dtbo_a) + 1 )) /dev/zero >> "$I/dtbo.img"; resum "$I"
+refused "a dtbo.img larger than dtbo_a" "larger than dtbo_a" write --yes
+reset_set
+head -c $(( $(psize vendor_boot_a) + 1 )) /dev/zero >> "$I/vendor_boot.img"; resum "$I"
+refused "a vendor_boot.img larger than vendor_boot_a" "larger than vendor_boot_a" write --yes
+reset_set
+printf '%s\nmore\n' "$REL" > "$I/RELEASE"; resum "$I"
+refused "a RELEASE of two lines" "is not one line" write --yes
+reset_set
+echo "$NEWREL" > "$I/RELEASE"; resum "$I"
+refused "a release without its modules" "boot without its modules" write --yes
+mkdir -p "$R/usr/lib/modules/$NEWREL"
+refused "a release whose depmod has not run" "modules.dep" write --yes
+rm -rf "$R/usr/lib/modules/$NEWREL"
+reset_set
+pass "refuses a set that fails its sums, a bad boot, vendor_boot or dtbo image, and a release without modules"
+
+battery "$R" 12 Discharging 0
+refused "a low battery" "battery at 12%" write --yes
+battery "$R" 12 Discharging 1
+run write --dry-run || fail "a dry run does not need the battery"
+battery "$R" 12 Charging 1
+rm -rf "$R/sys/class/power_supply"
+refused "not a terminal, no --yes" "needs --yes when not run in a terminal" write
+FAKE_FREE=1000 refused "no room for the saved set" "not enough space" write --yes
+[[ ! -e $ST/previous ]] || fail "nothing saved without room"
+mkdir -p "$ST"
+flock "$ST/.lock" "$U" write --yes > "$t/out" 2>&1 && fail "one run at a time"
+grep -qF 'another omamobile-ingot-boot is running' "$t/out" || { cat "$t/out"; fail "and says so"; }
+refused "an unknown option" "unknown argument --partition" write --yes --partition boot_b
+pass "refuses a low battery, a write without confirmation, no room for the saved set, a second run and unknown options"
+
+# ---------------------------------------------------------------- the write
+# No battery reading at all: a warning, not a refusal
+old_boot=$t/old-boot_a && cp "$(part "$R" boot_a)" "$old_boot"
+old_vb=$t/old-vendor_boot_a && cp "$(part "$R" vendor_boot_a)" "$old_vb"
+old_dtbo=$t/old-dtbo_a && cp "$(part "$R" dtbo_a)" "$old_dtbo"
+rest=$(others "$R" boot_a vendor_boot_a dtbo_a)
+run write --yes || { cat "$t/out"; fail "a write succeeds"; }
+grep -qF 'no battery reading' "$t/out" || fail "no battery supply: warns"
+for x in "boot_a boot_a.img" "vendor_boot_a vendor_boot.img" "dtbo_a dtbo.img"; do
+  set -- $x
+  holds "$R" "$1" "$I/$2" || fail "$1 holds $2"
+  grep -qF "$1 (" "$t/out" && grep -qF "written and verified" "$t/out" || fail "$1 written and verified"
+done
+[[ $(stat -c %s "$(part "$R" vendor_boot_a)") == "$(psize vendor_boot_a)" ]] || fail "the partition keeps its size"
+[[ $(others "$R" boot_a vendor_boot_a dtbo_a) == "$rest" ]] || fail "no other partition, and not the disk, changed"
+grep -qF 'Restart the phone to boot it' "$t/out" || fail "says a restart is needed"
+(cd "$ST/previous" && sha256sum --quiet -c SHA256SUMS) || fail "the saved set passes its sums"
+cmp -s "$ST/previous/boot_a.img" "$old_boot" && cmp -s "$ST/previous/vendor_boot_a.img" "$old_vb" && cmp -s "$ST/previous/dtbo_a.img" "$old_dtbo" \
+  || fail "previous holds the old whole partitions"
+[[ $(cat "$ST/previous/RELEASE") == "$REL" && $(cat "$ST/previous/BOOTED") == yes ]] || fail "previous records the running release, as booted"
+grep -qx "boot_a $(psize boot_a)" "$ST/previous/SIZES" || fail "previous records the sizes"
+grep -qE "  boot_a\.img$" "$ST/current/SHA256SUMS" && [[ $(cat "$ST/current/RELEASE") == "$REL" ]] || fail "current records what was written"
+[[ ! -e $ST/incomplete ]] || fail "a finished write leaves no incomplete marker"
+pass "write: saves the whole partitions, writes, reads back, records, and touches nothing else"
+
+before=$(sums "$R")
+run write --yes || { cat "$t/out"; fail "a second write of the same set succeeds"; }
+grep -qF 'nothing to write' "$t/out" || fail "and writes nothing"
+[[ $(sums "$R") == "$before" ]] || fail "identical images are skipped"
+pass "write skips images the partitions already hold"
+
+# A newer set in the same boot: the slot no longer holds what booted, so
+# the saved set (the one that booted) is kept
+mkdir -p "$R/usr/lib/modules/$NEWREL" && echo dep > "$R/usr/lib/modules/$NEWREL/modules.dep"
+mkset "$t/two" "$NEWREL" two
+cp "$t/two/vendor_boot.img" "$t/vb-only"
+run write --yes --images "$t/two" || { cat "$t/out"; fail "a write of another set succeeds"; }
+holds "$R" boot_a "$t/two/boot_a.img" || fail "--images: boot_a holds the new set"
+grep -qF 'keeping previous/' "$t/out" || { cat "$t/out"; fail "says it keeps the saved set"; }
+cmp -s "$ST/previous/boot_a.img" "$old_boot" || fail "previous still holds the set that booted"
+pass "a second write in the same boot keeps the saved set that booted"
+
+# Rollback: dry run first, then the bytes come back
+before=$(sums "$R")
+run rollback --dry-run || { cat "$t/out"; fail "rollback --dry-run"; }
+[[ $(sums "$R") == "$before" ]] || fail "rollback --dry-run writes nothing"
+refused "a rollback without confirmation" "needs --yes" rollback
+run rollback --yes || { cat "$t/out"; fail "rollback succeeds"; }
+cmp -s "$(part "$R" boot_a)" "$old_boot" && cmp -s "$(part "$R" vendor_boot_a)" "$old_vb" && cmp -s "$(part "$R" dtbo_a)" "$old_dtbo" \
+  || fail "rollback restores the saved bytes"
+grep -qF 'Restart the phone' "$t/out" || fail "rollback says a restart is needed"
+echo x >> "$ST/previous/dtbo_a.img"
+refused "a saved set that fails its sums" "fails its checksums" rollback --yes
+pass "rollback --dry-run changes nothing; rollback writes the saved set back, checked against its sums"
+
+# --boot-only after a restart: only boot_a, even when vendor_boot differs
+mkroot "$R"; rm -rf "${R:?}/var"
+mkset "$t/three" "$REL" three
+rest=$(others "$R" boot_a)
+run write --yes --boot-only --images "$t/three" || { cat "$t/out"; fail "--boot-only"; }
+holds "$R" boot_a "$t/three/boot_a.img" || fail "--boot-only writes boot_a"
+[[ $(others "$R" boot_a) == "$rest" ]] || fail "--boot-only writes boot_a alone"
+[[ -f $ST/previous/boot_a.img && ! -e $ST/previous/vendor_boot_a.img ]] || fail "--boot-only saves boot_a alone"
+pass "--boot-only writes and saves boot_a only"
+
+# A restart, then a new set: the slot holds what booted, previous replaced
+reboot_counters "$R"
+run write --yes || { cat "$t/out"; fail "a write after a restart"; }
+cmp -s "$ST/previous/boot_a.img" "$t/three/boot_a.img" || fail "after a restart, previous is the set that booted"
+pass "after a restart the saved set is replaced by what booted"
+
+# A read-back that doesn't match stops with the rollback hint
+mkroot "$R"; rm -rf "${R:?}/var"
+mkdir -p "$fake/baddd"
+cat > "$fake/baddd/dd" <<'EOF'
+#!/bin/bash
+/usr/bin/dd "$@" || exit
+for a; do [[ $a == of=* ]] && printf 'Z' | /usr/bin/dd of="${a#of=}" bs=1 seek=5000 conv=notrunc status=none; done
+exit 0
+EOF
+chmod +x "$fake/baddd/dd"
+if PATH=$fake/baddd:$PATH run write --yes; then fail "a bad read-back fails"; fi
+grep -qF "Run 'omamobile-ingot-boot rollback' BEFORE restarting" "$t/out" || { cat "$t/out"; fail "and says to roll back before restarting"; }
+[[ -e $ST/incomplete ]] || fail "and leaves the incomplete marker"
+run status || true
+grep -qF 'INCOMPLETE' "$t/out" || fail "status shows the incomplete write"
+run rollback --yes || { cat "$t/out"; fail "rollback after a failed write"; }
+grep -qF 'OLD boot_a' "$(part "$R" boot_a)" || fail "rollback undoes a failed write"
+pass "a read-back mismatch stops with the rollback hint, and rollback undoes it"
+
+# The hook with AUTO_WRITE=yes writes without asking
+mkroot "$R"; rm -rf "${R:?}/var"
+echo 'AUTO_WRITE=yes' > "$R/etc/omamobile/ingot-boot.conf"
+run hook < /dev/null || { cat "$t/out"; fail "the hook writes with AUTO_WRITE=yes"; }
+holds "$R" boot_a "$I/boot_a.img" || fail "the hook wrote boot_a"
+battery "$R" 5 Discharging 0
+mkset "$I" "$REL" four
+refused "the hook on a low battery" "battery at 5%" hook
+pass "the hook writes with AUTO_WRITE=yes and refuses loudly like a manual write"
+
+# ---------------------------------------------------------------- slots
+mkroot "$R"; rm -rf "${R:?}/var"
+disk_sum=$(sha256sum < "$R/dev/sde")
+slots() { "$U" slots "$@" > "$t/out" 2>&1; }
+verdict() { # what exit expected-text a-attrs b-attrs
+  mkgpt "$R/dev/sde" "$4" "$5"; disk_sum=$(sha256sum < "$R/dev/sde")
+  local rc=0
+  slots || rc=$?
+  [[ $rc == "$2" ]] || { cat "$t/out"; fail "slots, $1: exit $2 (got $rc)"; }
+  grep -qF -- "$3" "$t/out" || { cat "$t/out"; fail "slots, $1: says '$3'"; }
+  [[ $(sha256sum < "$R/dev/sde") == "$disk_sum" ]] || fail "slots, $1: the disk is unchanged"
+}
+verdict "A successful" 0 "boots without counting" "$(attr 3 1 0 1 0)" "$(attr 2 0 7 0 0)"
+grep -qE '^boot_a +1 +3 +0 +1 +0$' "$t/out" || { cat "$t/out"; fail "slots prints boot_a's flags"; }
+verdict "A unmarked, B not eligible" 0 "5 normal boots left, then the phone stops in fastboot; 'fastboot set_active a' from a computer gives 7 more" \
+  "$(attr 3 1 5 0 0)" "$(attr 2 0 7 0 0)"
+verdict "A unmarked, B unbootable" 2 "2 normal boots left" "$(attr 3 1 2 0 0)" "$(attr 2 0 0 1 1)"
+verdict "A unmarked, B eligible" 3 "DANGER: slot A is not marked successful and slot B is: after 4 more normal boots" "$(attr 3 1 4 0 0)" "$(attr 2 0 7 1 0)"
+grep -qF "'fastboot set_active b' then 'fastboot set_active a' in the same session" "$t/out" || fail "the danger line says how to fix it"
+verdict "A not active, B eligible" 3 "DANGER" "$(attr 3 0 7 1 0)" "$(attr 2 1 7 1 0)"
+verdict "A unbootable, B not eligible" 2 "stops in fastboot" "$(attr 3 1 0 0 1)" "$(attr 2 0 7 0 0)"
+mkgpt "$R/dev/sde" "$(attr 3 1 4 0 0)" "$(attr 2 0 7 1 0)"
+slots --json || [[ $? == 3 ]] || fail "slots --json"
+python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["verdict"]=="danger" and d["boot_a"]["tries"]==4 and d["boot_b"]["successful"]==1, d' "$t/out" \
+  || fail "slots --json carries the flags and the verdict"
+"$U" slots --service > "$t/out" 2>&1 || true
+grep -q '^<4>DANGER' "$t/out" || { cat "$t/out"; fail "--service logs danger at warning level"; }
+python3 -I -c 'import json,sys; assert json.load(open(sys.argv[1]))["verdict"]=="danger"' "$R/run/omamobile/ingot-slots.json" || fail "--service writes ingot-slots.json"
+mkgpt "$R/dev/sde" "$(attr 3 1 0 1 0)" "$(attr 2 0 7 0 0)"
+"$U" slots --service > "$t/out" 2>&1 || fail "--service: a good state exits 0"
+grep -q '^<6>slot A is marked successful' "$t/out" || fail "--service logs a good state at info level"
+pass "slots: each verdict, its exit status, --json and the boot-time --service, never changing the disk"
+
+mv "$R/dev/sde" "$t/sde"
+if slots; then fail "slots without the disk node fails"; fi
+grep -qF 'whole-disk node' "$t/out" && grep -qF 'missing' "$t/out" || { cat "$t/out"; fail "and says the disk node is missing"; }
+"$U" slots --service > "$t/out" 2>&1 && fail "--service fails without the disk"
+grep -q '^<4>omamobile-ingot-boot: cannot read the slot flags' "$t/out" || { cat "$t/out"; fail "--service says why"; }
+[[ ! -e $R/run/omamobile/ingot-slots.json ]] || fail "--service leaves no stale verdict"
+mv "$t/sde" "$R/dev/sde"
+printf 'X' | dd of="$R/dev/sde" bs=1 seek=$((4096 + 40)) conv=notrunc status=none
+if slots; then fail "slots refuses a GPT with a bad CRC"; fi
+grep -qF "CRC" "$t/out" || { cat "$t/out"; fail "and says the CRC is wrong"; }
+mkgpt "$R/dev/sde" "$(attr 3 1 0 1 0)" "$(attr 2 0 7 0 0)"
+printf 'NOT PART' | dd of="$R/dev/sde" bs=1 seek=4096 conv=notrunc status=none
+if slots; then fail "slots refuses a disk without a GPT"; fi
+grep -qF "no GPT header" "$t/out" || fail "and says there is no GPT"
+pass "slots fails without guessing: no disk node, a bad CRC, no GPT"
+
+# ---------------------------------------------------------------- status and preflight
+mkroot "$R"; rm -rf "${R:?}/var"
+run status || { cat "$t/out"; fail "status"; }
+for want in 'board:       osom,ingot' 'boot slot:   _a' "image set:   $REL" 'partition:   boot_a sde5' 'slots:       A active 1' 'boots without counting'; do
+  grep -qF -- "$want" "$t/out" || { cat "$t/out"; fail "status shows '$want'"; }
+done
+before=$(sums "$R")
+"$U" preflight --json > "$t/out" 2>&1 || { cat "$t/out"; fail "preflight passes a good phone"; }
+python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["ok"] and d["release"]==sys.argv[2], d' "$t/out" "$REL" || fail "preflight --json says ok"
+echo 1 > "$(psys "$R" dtbo_a)/ro"
+if "$U" preflight > "$t/out" 2>&1; then fail "preflight refuses a read-only dtbo_a"; fi
+grep -qF 'not ready: ' "$t/out" && grep -qF 'storage guard' "$t/out" || { cat "$t/out"; fail "preflight says why"; }
+[[ $(sums "$R") == "$before" && ! -e $R/var/lib ]] || fail "status and preflight change nothing"
+pass "status and preflight report, and change nothing"

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+# Solana Mobile Saga (ingot): keep the three audio SoundWire buses awake.
+#
+# The two WSA883x speaker amplifiers (bus 3250000) enumerate at boot, but
+# the first time the bus's clock is stopped and started again (its runtime
+# suspend, a few seconds after the last use) both drop to device number 0
+# at once, the controller's enumeration fails ("SWR bus clsh detected",
+# interrupt bit 11) and they stay unattached: every later stream plays into
+# nothing. The WCD938x's buses (3210000 playback, 33b0000 capture) survive
+# the same restart, but with parity errors and alerts, and an alert on the
+# playback side ends in a NULL dereference in the codec's interrupt
+# callback (the kernel's SoundWire IRQ thread dies).
+#
+# With runtime power management held on, the clocks never stop at run time.
+# This costs idle power. A system suspend stops the clocks all the same; in
+# the suspends tried with this rule in place (pm_test runs and two
+# suspend-to-idle cycles) the amplifiers were still attached afterwards, so
+# the failure seems to belong to the runtime path. Why is not understood.
+# Remove this file once the kernel keeps the devices across a clock stop.
+ACTION=="add", SUBSYSTEM=="platform", KERNEL=="3210000.soundwire|3250000.soundwire|33b0000.soundwire", ATTR{power/control}="on"

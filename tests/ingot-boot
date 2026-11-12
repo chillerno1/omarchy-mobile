@@ -1,0 +1,189 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# The Saga's standalone boot image, with no phone and no Docker:
+# tools/ingot-boot-footer on a synthetic header v4 boot.img (made with
+# mkbootimg; skipped without it or avbtool) gives exactly boot_a's size, a
+# footer avbtool reads back, the input's bytes in front and the same bytes
+# twice, and refuses what isn't a v4 boot image, an existing OUT, an image
+# too big for boot_a and a key that isn't the recorded one. The container
+# script's kernel release banner, its --self-update values (exactly the
+# descriptor's) and its refusal of SELF_UPDATE without ARCH_BOOT run here
+# too, and build-ingot-probe refuses --self-update without --arch before
+# Docker.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+t=$(mktemp -d); trap '[[ -n ${KEEP:-} ]] || rm -rf "$t"' EXIT
+build=device/ingot/initramfs/build
+size=$(($(sed -n 's/^BOOT_A_SIZE=//p' device/ingot/device.conf)))
+((size == 0x6000000)) || fail "the descriptor's BOOT_A_SIZE is boot_a's 96 MiB (got $size)"
+cmp -s device/ingot/device.conf packages/omamobile-device-ingot/device.conf || fail "the package's device.conf is the descriptor"
+pass "BOOT_A_SIZE is 0x6000000"
+
+# --- tools/ingot-boot-footer ---
+avb=${AVBTOOL:-$(command -v avbtool || true)}
+mkb=$(command -v mkbootimg || true)
+if [[ -z $avb || -z $mkb ]]; then
+  echo "ok - # skip: tools/ingot-boot-footer needs avbtool and mkbootimg"
+else
+  footer() { tools/ingot-boot-footer "$@" > "$t/log" 2>&1; }
+  head -c 300000 /dev/urandom > "$t/kernel"
+  head -c 20000 /dev/urandom > "$t/ramdisk"
+  "$mkb" --header_version 4 --kernel "$t/kernel" --ramdisk "$t/ramdisk" -o "$t/boot.img"
+  "$mkb" --header_version 2 --kernel "$t/kernel" --ramdisk "$t/ramdisk" --dtb "$t/ramdisk" -o "$t/v2.img"
+  footer "$t/boot.img" "$t/a1.img" || { cat "$t/log"; fail "a v4 image gets a footer"; }
+  [[ $(stat -c %s "$t/a1.img") == "$size" ]] || fail "the output is exactly boot_a's size"
+  avbi() { if [[ $avb == *.py ]]; then python3 -I "$avb" "$@"; else "$avb" "$@"; fi; }
+  info=$(avbi info_image --image "$t/a1.img") || fail "avbtool reads the footer back"
+  grep -q '^Footer version:' <<<"$info" && grep -q 'Partition Name: *boot$' <<<"$info" \
+    && grep -q '^Rollback Index: *0$' <<<"$info" && grep -q '^Algorithm: *SHA256_RSA4096$' <<<"$info" \
+    || { echo "$info"; fail "a boot footer, rollback index 0, SHA256_RSA4096"; }
+  cmp -s -n "$(stat -c %s "$t/boot.img")" "$t/boot.img" "$t/a1.img" || fail "the output starts with the input"
+  grep -q "sha256 $(sha256sum < "$t/a1.img" | cut -d' ' -f1)" "$t/log" || fail "the size and sha256 are printed"
+  footer "$t/boot.img" "$t/a2.img" || { cat "$t/log"; fail "a second run"; }
+  cmp -s "$t/a1.img" "$t/a2.img" || fail "two runs give the same bytes"
+  pass "a v4 boot.img becomes boot_a.img: 96 MiB, a footer avbtool reads, its own bytes in front, the same twice"
+
+  refused() { # what, expected message, arguments
+    local what=$1 msg=$2; shift 2
+    if footer "$@"; then fail "refuses $what"; fi
+    grep -q -- "$msg" "$t/log" || { cat "$t/log"; fail "refuses $what with: $msg"; }
+    pass "refuses $what"
+  }
+  head -c 4096 /dev/urandom > "$t/random.img"
+  refused "a file that is not a boot image" "no ANDROID! magic" "$t/random.img" "$t/out1.img"
+  refused "a header v2 boot image" "header v2" "$t/v2.img" "$t/out2.img"
+  refused "an existing OUT" "already exists" "$t/boot.img" "$t/a1.img"
+  cmp -s "$t/a1.img" "$t/a2.img" || fail "an existing OUT is left as it was"
+  # A v4 header in front of more than boot_a can hold (sparse, so cheap)
+  cp "$t/boot.img" "$t/big.img"; truncate -s "$size" "$t/big.img"
+  refused "an image too big for boot_a" "holds at most" "$t/big.img" "$t/out3.img"
+  refused "a missing input" "no such file" "$t/none.img" "$t/out4.img"
+  refused "one argument" "usage:" "$t/boot.img"
+  [[ ! -e $t/out1.img && ! -e $t/out2.img && ! -e $t/out3.img && ! -e $t/out4.img ]] || fail "a refusal writes no OUT"
+  [[ -z $(find "$t" -name '.ingot-boot-footer.*') ]] || fail "a refusal leaves no working copy"
+
+  # --- tools/ingot-boot-set: the set the phone's writer and the kernel
+  # package take. The builder and those two were written apart, so this is
+  # where they meet: the set must pass the checks they share.
+  mkdir "$t/built"
+  cp "$t/boot.img" "$t/built/boot.img"
+  { printf 'VNDRBOOT'; head -c 5000 /dev/urandom; } > "$t/built/vendor_boot.img"
+  { printf '\xd7\xb7\xab\x1e'; head -c 4092 /dev/urandom; } > "$t/built/dtbo.img"
+  echo 7.3.0-rc6-omamobile-push1-g0123456789ab > "$t/built/RELEASE"
+  head -c 100 /dev/urandom > "$t/built/ingot.dtb"
+  (cd "$t/built" && sha256sum boot.img vendor_boot.img dtbo.img ingot.dtb RELEASE > SHA256SUMS)
+  mkset() { tools/ingot-boot-set "$@" > "$t/log" 2>&1; }
+  mkset "$t/built" "$t/built/slot-a" || { cat "$t/log"; fail "a build directory becomes a set"; }
+  [[ $(cd "$t/built/slot-a" && find . -type f | LC_ALL=C sort | tr '\n' ' ') == "./RELEASE ./SHA256SUMS ./boot_a.img ./dtbo.img ./vendor_boot.img " ]] \
+    || fail "the set holds its five files and nothing else"
+  cmp -s "$t/built/slot-a/boot_a.img" "$t/a1.img" || fail "the set's boot_a.img is the footed boot.img"
+  cmp -s "$t/built/slot-a/vendor_boot.img" "$t/built/vendor_boot.img" && cmp -s "$t/built/slot-a/dtbo.img" "$t/built/dtbo.img" \
+    || fail "vendor_boot.img and dtbo.img are copied unchanged"
+  lib=packages/omamobile-ingot-boot/lib/ingot-images.sh
+  if [[ -f $lib ]]; then
+    ( # shellcheck source=../packages/omamobile-ingot-boot/lib/ingot-images.sh
+      source "$lib"
+      d=$t/built/slot-a
+      ib_check_sums "$d" && [[ $(ib_release "$d") == 7.3.0-rc6-omamobile-push1-g0123456789ab ]] \
+        && ib_check_boot "$d/boot_a.img" "$IB_BOOT_A_BYTES" && ib_check_vendor_boot "$d/vendor_boot.img" "$IB_VENDOR_BOOT_A_BYTES" \
+        && ib_check_dtbo "$d/dtbo.img" "$IB_DTBO_A_BYTES" && ib_kernel_of "$d/boot_a.img" "$t/kernel.out" \
+        && cmp -s "$t/kernel.out" "$t/kernel" ) || fail "the set passes the writer's and the kernel package's checks"
+    # The build directory itself is not a set: its sums name other files
+    ( source "$lib"; ! ib_check_sums "$t/built" >/dev/null ) || fail "the build directory is not taken for a set"
+    pass "ingot-boot-set makes the set omamobile-ingot-boot and linux-omamobile-ingot check, kernel included"
+  else
+    pass "ingot-boot-set makes boot_a.img, vendor_boot.img, dtbo.img, RELEASE and SHA256SUMS"
+  fi
+  refused_set() { # what, expected message, arguments
+    local what=$1 msg=$2; shift 2
+    if mkset "$@"; then fail "ingot-boot-set refuses $what"; fi
+    grep -q -- "$msg" "$t/log" || { cat "$t/log"; fail "ingot-boot-set refuses $what with: $msg"; }
+  }
+  refused_set "an existing set" "already exists" "$t/built" "$t/built/slot-a"
+  cp -r "$t/built" "$t/mixed"; rm -rf "$t/mixed/slot-a"
+  head -c 5008 /dev/urandom > "$t/mixed/vendor_boot.img"
+  refused_set "an image that isn't the one its build summed" "does not match" "$t/mixed" "$t/mixed/slot-a"
+  rm "$t/mixed/dtbo.img"
+  refused_set "a build directory without dtbo.img" "has no dtbo.img" "$t/mixed" "$t/mixed/slot-a"
+  [[ ! -e $t/mixed/slot-a && -z $(find "$t" -name '.ingot-boot-set.*') ]] || fail "a refusal leaves no set and no working copy"
+  pass "ingot-boot-set refuses an existing set, a changed image and a missing one, leaving nothing behind"
+
+  # A key that isn't the one SOURCE records, in a copy of the tree
+  R=$t/repo
+  mkdir -p "$R/tools/lib" "$R/device/ingot" "$R/packages/omamobile-boot-update"
+  cp tools/ingot-boot-footer "$R/tools/"; cp tools/lib/usage.sh "$R/tools/lib/"
+  cp device/ingot/device.conf "$R/device/ingot/"
+  cp -r packages/omamobile-boot-update/avb "$R/packages/omamobile-boot-update/"
+  echo tampered >> "$R/packages/omamobile-boot-update/avb/testkey_rsa4096.pem"
+  if "$R/tools/ingot-boot-footer" "$t/boot.img" "$t/out5.img" > "$t/log" 2>&1; then fail "refuses a key that isn't the recorded one"; fi
+  grep -q 'does not match the sha256' "$t/log" || { cat "$t/log"; fail "says the key does not match"; }
+  [[ ! -e $t/out5.img ]] || fail "a bad key writes no OUT"
+  pass "refuses a key that doesn't match packages/omamobile-boot-update/avb/SOURCE"
+fi
+
+# --- The container script, without the container ---
+# RELEASE: its banner reader against made-up Images
+awk '/^python3 - <<.PY.$/ {on = 1; next} on && /^PY$/ {exit} on' "$build" > "$t/release.py"
+grep -q "/out/RELEASE" "$t/release.py" || fail "the build writes /out/RELEASE from the Image"
+sed -e "s|/tmp/Image|$t/Image|" -e "s|/out/RELEASE|$t/RELEASE|" "$t/release.py" > "$t/release-test.py"
+image() { # text after the ARM64 header, with | for a NUL byte (bash can't pass one)
+  python3 -I -c 'import sys; sys.stdout.buffer.write(b"\0" * 56 + b"ARM\x64" + b"\0" * 4 + sys.argv[1].encode().replace(b"|", b"\0"))' "$1" > "$t/Image"
+}
+image 'junk|Linux version 7.3.0-rc6-omamobile-00012-gabc1234 (builder@host) (clang) #1 SMP|'
+python3 -I "$t/release-test.py" || fail "an Image with a banner gives its release"
+[[ $(cat "$t/RELEASE") == 7.3.0-rc6-omamobile-00012-gabc1234 ]] || fail "RELEASE is the banner's release (got $(cat "$t/RELEASE"))"
+rm "$t/RELEASE"; image 'no banner here|Linux version %s|'
+if python3 -I "$t/release-test.py" 2>/dev/null; then fail "an Image without a banner stops the build"; fi
+[[ ! -e $t/RELEASE ]] || fail "no banner: no RELEASE"
+grep -q 'initramfs.cpio.gz RELEASE > SHA256SUMS' "$build" || fail "RELEASE is in SHA256SUMS"
+pass "RELEASE is the Image banner's release, a missing banner stops the build, and SHA256SUMS lists it"
+
+# --self-update: the block that packs the slot and the wider allowlist
+awk '/^    if \[ "\$\{SELF_UPDATE:-0\}" = 1 \]; then$/ {on = 1} on; on && /^    fi$/ {exit}' "$build" > "$t/self.sh"
+grep -q omamobile-slot "$t/self.sh" || fail "the --self-update block found in $build"
+mkdir -p "$t/src/device/ingot"
+sed -e "s|/src/|$t/src/|g" "$t/self.sh" > "$t/self-test.sh"
+self() { # sed expression applied to the descriptor
+  sed -e "$1" device/ingot/device.conf > "$t/src/device/ingot/device.conf"
+  rm -rf "$t/stage"; mkdir -p "$t/stage/etc"
+  (SELF_UPDATE=1 stage=$t/stage sh -c ". '$t/self-test.sh'") > "$t/log" 2>&1
+}
+self '' || { cat "$t/log"; fail "the descriptor's self-update values pack"; }
+[[ $(cat "$t/stage/etc/omamobile-slot") == a && $(cat "$t/stage/etc/omamobile-ufs-rw") == "boot_a vendor_boot_a dtbo_a userdata" \
+   && $(cat "$t/stage/etc/omamobile-ufs-rw-luns") == sde ]] || fail "--self-update packs slot a, the four names and sde"
+for e in 's/^SLOT=.*/SLOT=b/' 's/^UFS_RW_SELF_UPDATE=.*/UFS_RW_SELF_UPDATE="boot_a vendor_boot_a dtbo_a userdata persist"/' \
+         's/^UFS_RW_SELF_UPDATE=.*/UFS_RW_SELF_UPDATE="boot_a userdata"/' '/^UFS_RW_SELF_UPDATE=/d' \
+         's/^UFS_RW_SELF_UPDATE_LUNS=.*/UFS_RW_SELF_UPDATE_LUNS="sde sdf"/' '/^SLOT=/d'; do
+  if self "$e"; then fail "--self-update refuses the descriptor edit $e"; fi
+  grep -q 'SELF_UPDATE needs' "$t/log" || { cat "$t/log"; fail "--self-update says why it refuses $e"; }
+  [[ -z $(ls "$t/stage/etc") ]] || fail "--self-update packs nothing for $e"
+done
+pass "--self-update packs exactly slot a, boot_a vendor_boot_a dtbo_a userdata and sde, and refuses any other value"
+
+# SELF_UPDATE without ARCH_BOOT stops before the container installs anything
+mkdir -p "$t/bin"
+printf '#!/bin/sh\necho called >> "%s/calls"\nexit 97\n' "$t" > "$t/bin/apk"
+chmod +x "$t/bin/apk"
+if PATH="$t/bin:$PATH" SELF_UPDATE=1 ARCH_BOOT=0 sh "$build" > "$t/log" 2>&1; then fail "SELF_UPDATE without ARCH_BOOT is refused"; fi
+grep -q 'SELF_UPDATE needs ARCH_BOOT' "$t/log" && [[ ! -e $t/calls ]] || { cat "$t/log"; fail "refused before apk runs"; }
+# shellcheck disable=SC2016 # the script's own text, $stage unexpanded
+grep -q 'echo stay > "\$stage/etc/omamobile-no-usb-host"' "$build" && grep -q 'omamobile-compatible' "$build" \
+  || fail "--arch packs the board compatible and the no-USB-host stay"
+pass "the container script refuses SELF_UPDATE without ARCH_BOOT first; --arch packs the board and stay"
+
+# boot.img's command line asks for bootconfig, ahead of any "--", or the
+# kernel leaves ABL's androidboot.* keys (the slot) out of /proc/bootconfig
+cmdline=$(sed -n "s/^    --cmdline '\(.*\)' \\\\$/\1/p" "$build")
+[[ -n $cmdline ]] || fail "boot.img's --cmdline found in $build"
+[[ " ${cmdline%% -- *} " == *' bootconfig '* ]] || fail "boot.img's command line has bootconfig before any -- (got: $cmdline)"
+pass "boot.img's command line asks the kernel to parse ABL's bootconfig"
+
+# build-ingot-probe --self-update without --arch, before Docker
+printf '#!/bin/sh\necho called >> "%s/calls"\nexit 97\n' "$t" > "$t/bin/docker"
+chmod +x "$t/bin/docker"
+if PATH="$t/bin:$PATH" tools/build-ingot-probe --self-update --out "$t/probe" > "$t/log" 2>&1; then fail "--self-update without --arch is refused"; fi
+grep -q -- '--self-update needs --arch' "$t/log" || { cat "$t/log"; fail "says --self-update needs --arch"; }
+[[ ! -e $t/calls && ! -e $t/probe ]] || fail "--self-update without --arch reached Docker or made the output"
+pass "build-ingot-probe refuses --self-update without --arch before Docker"

@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Omarchy Mobile: give the WCN6855 Bluetooth controller (hci_uart QCA on
+# UART20) a stable address (omamobile-bt-addr@.service). DEVTYPE host: the
+# controller itself, not its connections.
+ACTION=="add", SUBSYSTEM=="bluetooth", ENV{DEVTYPE}=="host", KERNEL=="hci[0-9]*", DRIVERS=="hci_uart_qca", TAG+="systemd", ENV{SYSTEMD_WANTS}+="omamobile-bt-addr@%k.service"

@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: MIT
 # Runs inside tools/build-ingot-probe's disposable aarch64 Alpine container.
 set -eu
+# SELF_UPDATE widens the storage allowlist of the Arch init, so it means
+# nothing without ARCH_BOOT; refuse it before any work
+if [ "${SELF_UPDATE:-0}" = 1 ] && [ "${ARCH_BOOT:-0}" != 1 ]; then
+    echo 'SELF_UPDATE needs ARCH_BOOT (build-ingot-probe --self-update needs --arch)' >&2; exit 1
+fi
 apk add --no-cache gcc musl-dev cpio dtc python3 gzip
 
 [ "$(fdtget /input/ingot.dtb / model)" = 'Solana Mobile Saga' ] || {
@@ -13,13 +18,18 @@ case " $(fdtget /input/ingot.dtb / compatible) " in
 esac
 gzip -t /input/kernel || { echo 'Expected a gzip-compressed ARM64 Image' >&2; exit 1; }
 gzip -dc /input/kernel > /tmp/Image
+# /out/RELEASE: the packed kernel's release, from its banner, so the
+# modules installed on userdata can be matched to the boot image
 python3 - <<'PY'
 from pathlib import Path
-import sys
-with Path('/tmp/Image').open('rb') as stream:
-    stream.seek(56)
-    if stream.read(4) != b'ARM\x64':
-        sys.exit('Kernel has no ARM64 Image header')
+import re, sys
+image = Path('/tmp/Image').read_bytes()
+if image[56:60] != b'ARM\x64':
+    sys.exit('Kernel has no ARM64 Image header')
+m = re.search(rb'Linux version ([0-9][0-9A-Za-z._+-]*) \(', image)
+if not m:
+    sys.exit('Kernel has no "Linux version <release> (" banner')
+Path('/out/RELEASE').write_text(m.group(1).decode() + '\n')
 PY
 rm /tmp/Image
 
@@ -43,6 +53,29 @@ if [ "${ARCH_BOOT:-0}" = 1 ]; then
     mkdir -p "$stage/etc"
     echo "$rw" > "$stage/etc/omamobile-ufs-rw"
     sed -n 's/^USB_PRODUCT="\(.*\)"$/\1/p' /src/device/ingot/device.conf > "$stage/etc/omamobile-usb-product"
+    # The board the init's board checks compare against, and "stay": on
+    # this phone a crash without a USB host would spend one of slot A's
+    # boot tries and fall back to LineageOS, which can't use the Arch root
+    compat=$(sed -n 's/^COMPATIBLE="\(.*\)"$/\1/p' /src/device/ingot/device.conf)
+    [ "$compat" = osom,ingot ] || { echo "ARCH_BOOT needs COMPATIBLE=\"osom,ingot\", not \"$compat\"" >&2; exit 1; }
+    echo "$compat" > "$stage/etc/omamobile-compatible"
+    echo stay > "$stage/etc/omamobile-no-usb-host"
+    if [ "${SELF_UPDATE:-0}" = 1 ]; then
+        # build-ingot-probe --self-update: slot A's boot images join the
+        # allowlist, so Arch can write its own boot partitions. Only these
+        # exact values: a descriptor edit can't widen the guard further.
+        slot=$(sed -n 's/^SLOT=\(.*\)$/\1/p' /src/device/ingot/device.conf)
+        rw=$(sed -n 's/^UFS_RW_SELF_UPDATE="\(.*\)"$/\1/p' /src/device/ingot/device.conf)
+        luns=$(sed -n 's/^UFS_RW_SELF_UPDATE_LUNS="\(.*\)"$/\1/p' /src/device/ingot/device.conf)
+        [ "$slot" = a ] || { echo "SELF_UPDATE needs SLOT=a, not \"$slot\"" >&2; exit 1; }
+        [ "$rw" = 'boot_a vendor_boot_a dtbo_a userdata' ] || {
+            echo "SELF_UPDATE needs UFS_RW_SELF_UPDATE=\"boot_a vendor_boot_a dtbo_a userdata\", not \"$rw\"" >&2; exit 1;
+        }
+        [ "$luns" = sde ] || { echo "SELF_UPDATE needs UFS_RW_SELF_UPDATE_LUNS=\"sde\", not \"$luns\"" >&2; exit 1; }
+        echo "$slot" > "$stage/etc/omamobile-slot"
+        echo "$rw" > "$stage/etc/omamobile-ufs-rw"
+        echo "$luns" > "$stage/etc/omamobile-ufs-rw-luns"
+    fi
     for f in sbin/e2fsck usr/sbin/resize2fs usr/sbin/dumpe2fs; do
         [ -x "$stage/$f" ] || { echo "the initramfs has no /$f" >&2; exit 1; }
     done
@@ -138,4 +171,4 @@ for img in boot vendor_boot; do
     [ "$size" -le 100663296 ] || { rm /out/$img.img; echo "$img exceeds its 96 MiB partition" >&2; exit 1; }
 done
 [ "$(stat -c %s /out/dtbo.img)" -le 25165824 ] || { echo 'dtbo exceeds its 24 MiB partition' >&2; exit 1; }
-(cd /out && sha256sum boot.img vendor_boot.img dtbo.img ingot.dtb initramfs.cpio.gz > SHA256SUMS)
+(cd /out && sha256sum boot.img vendor_boot.img dtbo.img ingot.dtb initramfs.cpio.gz RELEASE > SHA256SUMS)

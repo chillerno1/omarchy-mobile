@@ -1,0 +1,227 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Tests for linux-omamobile-ingot against a fake kernel build (a made-up
+# Image.gz, DTB and modules tarball shaped like bin/omamobile modules'
+# output) and a fake image set shaped like tools/build-ingot-probe
+# --standalone's (a header v4 boot_a.img carrying that Image.gz, padded to
+# 0x6000000 bytes with an AVB footer): the release to pkgver mapping and its
+# order, the refusals of ./stage, --verify, the package layout, and makepkg
+# itself where it is installed. ./stage uses omamobile-ingot-boot's image
+# checks (../omamobile-ingot-boot/lib/ingot-images.sh).
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+PKG=$PWD
+fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
+pass() { printf 'ok - %s\n' "$1"; }
+
+for f in stage install lib/pkgver test/all PKGBUILD; do bash -n "$f" || fail "$f parses"; done
+pass "scripts parse"
+command -v zstd >/dev/null || { pass "# SKIP no zstd"; exit 0; }
+command -v git >/dev/null || { pass "# SKIP no git"; exit 0; }
+command -v python3 >/dev/null || { pass "# SKIP no python3"; exit 0; }
+[[ -f ../omamobile-ingot-boot/lib/ingot-images.sh ]] || { pass "# SKIP not in the repository (stage needs omamobile-ingot-boot's checks)"; exit 0; }
+
+t=$(mktemp -d)
+trap 'rm -rf "$t"' EXIT
+
+# ---------------------------------------------------------------- pkgver
+check_ver() { # release [commits] expected
+  local want=${*: -1} args=("${@:1:$#-1}")
+  [[ $(lib/pkgver "${args[@]}" 2>/dev/null) == "$want" ]] || fail "pkgver ${args[*]} -> $want (got $(lib/pkgver "${args[@]}" 2>&1))"
+}
+check_ver 7.3.0-rc6-omamobile-push1-g837bf17d318a 1301234 7.3.0rc6.r1301234.g837bf17d318a
+check_ver 7.3.0-rc6-omamobile-push1-00058-g7b0f8b5d18f8 7.3.0rc6.r58.g7b0f8b5d18f8
+check_ver 7.3.0-rc6-omamobile-g0123456789ab 4521 7.3.0rc6.r4521.g0123456789ab
+check_ver 7.4-omamobile-push2-00001-gabcdef0 7.4.0.r1.gabcdef0
+for bad in 7.3.0-rc6-omamobile-push1-g837bf17d318a-dirty 7.3.0-rc6 7.3.0-rc6-omandroid-push1-g837bf17d318a \
+           '7.3.0-omamobile-push1-g$(id)' 7.3.0-rc6-omamobile-push1 ''; do
+  if lib/pkgver "$bad" 12 >/dev/null 2>&1; then fail "pkgver refuses '$bad'"; fi
+done
+if lib/pkgver 7.3.0-rc6-omamobile-push1-g837bf17d318a >/dev/null 2>&1; then fail "pkgver needs a count for a release without one"; fi
+if command -v vercmp >/dev/null; then
+  order=(7.3.0rc6.r1301230.g1111111 7.3.0rc6.r1301234.g837bf17 7.3.0rc6.r1301300.g0000000 7.3.0.r1301400.gaaaaaaa)
+  for ((i = 1; i < ${#order[@]}; i++)); do
+    [[ $(vercmp "${order[i-1]}" "${order[i]}") == -1 ]] || fail "vercmp: ${order[i-1]} < ${order[i]}"
+  done
+  pass "pkgver takes development releases, refuses -dirty, and sorts upward with the commit count (vercmp)"
+else
+  pass "pkgver takes development releases and refuses -dirty (vercmp # SKIP not installed)"
+fi
+
+# ---------------------------------------------------------------- a fake build
+gitc() { git -c user.name=t -c user.email=t@example.invalid -c init.defaultBranch=main "$@"; }
+src=$t/src && mkdir -p "$src"
+( cd "$src" && gitc init -q && for i in 1 2 3 4; do echo $i > f; git add f; gitc commit -qm "c$i"; done )
+head12=$(git -C "$src" rev-parse --short=12 HEAD)
+rel=7.3.0-rc6-omamobile-push1-g$head12
+K=$t/out
+mkbuild() { # release
+  rm -rf "$K" "$t/ms"
+  mkdir -p "$K/include/config" "$K/arch/arm64/boot/dts/qcom" "$t/ms/$1/kernel/drivers/gpu"
+  echo "$1" > "$K/include/config/kernel.release"
+  { head -c 56 /dev/zero; printf 'ARM\x64'; head -c 6000 /dev/urandom; } | gzip -n > "$K/arch/arm64/boot/Image.gz"
+  head -c 300 /dev/urandom > "$K/arch/arm64/boot/dts/qcom/sm8475-osom-ingot.dtb"
+  head -c 999 /dev/urandom > "$t/ms/$1/kernel/drivers/gpu/msm.ko"
+  printf 'kernel/drivers/gpu/msm.ko\n' > "$t/ms/$1/modules.order"
+  : > "$t/ms/$1/modules.builtin"; : > "$t/ms/$1/modules.builtin.modinfo"
+  for f in modules.dep modules.dep.bin modules.alias modules.symbols; do echo x > "$t/ms/$1/$f"; done
+  ln -s /home/someone/kernel "$t/ms/$1/build"
+  tar -C "$t/ms" --owner=0 --group=0 --numeric-owner -cf - "$1" | zstd -q -f -o "$K/modules-$1.tar.zst"
+}
+IMG=$t/images
+mkimages() { # release [kernel]
+  rm -rf "$IMG" && mkdir -p "$IMG"
+  python3 -I - "$IMG" "${2:-$K/arch/arm64/boot/Image.gz}" <<'PY'
+import struct, sys
+d, kpath = sys.argv[1], sys.argv[2]
+kernel = open(kpath, "rb").read()
+hdr = bytearray(4096)
+hdr[0:8] = b"ANDROID!"
+struct.pack_into("<IIIII", hdr, 8, len(kernel), 512, 0, 1580, 0)
+struct.pack_into("<I", hdr, 40, 4)
+size = 0x6000000
+with open(f"{d}/boot_a.img", "wb") as f:
+    f.write(bytes(hdr) + kernel + b"\0" * (4096 - len(kernel) % 4096) + b"RAMDISK")
+    f.seek(size - 64)
+    f.write(b"AVBf" + b"\0" * 60)
+open(f"{d}/vendor_boot.img", "wb").write(b"VNDRBOOT" + b"\4\0\0\0" + b"\0" * 8000)
+open(f"{d}/dtbo.img", "wb").write(bytes([0xd7, 0xb7, 0xab, 0x1e]) + b"\0" * 500)
+PY
+  echo "$1" > "$IMG/RELEASE"
+  resum
+}
+resum() { (cd "$IMG" && sha256sum boot_a.img vendor_boot.img dtbo.img RELEASE > SHA256SUMS); }
+mkbuild "$rel"; mkimages "$rel"
+export KERNEL_DIR=$src
+
+# ---------------------------------------------------------------- stage
+P=$t/prebuilt
+./stage "$K" "$IMG" "$P" > "$t/log" 2>&1 || { cat "$t/log"; fail "stage copies a development build and its images"; }
+for f in kernel.release kernel.commits modules.tar.zst sm8475-osom-ingot.dtb SOURCE SHA256SUMS \
+         boot/boot_a.img boot/vendor_boot.img boot/dtbo.img boot/RELEASE boot/SHA256SUMS; do
+  [[ -f $P/$f ]] || fail "stage: $f"
+done
+(cd "$P" && sha256sum --quiet -c SHA256SUMS) || fail "stage: checksums"
+grep -qE '  boot/SHA256SUMS$' "$P/SHA256SUMS" || fail "stage: the sums cover boot/SHA256SUMS"
+[[ $(cat "$P/kernel.commits") == 4 ]] || fail "the commit count is KERNEL_DIR's"
+grep -qx "commit $(git -C "$src" rev-parse HEAD)" "$P/SOURCE" || fail "SOURCE records the commit"
+grep -qF "pkgver 7.3.0rc6.r4.g$head12" "$t/log" || fail "stage names the pkgver"
+pass "stage copies a development kernel's modules, DTB and boot images, with the commit and count"
+
+stage_refuses() { # what message
+  if ./stage "$K" "$IMG" "$t/p3" > "$t/log" 2>&1; then fail "stage refuses $1"; fi
+  grep -qF -- "$2" "$t/log" || { cat "$t/log"; fail "stage, $1: says '$2'"; }
+  [[ ! -e $t/p3 ]] || fail "stage, $1: nothing staged"
+}
+mkbuild "$rel-dirty"; mkimages "$rel-dirty"
+stage_refuses "a dirty tree" "uncommitted changes"
+mkbuild "$rel"; mkimages "$rel"
+rm "$K/modules-$rel.tar.zst"
+stage_refuses "a build without its modules" "bin/omamobile modules"
+mkbuild 7.3.0-rc6-omamobile-push1-gffffffffffff
+mv "$K/modules-7.3.0-rc6-omamobile-push1-gffffffffffff.tar.zst" "$t/stale.tar.zst"
+mkbuild "$rel"
+cp "$t/stale.tar.zst" "$K/modules-$rel.tar.zst"
+stage_refuses "another release's modules" "not $rel only"
+mkbuild "$rel"
+rm -rf "$t/ms/$rel/modules.order"; tar -C "$t/ms" -cf - "$rel" | zstd -q -f -o "$K/modules-$rel.tar.zst"
+stage_refuses "modules without modules.order" "has no modules.order"
+mkbuild "$rel"; mkimages "$rel"
+rm "$K/arch/arm64/boot/dts/qcom/sm8475-osom-ingot.dtb"
+stage_refuses "no board DTB" "sm8475-osom-ingot.dtb"
+mkbuild "$rel"; mkimages "$rel"
+mkbuild 7.3.0-rc6-omamobile-push1-gffffffffffff
+stage_refuses "a build of another commit than KERNEL_DIR's" "was built from ffffffffffff"
+mkbuild "$rel"; mkimages "$rel"
+echo 7.3.0-rc6-omamobile-push1-g000000000000 > "$IMG/RELEASE"; resum
+stage_refuses "images of another release" "RELEASE says 7.3.0-rc6-omamobile-push1-g000000000000"
+head -c 4000 /dev/urandom | gzip -n > "$t/other.gz"
+mkimages "$rel" "$t/other.gz"
+stage_refuses "images of another kernel" "is not $K/arch/arm64/boot/Image.gz"
+mkimages "$rel"
+truncate -s $((0x6000000 - 4096)) "$IMG/boot_a.img"; resum
+stage_refuses "a boot_a.img not padded to boot_a" "the AVB footer must be at its end"
+mkimages "$rel"
+printf 'XXXX' | dd of="$IMG/boot_a.img" bs=1 seek=$((0x6000000 - 64)) conv=notrunc status=none; resum
+stage_refuses "a boot_a.img without its AVB footer" "no AVB footer"
+mkimages "$rel"
+printf '\3' | dd of="$IMG/boot_a.img" bs=1 seek=40 conv=notrunc status=none; resum
+stage_refuses "a header v3 boot image" "not 4"
+mkimages "$rel"
+printf 'XNDRBOOT' | dd of="$IMG/vendor_boot.img" conv=notrunc status=none; resum
+stage_refuses "a bad vendor_boot.img" "VNDRBOOT"
+mkimages "$rel"
+echo x >> "$IMG/dtbo.img"
+stage_refuses "a set that fails its sums" "fails its SHA256SUMS"
+mkimages "$rel"
+if env -u KERNEL_DIR ./stage "$K" "$IMG" "$t/p4" > "$t/log" 2>&1; then fail "stage refuses a release without a count and no KERNEL_DIR"; fi
+grep -qF 'set KERNEL_DIR' "$t/log" || { cat "$t/log"; fail "and says to set KERNEL_DIR"; }
+crel=7.3.0-rc6-omamobile-push1-00058-g$head12
+mkbuild "$crel"; mkimages "$crel"
+env -u KERNEL_DIR ./stage "$K" "$IMG" "$t/p5" > "$t/log" 2>&1 || { cat "$t/log"; fail "a release with its own count needs no KERNEL_DIR"; }
+grep -qF "pkgver 7.3.0rc6.r58.g$head12" "$t/log" || fail "and takes the release's count"
+mkbuild "$rel"; mkimages "$rel"
+pass "stage refuses -dirty, missing or stale modules, no DTB, another commit, release or kernel, and images the phone would refuse"
+
+# --verify
+./stage --verify "$P" > "$t/log" 2>&1 || { cat "$t/log"; fail "--verify passes a staged set"; }
+cp -r "$P" "$t/pv"
+echo tampered >> "$t/pv/boot/dtbo.img"
+if ./stage --verify "$t/pv" > "$t/log" 2>&1; then fail "--verify refuses a tampered prebuilt/"; fi
+rm -rf "$t/pv"
+pass "--verify re-checks the checksums and the images"
+
+# ---------------------------------------------------------------- install
+./install "$t/root" "$P" > "$t/log" 2>&1 || { cat "$t/log"; fail "install stages the package"; }
+r=$t/root/usr/lib/modules/$rel
+for f in pkgbase modules.order modules.builtin kernel/drivers/gpu/msm.ko; do [[ -f $r/$f ]] || fail "install: $f"; done
+[[ $(cat "$r/pkgbase") == linux-omamobile-ingot ]] || fail "pkgbase names the package"
+for f in modules.dep modules.dep.bin modules.alias modules.symbols build vmlinuz; do
+  [[ ! -e $r/$f && ! -L $r/$f ]] || fail "install leaves out $f"
+done
+b=$t/root/usr/lib/omamobile/ingot/boot
+for f in boot_a.img vendor_boot.img dtbo.img RELEASE SHA256SUMS; do cmp -s "$b/$f" "$P/boot/$f" || fail "install: boot/$f as staged"; done
+(cd "$b" && sha256sum --quiet -c SHA256SUMS) || fail "the installed set passes its sums"
+[[ $(cat "$t/root/usr/share/omamobile/linux-ingot/kernel.release") == "$rel" ]] || fail "kernel.release names the release"
+[[ -f $t/root/usr/share/omamobile/linux-ingot/sm8475-osom-ingot.dtb ]] || fail "the board DTB, for reference"
+[[ $(ls "$t/root/usr/lib/modules") == "$rel" ]] || fail "one release directory only"
+[[ ! -e $t/root/boot && ! -e $t/root/etc && -z $(find "$t/root/usr/lib/modules" -path '*/dtbs/*') ]] \
+  || fail "no /boot, no /etc, no dtbs/ (which would wake omamobile-boot-update's hook)"
+[[ -z $(find "$t/root" -perm -o+w ! -type l) ]] || fail "nothing world-writable"
+pass "install: the modules (without depmod's files or a vmlinuz), the image set, the release and the DTB"
+echo tampered >> "$P/boot/boot_a.img"
+if ./install "$t/root2" "$P" > "$t/log" 2>&1; then fail "install refuses a prebuilt/ that fails its checksums"; fi
+./stage "$K" "$IMG" "$P" >/dev/null
+
+# The installed set is one omamobile-ingot-boot accepts (the same checks)
+( source ../omamobile-ingot-boot/lib/ingot-images.sh
+  ib_check_sums "$b" && [[ $(ib_release "$b") == "$rel" ]] && ib_check_boot "$b/boot_a.img" $((0x6000000)) \
+    && ib_check_vendor_boot "$b/vendor_boot.img" $((0x6000000)) && ib_check_dtbo "$b/dtbo.img" $((0x1800000)) ) \
+  || fail "the installed set passes omamobile-ingot-boot's checks"
+pass "the installed image set passes omamobile-ingot-boot's checks"
+
+# ---------------------------------------------------------------- PKGBUILD
+v=$( (startdir=$PKG LINUX_OMAMOBILE_INGOT_PREBUILT=$P; source ./PKGBUILD; echo "$pkgname $pkgver-$pkgrel ${arch[*]} ${depends[*]} ${options[*]}") )
+[[ $v == "linux-omamobile-ingot 7.3.0rc6.r4.g$head12-$(cat version) aarch64 kmod omamobile-ingot-boot !strip !debug" ]] || fail "PKGBUILD fields (got $v)"
+v=$( (startdir=$PKG LINUX_OMAMOBILE_INGOT_PREBUILT=$t/nowhere; source ./PKGBUILD; echo "$pkgver") )
+[[ $v == 0 ]] || fail "with nothing staged pkgver is 0 and package() refuses (got $v)"
+( startdir=$PKG LINUX_OMAMOBILE_INGOT_PREBUILT=$t/nowhere pkgdir=$t/pkgdir; source ./PKGBUILD; package ) > "$t/log" 2>&1 && fail "package() refuses with nothing staged"
+grep -qF 'no staged kernel' "$t/log" || fail "and says so"
+pass "the PKGBUILD takes pkgver from the staged release and refuses with nothing staged"
+
+if command -v makepkg >/dev/null && command -v fakeroot >/dev/null && ((EUID != 0)) && [[ -z ${LINUX_OMAMOBILE_INGOT_IN_MAKEPKG:-} ]]; then
+  mkdir -p "$t/mp" && cp -r PKGBUILD install stage version lib test "$t/mp/"
+  (cd "$t/mp" && LINUX_OMAMOBILE_INGOT_IN_MAKEPKG=1 LINUX_OMAMOBILE_INGOT_PREBUILT=$P BUILDDIR=$t/mpb PKGDEST=$t/pkgs SRCDEST=$t/src2 \
+    PKGEXT=.pkg.tar.zst makepkg -A -d -f --nocheck --nosign >"$t/mp.log" 2>&1) || { tail -20 "$t/mp.log"; fail "makepkg packs it"; }
+  pkgf=$(ls "$t"/pkgs/linux-omamobile-ingot-7.3.0rc6.r4.g"$head12"-*.pkg.tar.zst)
+  list=$(tar --zstd -tf "$pkgf")
+  for f in "usr/lib/modules/$rel/pkgbase" usr/lib/omamobile/ingot/boot/boot_a.img usr/lib/omamobile/ingot/boot/SHA256SUMS \
+           usr/share/omamobile/linux-ingot/kernel.release; do
+    grep -qxF "$f" <<<"$list" || fail "the package holds $f"
+  done
+  grep -qE '^(boot|etc)/' <<<"$list" && fail "the package has nothing in /boot or /etc"
+  tar --zstd -xOf "$pkgf" usr/lib/omamobile/ingot/boot/boot_a.img | cmp -s - "$P/boot/boot_a.img" || fail "makepkg left boot_a.img as staged"
+  pass "makepkg -A packs the staged set unchanged"
+else
+  pass "makepkg # SKIP no makepkg or fakeroot, or running as root"
+fi

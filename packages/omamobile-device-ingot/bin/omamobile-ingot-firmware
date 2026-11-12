@@ -1,0 +1,474 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Install the Solana Saga's own firmware from its modem_a partition: the
+# GPU zap shader, the ADSP firmware, and the Wi-Fi firmware and board file
+# (WCN6855 hw2.1, as overrides in firmware/updates/). The files are the
+# phone's own; nothing is in the package. Run it by hand, as root, on the
+# phone.
+#
+#   omamobile-ingot-firmware plan                       what it finds, and what install would do
+#   omamobile-ingot-firmware install [--dry-run] [--replace]
+#   omamobile-ingot-firmware status                     what is installed, against the record
+#   omamobile-ingot-firmware --help
+#
+# What it copies is in /usr/share/omamobile/ingot/firmware.map. modem_a is
+# found by PARTNAME in /sys/class/block/*/uevent (exactly one), must read
+# ro 1 (the storage guard keeps it read-only) and must not be mounted, and
+# is mounted read-only (vfat, ro,nodev,nosuid,noexec) on a private folder
+# under /run for the run, then unmounted. No other partition is read.
+#
+# Files are installed 0644 root, each through a temporary file and a
+# rename, and recorded with their sha256 in
+# /var/lib/omamobile/ingot-firmware/installed.sha256. A file already there
+# that differs and is not in the record (copied by hand) is kept and
+# reported; --replace overwrites it. The Wi-Fi board file needs the board
+# name ath11k looks for (wifi_board_name, set in
+# /etc/omamobile/ingot-firmware.conf); without it, it is skipped.
+#
+# After an install, reboot (or start omamobile-adsp.service) to use it.
+set -euo pipefail
+
+# Test hooks: a fake root for everything written and read on the root
+# file system, stand-ins for /sys and mountinfo, a folder in place of the
+# mounted partition (the mount is then skipped; the partition checks still
+# run), and a kernel log in place of dmesg.
+root=${OMAMOBILE_INGOT_FW_ROOT:-}
+sysfs=${OMAMOBILE_INGOT_FW_SYSFS:-/sys}
+mountinfo=${OMAMOBILE_INGOT_FW_MOUNTINFO:-/proc/self/mountinfo}
+source_dir=${OMAMOBILE_INGOT_FW_SOURCE:-}
+klog_file=${OMAMOBILE_INGOT_FW_KLOG:-}
+map=${OMAMOBILE_INGOT_FW_MAP:-$root/usr/share/omamobile/ingot/firmware.map}
+conf=$root/etc/omamobile/ingot-firmware.conf
+state=$root/var/lib/omamobile/ingot-firmware
+record=$state/installed.sha256
+
+allowed_dirs=(/usr/lib/firmware/qcom/sm8475/osom/ingot /usr/lib/firmware/updates/ath11k/WCN6855/hw2.1)
+board_magic=QCA-ATH11K-BOARD
+
+die() { echo "omamobile-ingot-firmware: $*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+
+usage() {
+  sed -n '3,/^[^#]/{/^#/!d; s/^# \{0,1\}//; p}' "${BASH_SOURCE[0]}"
+}
+
+# ------------------------------------------------------------------ map
+# entries: "glob|dest|note" in file order; board_name from the map, then
+# the local conf.
+entries=()
+board_name=
+read_key() { # FILE: sets board_name from a wifi_board_name= line
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == wifi_board_name=* ]] && board_name=${line#wifi_board_name=}
+  done < "$1"
+  return 0
+}
+
+valid_dest() {
+  local d=$1 dir ok=0
+  [[ $d == /* && $d != *//* && /$d/ != */../* && /$d/ != */./* ]] || return 1
+  [[ ${d##*/} =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+  for dir in "${allowed_dirs[@]}"; do [[ ${d%/*} == "$dir" ]] && ok=1; done
+  ((ok))
+}
+
+load_map() {
+  [[ -f $map ]] || die "no map at $map"
+  local line n=0 glob dest note rest
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    if [[ $line == wifi_board_name=* ]]; then
+      board_name=${line#wifi_board_name=}; continue
+    fi
+    [[ $line == *'|'*'|'* ]] || die "$map line $n: not source-glob|destination|note"
+    glob=${line%%|*}; rest=${line#*|}; dest=${rest%%|*}; note=${rest#*|}
+    [[ -n $glob && $glob != /* && /$glob/ != */../* ]] || die "$map line $n: bad source $glob"
+    valid_dest "$dest" || die "$map line $n: destination $dest is outside ${allowed_dirs[*]}"
+    entries+=("$glob|$dest|$note")
+  done < "$map"
+  if [[ -f $conf ]]; then read_key "$conf"; fi
+  if [[ -n $board_name ]]; then
+    [[ $board_name =~ ^bus=[A-Za-z0-9=,._-]+$ && ${#board_name} -lt 200 ]] \
+      || die "wifi_board_name is not a board name like bus=pci,vendor=...: $board_name"
+  fi
+}
+
+# ------------------------------------------------------------------ modem_a
+part_dev='' part_majmin=''
+check_partition() {
+  local u matches=() kv devname='' major='' minor=''
+  for u in "$sysfs"/class/block/*/uevent; do
+    [[ -f $u ]] || continue
+    while IFS= read -r kv; do
+      [[ $kv == PARTNAME=modem_a ]] && matches+=("${u%/uevent}")
+    done < "$u"
+  done
+  ((${#matches[@]} == 1)) || die "expected exactly one partition named modem_a, found ${#matches[@]}: refusing"
+  while IFS= read -r kv; do
+    case $kv in
+      DEVNAME=*) devname=${kv#DEVNAME=} ;;
+      MAJOR=*) major=${kv#MAJOR=} ;;
+      MINOR=*) minor=${kv#MINOR=} ;;
+    esac
+  done < "${matches[0]}/uevent"
+  [[ $devname =~ ^[a-z0-9]+$ && $major =~ ^[0-9]+$ && $minor =~ ^[0-9]+$ ]] \
+    || die "modem_a's uevent has no usable DEVNAME, MAJOR and MINOR: refusing"
+  [[ $(< "${matches[0]}/ro") == 1 ]] \
+    || die "modem_a ($devname) is not read-only (ro is not 1): refusing. The storage guard keeps it read-only; this tool never changes that"
+  local _a _b mm _rest
+  while read -r _a _b mm _rest; do
+    [[ $mm == "$major:$minor" ]] && die "modem_a ($devname) is mounted already: refusing (unmount it first)"
+  done < "$mountinfo"
+  part_dev=$devname part_majmin=$major:$minor
+}
+
+mnt=
+cleanup() {
+  if [[ -n $mnt ]]; then
+    umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || echo "omamobile-ingot-firmware: could not unmount $mnt" >&2
+    rmdir "$mnt" 2>/dev/null || true
+  fi
+}
+
+open_source() {
+  check_partition
+  if [[ -n $source_dir ]]; then
+    [[ -d $source_dir ]] || die "no folder $source_dir"
+    src=$source_dir
+    return
+  fi
+  ((EUID == 0)) || die "run as root (it mounts modem_a read-only)"
+  local node=/dev/$part_dev
+  [[ -b $node ]] || die "$node is not a block device"
+  local mm
+  mm=$(stat -c '%t:%T' "$node")
+  [[ $((16#${mm%:*})):$((16#${mm#*:})) == "$part_majmin" ]] || die "$node is not modem_a ($part_majmin): refusing"
+  trap cleanup EXIT
+  mnt=$(mktemp -d /run/omamobile-ingot-firmware.XXXXXX)
+  chmod 700 "$mnt"
+  mount -t vfat -o ro,nodev,nosuid,noexec "$node" "$mnt" || { rmdir "$mnt"; mnt=; die "could not mount $node read-only"; }
+  src=$mnt
+}
+
+# ------------------------------------------------------------------ sources
+files=()
+index_source() {
+  local f
+  while IFS= read -r -d '' f; do files+=("$f"); done < <(cd "$src" && find . -type f -printf '%P\0' | sort -z)
+}
+
+# match GLOB: sets hits=() of relative paths, case-insensitively
+match() {
+  local glob=${1,,} f
+  hits=()
+  for f in "${files[@]}"; do
+    # shellcheck disable=SC2053 # the glob is a pattern on purpose
+    [[ ${f,,} == $glob ]] && hits+=("$f")
+  done
+  return 0
+}
+
+# segments MDT: sets segs=() of the .bNN files beside a split image
+segments() {
+  local dir='' stem f fdir
+  [[ $1 == */* ]] && dir=${1%/*}
+  stem=${1##*/}; stem=${stem%.*}; stem=${stem,,}
+  segs=()
+  for f in "${files[@]}"; do
+    fdir=
+    [[ $f == */* ]] && fdir=${f%/*}
+    [[ $fdir == "$dir" ]] || continue
+    [[ ${f##*/} =~ ^(.*)\.[bB]([0-9][0-9])$ && ${BASH_REMATCH[1],,} == "$stem" ]] && segs+=("$f")
+  done
+  return 0
+}
+
+is_elf() { [[ $(head -c4 "$1" | od -An -tx1 | tr -d ' \n') == 7f454c46 ]]; }
+
+le32() { local n=$1; printf '%b' "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' $((n & 255)) $((n >> 8 & 255)) $((n >> 16 & 255)) $((n >> 24 & 255)))"; }
+pad4() { local n=$1; local p=$(((4 - n % 4) % 4)); ((p)) && head -c "$p" /dev/zero; return 0; }
+
+# build_board BDF NAME OUT: ath11k's board-2.bin with one board element
+# (core.c, ath11k_core_fetch_board_data_api_n): the magic with its NUL,
+# padded to 4 bytes, then the element (id 0, ATH11K_BD_IE_BOARD) holding
+# a name element (id 0) and a data element (id 1), each padded to 4.
+build_board() {
+  local bdf=$1 name=$2 out=$3 nlen dlen inner
+  nlen=${#name}
+  dlen=$(stat -c %s "$bdf")
+  inner=$((8 + nlen + (4 - nlen % 4) % 4 + 8 + dlen + (4 - dlen % 4) % 4))
+  {
+    printf '%s\0' "$board_magic"; pad4 $((${#board_magic} + 1))
+    le32 0; le32 "$inner"
+    le32 0; le32 "$nlen"; printf '%s' "$name"; pad4 "$nlen"
+    le32 1; le32 "$dlen"; cat "$bdf"; pad4 "$dlen"
+  } > "$out"
+}
+
+# ------------------------------------------------------------------ record
+declare -A rec=()
+load_record() {
+  local sha path
+  [[ -f $record ]] || return 0
+  while read -r sha path; do
+    [[ $sha =~ ^[0-9a-f]{64}$ && -n $path ]] && rec[$path]=$sha
+  done < "$record"
+}
+save_record() {
+  local tmp p
+  install -d -m 755 "$state"
+  tmp=$(mktemp "$state/.installed.XXXXXX")
+  for p in "${!rec[@]}"; do printf '%s  %s\n' "${rec[$p]}" "$p"; done | sort -k2 > "$tmp"
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$record"
+}
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+
+# ------------------------------------------------------------------ plan
+# Each item: "kind|dest|file|set": kind is copy or board, file is the file
+# to install (in the source, or the built board file), and set is the
+# destination of the image a segment belongs to (its own for the others).
+items=()
+work=''
+problems=0
+note_used=''
+
+plan_entries() {
+  local -A seen=()
+  local dests=() e glob dest note d f s n tried first_note
+  for e in "${entries[@]}"; do
+    IFS='|' read -r glob dest note <<< "$e"
+    [[ -n ${seen[$dest]:-} ]] || { seen[$dest]=1; dests+=("$dest"); }
+  done
+  for d in "${dests[@]}"; do
+    f='' tried='' first_note=''
+    for e in "${entries[@]}"; do
+      IFS='|' read -r glob dest note <<< "$e"
+      [[ $dest == "$d" ]] || continue
+      [[ -n $first_note ]] || first_note=$note
+      tried+=" $glob"
+      match "$glob"
+      if ((${#hits[@]} > 1)); then
+        say "  ambiguous $glob matches ${#hits[@]} files (${hits[*]}): $d skipped"
+        problems=$((problems + 1)); f=-; break
+      fi
+      if ((${#hits[@]} == 1)); then f=${hits[0]}; note_used=$note; break; fi
+    done
+    [[ $f == - ]] && continue
+    if [[ -z $f ]]; then
+      say "  missing   $d  ($first_note; looked for:$tried)"
+      continue
+    fi
+    if [[ ${d##*/} == board-2.bin ]]; then
+      if ! is_elf "$src/$f"; then
+        say "  found     $f, but it is not an ELF board data file: $d skipped"
+        problems=$((problems + 1)); continue
+      fi
+      if [[ -z $board_name ]]; then
+        say "  found     $f -> $d: skipped, no wifi_board_name set ('plan' shows how to read it)"
+        board_hint=1; continue
+      fi
+      build_board "$src/$f" "$board_name" "$work/board-2.bin"
+      say "  found     $f -> $d (board data for '$board_name')"
+      items+=("board|$d|$work/board-2.bin|$d")
+      continue
+    fi
+    if [[ ${f,,} == *.mdt || ${f,,} == *.mbn ]] && ! is_elf "$src/$f"; then
+      say "  found     $f, but it is not an ELF image: $d skipped"
+      problems=$((problems + 1)); continue
+    fi
+    items+=("copy|$d|$src/$f|$d")
+    if [[ ${f,,} == *.mdt ]]; then
+      segments "$f"
+      n=0
+      for s in "${segs[@]}"; do
+        local nn=${s##*.}; nn=${nn,,}
+        local sd=${d%.*}.$nn
+        valid_dest "$sd" || die "segment destination $sd is not allowed"
+        items+=("copy|$sd|$src/$s|$d")
+        n=$((n + 1))
+      done
+      say "  found     $f (+ $n segments) -> $d  ($note_used)"
+    else
+      say "  found     $f -> $d  ($note_used)"
+    fi
+  done
+}
+
+# decide DEST NEWSHA: prints new, same, update or hand
+decide() {
+  local d=$root$1 cur
+  [[ -e $d ]] || { echo new; return; }
+  cur=$(sha "$d")
+  if [[ $cur == "$2" ]]; then echo same
+  elif [[ ${rec[$1]:-} == "$cur" ]]; then echo update
+  else echo hand
+  fi
+}
+
+install_file() { # FILE DEST
+  local d=$root$2 tmp
+  install -d -m 755 "${d%/*}"
+  tmp=$(mktemp "${d%/*}/.${d##*/}.XXXXXX")
+  cat "$1" > "$tmp"
+  chmod 644 "$tmp"
+  if ((EUID == 0)); then chown root:root "$tmp"; fi
+  mv -f "$tmp" "$d"
+  sync "$d"
+}
+
+act() { # MODE: plan, dry-run or install
+  local mode=$1 it dest file set new what changed=0 kept=0 i
+  local -a whats=() news=()
+  local -A held=()
+  # A split image is one set: if any part of it is kept, all of it is,
+  # so an image never meets another image's segments.
+  for it in "${items[@]}"; do
+    IFS='|' read -r _ dest file set <<< "$it"
+    new=$(sha "$file")
+    what=$(decide "$dest" "$new")
+    news+=("$new"); whats+=("$what")
+    [[ $what == hand && $replace == 0 ]] && held[$set]=1
+  done
+  say "Actions:"
+  for i in "${!items[@]}"; do
+    IFS='|' read -r _ dest file set <<< "${items[$i]}"
+    new=${news[$i]} what=${whats[$i]}
+    if [[ -n ${held[$set]:-} && $what != same ]]; then
+      if [[ $what == hand ]]; then
+        say "  keep      $dest (differs and is not in the record: copied by hand? --replace overwrites it)"
+      else
+        say "  keep      $dest (part of $set, which is kept)"
+      fi
+      kept=$((kept + 1)); continue
+    fi
+    case $what in
+      same)   say "  same      $dest" ;;
+      new)    say "  new       $dest" ;;
+      update) say "  update    $dest (installed by this tool before)" ;;
+      hand)   say "  replace   $dest (differs, not in the record: --replace)" ;;
+    esac
+    [[ $mode == install ]] || continue
+    if [[ $what == same ]]; then rec[$dest]=$new; continue; fi
+    install_file "$file" "$dest"
+    [[ $(sha "$root$dest") == "$new" ]] || die "$dest does not read back as written"
+    rec[$dest]=$new; changed=$((changed + 1))
+  done
+  ((${#items[@]})) || say "  nothing to install"
+  if [[ $mode == install ]]; then
+    save_record
+    say "Installed $changed file(s); record: $record"
+    if ((changed)); then say "Reboot, or 'systemctl start omamobile-adsp' for the ADSP, to use them."; fi
+  fi
+  ((kept == 0))
+}
+
+board_hint=0
+show_board_hint() {
+  say ""
+  say "The Wi-Fi board name: ath11k looks in board-2.bin for"
+  say "  bus=pci,vendor=17cb,device=1103,subsystem-vendor=SSSS,subsystem-device=DDDD,qmi-chip-id=C,qmi-board-id=B,variant=V"
+  say "(subsystem ids in hex, chip and board ids in decimal; then the same without ,variant=)."
+  say "When no board file answers, it logs 'failed to fetch board data for <name> from ...'; read"
+  say "  dmesg | grep 'failed to fetch board data'"
+  say "and copy the first name. It also always logs 'chip_id 0x.. chip_family 0x.. board_id 0x..'."
+  local log l pci vendor sub_v sub_d chip='' board='' variant=''
+  if [[ -n $klog_file ]]; then log=$(< "$klog_file")
+  else log=$(dmesg 2>/dev/null || true); fi
+  while IFS= read -r l; do
+    if [[ $l =~ failed\ to\ fetch\ board\ data\ for\ (bus=[^ ]+)\ from ]]; then
+      say "  from this boot's log: ${BASH_REMATCH[1]}"
+    elif [[ $l =~ chip_id\ 0x([0-9a-f]+)\ chip_family\ 0x[0-9a-f]+\ board_id\ 0x([0-9a-f]+) ]]; then
+      chip=$((16#${BASH_REMATCH[1]})) board=$((16#${BASH_REMATCH[2]}))
+    fi
+  done <<< "$log"
+  for pci in "$sysfs"/bus/pci/devices/*; do
+    [[ -r $pci/vendor ]] || continue
+    vendor=$(< "$pci/vendor")
+    [[ $vendor == 0x17cb && $(< "$pci/device") == 0x1103 ]] || continue
+    sub_v=$(< "$pci/subsystem_vendor"); sub_d=$(< "$pci/subsystem_device")
+    [[ -r $pci/of_node/qcom,calibration-variant ]] && variant=$(tr -d '\0' < "$pci/of_node/qcom,calibration-variant")
+    if [[ -n $chip ]]; then
+      say "  built from this phone (check it against the log line):"
+      say "    bus=pci,vendor=17cb,device=1103,subsystem-vendor=${sub_v#0x},subsystem-device=${sub_d#0x},qmi-chip-id=$chip,qmi-board-id=$board${variant:+,variant=$variant}"
+    fi
+  done
+  say "Set it with: echo 'wifi_board_name=<name>' >> /etc/omamobile/ingot-firmware.conf"
+}
+
+# ------------------------------------------------------------------ status
+status() {
+  load_record
+  local p cur bad=0 e glob dest note
+  say "Record: $record"
+  if ((${#rec[@]} == 0)); then say "  nothing recorded"; fi
+  for p in $(printf '%s\n' "${!rec[@]}" | sort); do
+    if [[ ! -e $root$p ]]; then say "  missing   $p"; bad=1; continue; fi
+    cur=$(sha "$root$p")
+    if [[ $cur == "${rec[$p]}" ]]; then say "  ok        $p"
+    else say "  changed   $p (differs from the record)"; bad=1; fi
+  done
+  local -A seen=()
+  for e in "${entries[@]}"; do
+    IFS='|' read -r glob dest note <<< "$e"
+    [[ -n ${seen[$dest]:-} ]] && continue
+    seen[$dest]=1
+    [[ -n ${rec[$dest]:-} ]] && continue
+    if [[ -e $root$dest ]]; then say "  unrecorded $dest (present, not installed by this tool)"
+    else say "  absent    $dest"; fi
+  done
+  say "wifi_board_name: ${board_name:-<not set>}"
+  return "$bad"
+}
+
+# ------------------------------------------------------------------ main
+cmd=${1:-}
+[[ -n $cmd ]] || { usage >&2; exit 2; }
+shift
+dry=0 replace=0
+for a in "$@"; do
+  case $a in
+    --dry-run) dry=1 ;;
+    --replace) replace=1 ;;
+    *) die "unknown option $a (see --help)" ;;
+  esac
+done
+[[ -z $root || ( $root == /* && -d $root ) ]] || die "OMAMOBILE_INGOT_FW_ROOT must be an absolute folder"
+
+case $cmd in
+  -h|--help|help) usage; exit 0 ;;
+  status)
+    (($# == 0)) || die "status takes no options"
+    load_map; status ;;
+  plan|install)
+    [[ $cmd == install ]] || (($# == 0)) || die "plan takes no options"
+    load_map
+    if [[ $cmd == install && $dry == 0 ]]; then
+      [[ -n $root ]] || ((EUID == 0)) || die "run as root"
+      install -d -m 755 "$state"
+      exec 9> "$state/lock"
+      flock -n 9 || die "another run holds $state/lock"
+    fi
+    open_source
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"; cleanup' EXIT
+    index_source
+    load_record
+    say "modem_a: /dev/$part_dev (read-only), ${#files[@]} files"
+    if [[ $cmd == plan ]]; then
+      say "Under image/:"
+      for f in "${files[@]}"; do [[ ${f,,} == image/* ]] && say "  $f"; done
+    fi
+    say "Map: $map"
+    plan_entries
+    mode=$cmd
+    [[ $cmd == install && $dry == 1 ]] && mode='dry-run'
+    rc=0
+    act "$mode" || { [[ $mode == install ]] && rc=1; }
+    ((board_hint)) && [[ $cmd == plan ]] && show_board_hint
+    ((problems)) && rc=1
+    exit "$rc" ;;
+  *) die "unknown command $cmd (see --help)" ;;
+esac

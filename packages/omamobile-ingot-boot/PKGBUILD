@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+# Maintainer: Derek Ross <derekross@gmail.com>
+pkgname=omamobile-ingot-boot
+pkgver=$(cat "${startdir:-.}/version")
+pkgrel=1
+pkgdesc="Omarchy Mobile: write the Solana Mobile Saga's slot-A boot images from linux-omamobile-ingot, guarded and verified, and check its slot flags (read-only)"
+arch=(any)
+url="https://github.com/derekross/omarchy-mobile"
+license=(MIT)
+depends=(bash coreutils util-linux grep sed gawk python)
+checkdepends=(python)
+
+check() {
+  "$startdir/test/all"
+}
+
+package() {
+  "$startdir/install" "$pkgdir"
+}

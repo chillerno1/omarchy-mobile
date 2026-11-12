@@ -44,8 +44,11 @@ pass "--check refuses stale, tampered, SOURCES-less or missing boot files"
 grep -qF "':(glob)packages/**/boot-files/**'" tools/repo-publish || fail "repo-publish --from-main carries boot-files/ into its clean tree"
 grep -qF 'tools/stage-boot-files --check "$d/boot-files"' tools/build-packages || fail "build-packages checks the boot files before building"
 grep -qF '"$d/stage" --verify "$d/prebuilt"' tools/build-packages || fail "build-packages verifies the staged kernel before building"
-grep -qE '^NAMED_ONLY=\(linux-omamobile\)$' tools/build-packages || fail "linux-omamobile is built only when named"
+grep -qE '^NAMED_ONLY=\(linux-omamobile linux-omamobile-ingot\)$' tools/build-packages || fail "linux-omamobile and linux-omamobile-ingot are built only when named"
 grep -qF '[[ " ${NAMED_ONLY[*]} " != *" $name "* ]] || continue' tools/build-packages || fail "and never by default or with --all"
+grep -qF '[[ " ${ORDER[*]} " == *" $name "* || " ${NAMED_ONLY[*]} " == *" $name "* ]] || dirs+=("packages/$name")' tools/build-packages \
+  || fail "a named-only package outside ORDER is not built by default either"
+grep -qE '^LOCAL_ONLY=\(linux-omamobile-ingot\)$' tools/build-packages || fail "linux-omamobile-ingot is built only with --local"
 pass "repo-publish carries boot-files/; build-packages checks them, verifies the kernel, and builds linux-omamobile only when named"
 
 # build-packages with a device package whose boot files are missing: that

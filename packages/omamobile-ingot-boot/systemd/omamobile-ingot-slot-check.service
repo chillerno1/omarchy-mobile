@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT
+# Read the Saga's slot flags once per boot (read-only) and log what they
+# mean: at warning level when slot A has two tries or fewer left, or when
+# the bootloader could switch to slot B. The verdict also goes to
+# /run/omamobile/ingot-slots.json. A failure here changes nothing and stops
+# nothing.
+[Unit]
+Description=Check the Solana Mobile Saga's boot slot flags (read-only)
+ConditionPathExists=/proc/device-tree/compatible
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/bin/omamobile-ingot-boot slots --service
+SyslogIdentifier=omamobile-ingot-slots
+ProtectSystem=strict
+ReadWritePaths=/run
+ProtectHome=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+# The Saga's ADSP (battery and audio) once the root file system, which holds
+# its firmware, is mounted. Enabled by the vendor multi-user.target.wants
+# link; inert until omamobile-ingot-firmware has installed the firmware.
+# It only starts an offline ADSP, never stops or restarts it, and a start
+# that hung or reset the phone makes the next boot skip it (the hang marker
+# in omamobile-adsp-start).
+[Unit]
+Description=Start the ADSP (battery and audio) from the phone's own firmware
+After=local-fs.target systemd-modules-load.service
+ConditionPathExists=/usr/lib/firmware/qcom/sm8475/osom/ingot/adsp.mdt
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/omamobile-adsp-start
+RemainAfterExit=yes
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

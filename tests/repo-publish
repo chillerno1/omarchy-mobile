@@ -26,6 +26,8 @@ cp tools/repo-publish "$R/tools/"
 echo /out > "$R/.gitignore"
 echo 'prebuilt/' > "$R/packages/a/.gitignore"
 printf '*.log\nbionic/prebuilt/\n' > "$R/packages/b/.gitignore"
+mkdir -p "$R/packages/linux-omamobile-ingot"
+echo 'prebuilt/' > "$R/packages/linux-omamobile-ingot/.gitignore"
 git -C "$R" init -q
 git -C "$R" add -A
 git -C "$R" -c user.name=test -c user.email=test@invalid commit -qm fixture
@@ -87,6 +89,14 @@ published "prebuilt files"
 [[ $(cat "$wt/packages/b/bionic/prebuilt/new"$'\n'"line") == two ]] || fail "a name with a newline is copied"
 [[ ! -e $wt/packages/b/build.log ]] || fail "ignored files outside prebuilt/ stay behind"
 pass "prebuilt files are copied by NUL-separated name, and nothing else"
+
+# --- the Saga's bring-up images (a developer's SSH key) never enter the tree ---
+mkdir -p "$R/packages/linux-omamobile-ingot/prebuilt/boot"
+echo key > "$R/packages/linux-omamobile-ingot/prebuilt/boot/boot_a.img"
+published "linux-omamobile-ingot's prebuilt/"
+[[ ! -e $wt/packages/linux-omamobile-ingot/prebuilt ]] || fail "linux-omamobile-ingot's prebuilt/ is not copied"
+[[ $(cat "$wt/packages/a/prebuilt/with space.bin") == one ]] || fail "the other prebuilt files still are"
+pass "linux-omamobile-ingot's prebuilt/ never reaches the publish tree"
 
 # --- failures stop before the publisher runs ---
 echo "not an index" > "$t/bad-index"   # the real git ls-files fails on it

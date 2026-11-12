@@ -1,0 +1,56 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Collect the Solana Mobile Saga's slot-A image set from a
+# tools/build-ingot-probe output; on the laptop only, it never connects to
+# or writes a phone.
+#
+# Usage: tools/ingot-boot-set IMAGES_DIR SET_DIR
+#
+# IMAGES_DIR is what tools/build-ingot-probe --arch wrote (boot.img,
+# vendor_boot.img, dtbo.img, RELEASE and their SHA256SUMS). SET_DIR, which
+# must not exist yet, gets the one set the phone's writer and the kernel
+# package take (packages/omamobile-ingot-boot/lib/ingot-images.sh):
+#   boot_a.img       boot.img with its AVB footer (tools/ingot-boot-footer)
+#   vendor_boot.img  as built
+#   dtbo.img         as built
+#   RELEASE          the kernel release inside boot_a.img
+#   SHA256SUMS       exactly these four
+# A set of its own, because the three images belong together: vendor_boot
+# holds the device tree the kernel in boot_a.img was built with, and the
+# writer refuses a directory whose SHA256SUMS names anything else.
+set -euo pipefail
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+die() { echo "error: $*" >&2; exit 1; }
+case ${1:-} in
+  -h|--help) source "$ROOT/tools/lib/usage.sh"; usage_from_header "$0"; exit 0 ;;
+esac
+(($# == 2)) || die 'usage: tools/ingot-boot-set IMAGES_DIR SET_DIR'
+in=$1 set=${2%/}
+[[ -d $in ]] || die "$in: no such directory"
+[[ ! -e $set && ! -L $set ]] || die "$set already exists; choose a new name"
+for f in boot.img vendor_boot.img dtbo.img RELEASE SHA256SUMS; do
+  [[ -f $in/$f && ! -L $in/$f ]] || die "$in has no $f (tools/build-ingot-probe --arch)"
+done
+# The build's own checksums first: a half-copied or mixed directory must not
+# become a set. Only the four files the set is made from are checked.
+for f in boot.img vendor_boot.img dtbo.img RELEASE; do
+  want=$(awk -v f="$f" '$2 == f {print $1}' "$in/SHA256SUMS")
+  [[ $want =~ ^[0-9a-f]{64}$ ]] || die "$in/SHA256SUMS does not list $f once"
+  [[ $(sha256sum < "$in/$f" | cut -d' ' -f1) == "$want" ]] || die "$in/$f does not match $in/SHA256SUMS"
+done
+
+# Build beside SET_DIR and rename, so a failure leaves no half-made set
+tmp=$(mktemp -d "$(dirname -- "$set")/.ingot-boot-set.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+"$ROOT/tools/ingot-boot-footer" "$in/boot.img" "$tmp/boot_a.img" >/dev/null
+for f in vendor_boot.img dtbo.img RELEASE; do
+  cp -- "$in/$f" "$tmp/$f"
+done
+chmod 644 "$tmp"/*
+(cd "$tmp" && sha256sum boot_a.img vendor_boot.img dtbo.img RELEASE > SHA256SUMS)
+chmod 755 "$tmp"
+# mv -T refuses to move into a directory that appeared meanwhile
+mv -T -n -- "$tmp" "$set"
+[[ -f $set/SHA256SUMS ]] || die "could not create $set"
+trap - EXIT
+echo "$set: kernel $(cat "$set/RELEASE"), boot_a.img sha256 $(sha256sum < "$set/boot_a.img" | cut -d' ' -f1)"

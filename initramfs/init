@@ -46,25 +46,34 @@ fi
 # Nothing in this initramfs runs mdev/udev, so no one else touches the disks.
 ufs_ro_log() { echo "omamobile: ufs-ro: $*" > /dev/kmsg; }
 # Storage guard. Everything on the UFS is read-only except an allowlist of
-# partitions we own: slot B's boot images (in-place kernel updates) and
-# userdata (the Arch root). The kernel only lets a partition be written if
+# partitions we own: one slot's boot images (in-place kernel updates) and
+# userdata (the Arch root). That slot is B, where stock Android on slot A is
+# the way back, unless the image says otherwise (see ufs_rw_load). The
+# kernel only lets a partition be written if
 # its whole disk is writable too, so the main disk (sda) stays writable but
 # its whole-disk node is removed, so nothing can write across partitions by
 # accident; a LUN the descriptor's UFS_RW_LUNS names is guarded the same way.
 # The other LUNs (on Pixels sdb, sdc, sdd: bootloader images) are read-only
 # at the disk level. Calibration partitions (efs, persist, modem_userdata...)
-# and all of slot A stay read-only.
+# and all of the other slot stay read-only.
 # The allowlist is the descriptor's UFS_RW, which bin/omamobile initramfs
 # checks and packs into /etc/omamobile-ufs-rw. It fails closed: a missing,
 # empty or malformed file leaves every partition read-only, so Arch does not
 # start and the initramfs shell stays up over SSH. Whatever the file says,
-# only slot B's boot images and userdata can be named.
+# only our slot's boot images and userdata can be named.
+# Our slot is B unless the image carries /etc/omamobile-slot saying "a": a
+# phone whose stock system lives on slot B (the Saga keeps LineageOS there
+# as its way back) gives us slot A instead. Only one slot is ever ours, so
+# such an image refuses the _b names, and it opens slot A only on the board
+# it was built for (its first compatible is /etc/omamobile-compatible): on a
+# Pixel, slot A is stock Android and must stay read-only. Anything else in
+# the file, or a missing or different board, fails closed.
 UFS_RW=""
 UFS_RW_LUNS=""
 # Is $1 a disk that holds allowlisted partitions? sda always.
 ufs_rw_disk() { case " sda $UFS_RW_LUNS " in *" $1 "*) true ;; *) false ;; esac; }
 ufs_rw_load() {
-  local list p
+  local list p slot want got
   if [ ! -s /etc/omamobile-ufs-rw ]; then
     ufs_ro_log "no allowlist in this image (/etc/omamobile-ufs-rw): every partition read-only"
     return 0
@@ -82,9 +91,30 @@ ufs_rw_load() {
     ufs_ro_log "empty allowlist in /etc/omamobile-ufs-rw: every partition read-only"
     return 0
   fi
+  slot=b
+  if [ -e /etc/omamobile-slot ]; then
+    slot=$(cat /etc/omamobile-slot 2>/dev/null)
+    case "$slot" in
+      a)
+        if [ ! -s /etc/omamobile-compatible ]; then
+          ufs_ro_log "slot a image has no board compatible (/etc/omamobile-compatible): every partition read-only"
+          return 0
+        fi
+        want=$(cat /etc/omamobile-compatible)
+        got=$(tr '\0' '\n' < /proc/device-tree/compatible 2>/dev/null | head -n 1)
+        if [ "$got" != "$want" ]; then
+          ufs_ro_log "slot a image is for $want, board is ${got:-unknown}: every partition read-only"
+          return 0
+        fi ;;
+      b) ;;
+      *)
+        ufs_ro_log "malformed slot in /etc/omamobile-slot: every partition read-only"
+        return 0 ;;
+    esac
+  fi
   for p in "$@"; do
     case "$p" in
-      boot_b|init_boot_b|vendor_boot_b|vendor_kernel_boot_b|dtbo_b|userdata) ;;
+      boot_"$slot"|init_boot_"$slot"|vendor_boot_"$slot"|vendor_kernel_boot_"$slot"|dtbo_"$slot"|userdata) ;;
       *)
         ufs_ro_log "allowlist names $p, which is never writable: every partition read-only"
         return 0 ;;
@@ -92,6 +122,7 @@ ufs_rw_load() {
   done
   UFS_RW="$*"
   ufs_ro_log "allowlist: $UFS_RW"
+  [ "$slot" = b ] || ufs_ro_log "this image owns slot $slot (/etc/omamobile-slot)"
   # LUNs besides sda that hold allowlisted partitions (the descriptor's
   # UFS_RW_LUNS: enchilada's boot_b is on sde). Each is guarded as sda is.
   # Malformed: none, so their partitions stay read-only.
@@ -373,17 +404,32 @@ say "ready"
 
 # Self-recovery for bring-up: if the host never configures the USB gadget,
 # show why on screen, then crash so the phone falls back to stock Android.
+# An image whose /etc/omamobile-no-usb-host says "stay" shows why and stays
+# up instead. That is for a phone where a crash recovers nothing: on the
+# Saga each crash spends one of slot A's boot tries, and the slot it falls
+# back to is LineageOS, which cannot use the Arch userdata. Reached only
+# when boot_arch did not hand over (it kills this subshell when it does).
 (
   for i in $(seq 1 45); do
     grep -qx configured /sys/class/udc/*/state 2>/dev/null && exit 0
     sleep 1
   done
+  stay=$(cat /etc/omamobile-no-usb-host 2>/dev/null)
   {
     echo
     echo "=== USB never configured; dmesg follows ==="
     dmesg | grep -iE 'dwc3|phy|usb|udc|clk|error|fail' | tail -30
-    echo "omamobile: no USB host, crashing in 20 s so ABL falls back to slot A"
+    if [ "$stay" = stay ]; then
+      echo "omamobile: no USB host; this phone stays in the initramfs (no crash)"
+      echo "omamobile: to recover, connect a computer, then ssh root@172.16.42.1"
+    else
+      echo "omamobile: no USB host, crashing in 20 s so ABL falls back to slot A"
+    fi
   } > $SCREEN
+  if [ "$stay" = stay ]; then
+    echo "omamobile: no USB host; staying in the initramfs (/etc/omamobile-no-usb-host)" > /dev/kmsg
+    exit 0
+  fi
   sleep 20
   # Never in the middle of growing the root file system (boot_arch)
   while [ -e /run/omamobile-resizing ]; do sleep 1; done
