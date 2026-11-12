@@ -1,0 +1,48 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Offline checks for the tqftpserv package: the PKGBUILD lists one checksum
+# per source, the two patches' checksums are the ones it pins, each patch is
+# shaped like the upstream commit it carries, and the units it installs are
+# not enabled by the package. (That the patches apply to the pinned tarball
+# was checked with `patch -Np1 --dry-run` on the v1.3 tarball and by
+# building the package with tools/build-packages --local ingot; this test
+# has no network and no tarball.)
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")/.."
+fails=0
+fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
+pass() { echo "ok: $*"; }
+
+p1=0001-translate-define-_GNU_SOURCE-for-asprintf.patch
+p2=0002-tqftpserv-populate-readwrite-use-libexec.patch
+# shellcheck disable=SC1091
+( source ./PKGBUILD
+  [[ $pkgname == tqftpserv ]] || exit 1
+  [[ ${#source[@]} == 3 && ${#sha256sums[@]} == 3 ]] || exit 2
+  [[ ${source[0]} == *"/v$pkgver.tar.gz" && ${sha256sums[0]} =~ ^[0-9a-f]{64}$ ]] || exit 3
+  [[ ${source[1]} == "$p1" && ${sha256sums[1]} == "$(sha256sum "$p1" | cut -d' ' -f1)" ]] || exit 4
+  [[ ${source[2]} == "$p2" && ${sha256sums[2]} == "$(sha256sum "$p2" | cut -d' ' -f1)" ]] || exit 5
+  [[ ${arch[*]} == aarch64 ]] || exit 6
+  for d in qrtr xz zstd; do [[ " ${depends[*]} " == *" $d "* ]] || exit 7; done
+) && pass "PKGBUILD: a pinned tarball, both patches' checksums current, depends on qrtr, xz and zstd" \
+  || fail "PKGBUILD pins (exit $?): a source and its sha256 do not line up, a patch was edited without updating the PKGBUILD, or a dependency is gone"
+
+grep -q '^--- a/translate.c' "$p1" && grep -q '^+#define _GNU_SOURCE' "$p1" \
+  && pass "0001 defines _GNU_SOURCE in translate.c" || fail "0001 is not the _GNU_SOURCE patch of translate.c"
+grep -q '^--- a/meson.build' "$p2" && grep -q '^--- a/tqftpserv-populate-readwrite.service.in' "$p2" \
+  && grep -q "libexec" "$p2" && pass "0002 moves populate-readwrite.sh to libexec in meson.build and the unit" \
+  || fail "0002 is not the libexec patch of meson.build and the populate unit"
+! grep -qE '^Signed-off-by:.*(Claude|GPT|Gemini|Copilot|AI)' "$p1" "$p2" \
+  && pass "the patches carry their human authors' sign-offs only" || fail "a patch carries an AI sign-off"
+
+grep -q -- '-Dsystemd-unit-prefix=/usr/lib/systemd/system' PKGBUILD \
+  && pass "units go to /usr/lib/systemd/system" || fail "PKGBUILD lost -Dsystemd-unit-prefix"
+! grep -qE 'systemctl (enable|preset)|\.install' PKGBUILD \
+  && pass "the package enables no unit (tqftpserv.service and the populate oneshot stay off until checked on the phone)" \
+  || fail "the package enables a unit: the populate oneshot mounts persist, which must be checked first"
+grep -q 'readonly/firmware/image' README.md && grep -q 'not enabled' README.md \
+  && pass "README says where the modem's files come from and that nothing is enabled" \
+  || fail "README lost the path or the not-enabled note"
+
+((fails)) && { echo "$fails test(s) failed" >&2; exit 1; }
+echo "tqftpserv: all tests passed"
