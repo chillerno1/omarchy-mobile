@@ -20,6 +20,9 @@ install=omamobile-device-ingot.install
 makedepends=(gcc)
 # test/all parses the built board file the way ath11k does
 checkdepends=(python)
+optdepends=('pipewire: saga-mic-talk records and plays back through it'
+            'wireplumber: saga-mic-talk finds the microphone source with wpctl'
+            'python: saga-mic-talk measures the recording')
 
 build() {
   "$startdir/build" "$srcdir/build"

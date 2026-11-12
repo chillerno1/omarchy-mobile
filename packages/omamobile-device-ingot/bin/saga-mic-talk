@@ -1,0 +1,136 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# saga-mic-talk [SECONDS]: the Saga's microphone check, through the desktop's
+# audio stack (PipeWire, as any app uses it). Records the "Internal
+# microphones" source for SECONDS (default 5; speak at the phone), prints each
+# microphone's level and whether speech was found on it, then plays the
+# recording back through the speaker, raised so it can be heard.
+#
+# Run it as the desktop's user, or as root (it then runs PipeWire's tools as
+# the user whose PipeWire is running). The left channel is DMIC1, the bottom
+# microphone; the right channel is DMIC6, the top one. The playback swaps
+# them, so each microphone is heard from the speaker at its own end.
+#
+# Playback level: each channel's speech is raised (or lowered) to about
+# -22 dBFS rms, at most +30 dB, and soft-limited (tanh) to -10 dBFS peak, so
+# nothing played is louder than the listening test's beeps. Played unchanged,
+# speech recorded from arm's length is too quiet to hear at the profile's
+# amplifier gain. The recording and the played file are kept in
+# $XDG_RUNTIME_DIR/saga-mic-talk/ until the next run or logout.
+set -euo pipefail
+
+usage() { echo "usage: saga-mic-talk [SECONDS]   (1 to 30, default 5)"; }
+case ${1:-} in -h | --help) usage; exit 0 ;; esac
+secs=${1:-5}
+if ! [[ $secs =~ ^[0-9]+$ ]] || ((secs < 1 || secs > 30)); then usage >&2; exit 2; fi
+
+for tool in pw-record pw-play wpctl python3; do
+  command -v "$tool" > /dev/null || { echo "STOP: $tool is not installed" >&2; exit 1; }
+done
+
+# Whose PipeWire: ours, or as root the first user with a running one.
+if ((EUID == 0)); then
+  uid=
+  for sock in /run/user/*/pipewire-0; do
+    [[ -S $sock ]] || continue
+    u=${sock#/run/user/}; u=${u%%/*}
+    ((u != 0)) && { uid=$u; break; }
+  done
+  [[ -n $uid ]] || { echo "STOP: no user's PipeWire is running (is the desktop up?)" >&2; exit 1; }
+  user=$(id -nu "$uid")
+  run() { runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" "$@"; }
+else
+  uid=$EUID
+  [[ -S /run/user/$uid/pipewire-0 ]] || { echo "STOP: PipeWire is not running for $(id -nu) (is the desktop up?)" >&2; exit 1; }
+  run() { env XDG_RUNTIME_DIR="/run/user/$uid" "$@"; }
+fi
+dir=/run/user/$uid/saga-mic-talk
+run mkdir -p "$dir"
+rec=$dir/talk.wav out=$dir/playback.wav
+run rm -f "$rec" "$out"
+
+node() { # PATTERN: the id wpctl status gives the node whose name ends with PATTERN
+  run wpctl status 2> /dev/null | sed -n "s/^[^0-9]*\([0-9]\+\)\. Built-in Audio $1.*/\1/p" | head -1
+}
+src=$(node 'Internal microphones')
+if [[ -z $src ]]; then
+  echo "STOP: no 'Built-in Audio Internal microphones' source. The card's profile should be 'HiFi (Mic, Speaker)';" >&2
+  echo "      try: systemctl --user restart wireplumber (as the desktop's user)" >&2
+  exit 1
+fi
+vol=$(run wpctl get-volume "$src" 2> /dev/null || true)
+echo "source $src: Built-in Audio Internal microphones (${vol:-volume unknown})"
+[[ $vol == *MUTED* ]] && echo "note: the source is muted in PipeWire; the recording will be silent"
+
+echo ">>> SPEAK NOW at the phone for $secs seconds"
+run timeout --signal=INT "$secs" pw-record --target "$src" --rate 48000 --channels 2 --format s16 "$rec" 2> /dev/null || true
+[[ -s $rec ]] || { echo "STOP: nothing was recorded" >&2; exit 1; }
+echo "<<< recorded. Levels (left = bottom mic DMIC1, right = top mic DMIC6):"
+
+# Levels, the verdict from the 250 ms envelope, and the playback file.
+run python3 - "$rec" "$out" << 'PY'
+import math, struct, sys, wave
+
+TARGET, LIMIT, MAXGAIN = -22.0, -10.0, 30.0   # dBFS rms, dBFS peak, dB
+db = lambda v: 20 * math.log10(v) if v > 0 else -200.0
+w = wave.open(sys.argv[1])
+if w.getnchannels() != 2 or w.getsampwidth() != 2:
+    sys.exit('STOP: expected 16-bit stereo, got %d channels of %d bytes' % (w.getnchannels(), w.getsampwidth()))
+sr, n = w.getframerate(), w.getnframes()
+d = struct.unpack('<%dh' % (2 * n), w.readframes(n))
+skip = sr // 10                          # the stream's first 100 ms can hold a start-up click
+names = ('bottom mic (left,  DMIC1)', 'top mic    (right, DMIC6)')
+chans, gains, found = [], [], []
+for c in (0, 1):
+    raw = d[c::2][skip:]
+    x = [v / 32768.0 for v in raw]
+    dc = sum(x) / max(len(x), 1)
+    x = [v - dc for v in x]
+    chans.append(x)
+    if not x or max(abs(v) for v in raw) == 0:
+        print('  %s: only zeros: NO SIGNAL (the microphone is dead or not routed)' % names[c])
+        gains.append(None); found.append(False); continue
+    rms = math.sqrt(sum(v * v for v in x) / len(x))
+    peak = max(abs(v) for v in x)
+    clipped = sum(1 for v in raw if v >= 32767 or v <= -32768)
+    B = sr // 4
+    blocks = [math.sqrt(sum(v * v for v in x[i:i + B]) / B) for i in range(0, len(x) - B + 1, B)]
+    floor = sorted(blocks)[len(blocks) // 10] if blocks else rms
+    speech = [b for b in blocks if db(b) >= db(floor) + 10]
+    ok = len(speech) >= 2
+    level = math.sqrt(sum(b * b for b in speech) / len(speech)) if speech else rms
+    print('  %s: rms %.1f dBFS, peak %.1f dBFS, floor %.1f dBFS%s' % (
+        names[c], db(rms), db(peak), db(floor), ', CLIPPED %d samples' % clipped if clipped else ''))
+    if ok:
+        print('      speech found: %d of %d 250 ms blocks, at %.1f dBFS (%.0f dB above the floor)' % (
+            len(speech), len(blocks), db(level), db(level) - db(floor)))
+    else:
+        print('      NO SPEECH found (no 250 ms block 10 dB above the floor)')
+    gains.append(min(TARGET - db(level), MAXGAIN) if ok else None)
+    found.append(ok)
+
+# A channel without speech plays at the other's gain (or +20 dB): the room is heard, not boosted to -22.
+other = [g for g in gains if g is not None]
+gains = [g if g is not None else (other[0] if other else 20.0) for g in gains]
+L = 10 ** (LIMIT / 20)
+out = []
+for c in (0, 1):
+    k = 10 ** (gains[c] / 20)
+    out.append([int(round(32767 * L * math.tanh(v * k / L))) for v in chans[c]])
+# Swap: the bottom mic plays from the bottom speaker (right), the top mic from the top (left).
+o = wave.open(sys.argv[2], 'wb'); o.setnchannels(2); o.setsampwidth(2); o.setframerate(sr)
+o.writeframes(struct.pack('<%dh' % (2 * len(out[0])), *[s for pair in zip(out[1], out[0]) for s in pair]))
+o.close()
+print('verdict: bottom mic %s, top mic %s' % tuple('OK (speech found)' if f else 'NO SPEECH' for f in found))
+print('playback gain: bottom %+.0f dB, top %+.0f dB (to about %.0f dBFS rms, peaks soft-limited at %.0f dBFS)' % (
+    gains[0], gains[1], TARGET, LIMIT))
+PY
+
+sink=$(node 'Speaker')
+echo ">>> PLAYING IT BACK: the bottom mic from the bottom speaker, the top mic from the top one"
+if run pw-play ${sink:+--target "$sink"} "$out" 2> /dev/null; then
+  echo "playback done. Did you hear your own words, from both ends of the phone?"
+else
+  echo "STOP: playback failed (pw-play exit $?)" >&2
+  exit 1
+fi
